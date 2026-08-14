@@ -105,6 +105,18 @@ impl Cli {
     /// Execute a client command via HTTP REST call to the daemon.
     pub async fn execute(self) -> Result<()> {
         let token = self.resolve_token().await;
+        if token.is_empty() {
+            eprintln!("zerotier-cli: authtoken.secret not found or not readable (permission denied).");
+            eprintln!("            Please run with sudo: 'sudo zgalaxy-cli {}'", match &self.command {
+                Commands::Status | Commands::Info => "status",
+                Commands::ListNetworks => "listnetworks",
+                Commands::ListPeers => "listpeers",
+                Commands::Join { .. } => "join <nwid>",
+                Commands::Leave { .. } => "leave <nwid>",
+                _ => "",
+            });
+            return Ok(());
+        }
 
         match self.command {
             Commands::Status | Commands::Info => {
@@ -172,7 +184,7 @@ impl Cli {
                                     .and_then(|p| p.first())
                                     .and_then(|p| p["address"].as_str())
                                     .unwrap_or("-");
-                                let lat = peer["latency_ms"].as_i64().unwrap_or(-1);
+                                let lat = peer["latency"].as_i64().unwrap_or(-1);
                                 let ver = peer["version"].as_str().unwrap_or("1.3.0");
                                 let role = peer["role"].as_str().unwrap_or("LEAF");
                                 println!("200 listpeers {} {} {} {} {}", addr, path, lat, ver, role);
@@ -187,21 +199,46 @@ impl Cli {
                     let id = Identity::generate();
                     fs::write(&public_file, id.to_public_string()).await?;
                     fs::write(&secret_file, id.to_secret_string()?).await?;
+                    restrict_secret_permissions(std::path::Path::new(&secret_file));
                     println!("Generated identity keypair: {} & {}", public_file, secret_file);
                     println!("Node address: {}", id.address);
                 }
                 IdToolCommands::InitMoon { public_file } => {
                     let content = fs::read_to_string(&public_file).await?;
                     let id = Identity::parse(&content)?;
+
+                    // Match zerotier-idtool behavior: when a secret identity
+                    // exists next to the public identity, emit the real signing
+                    // secret so `genmoon` (and the ZGALAXY engine) can sign the
+                    // world immediately. The secret is the full secret identity
+                    // string ("<address>:0:<pubhex>:<privhex>").
+                    let public_path = PathBuf::from(&public_file);
+                    let secret_path = public_path
+                        .parent()
+                        .map(|p| p.join("identity.secret"))
+                        .unwrap_or_else(|| PathBuf::from("identity.secret"));
+                    let secret_str = if secret_path.exists() {
+                        fs::read_to_string(&secret_path)
+                            .await
+                            .ok()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+
                     let template = serde_json::json!({
                         "id": id.address.to_string(),
                         "objtype": "world",
+                        "worldType": "moon",
+                        "updatesMustBeSigned": 1,
                         "roots": [{
-                            "id": id.address.to_string(),
-                            "stableEndpoints": ["dz.dreamzone.cc:9993"]
+                            "identity": id.address.to_string(),
+                            "stableEndpoints": ["dz.dreamzone.cc/9993"]
                         }],
                         "signingKey": hex::encode(id.verifying_key.to_bytes()),
-                        "signingKey_secret": ""
+                        "signingKey_SECRET": secret_str
                     });
                     println!("{}", serde_json::to_string_pretty(&template)?);
                 }
@@ -211,9 +248,29 @@ impl Cli {
                     let value: Value = serde_json::from_str(&content)?;
 
                     let id_str = value["id"].as_str().unwrap_or("").to_string();
-                    let root_ids: Vec<String> = value["roots"]
+                    let roots_raw: Vec<(String, Vec<String>)> = value["roots"]
                         .as_array()
-                        .map(|roots| roots.iter().filter_map(|r| r["id"].as_str().map(|s| s.to_string())).collect())
+                        .map(|roots| {
+                            roots.iter()
+                                .map(|r| {
+                                    // ZGALAXY writes roots entries as {"id": ...};
+                                    // canonical moon.json uses {"identity": ...}.
+                                    let root_id = r["id"].as_str()
+                                        .or_else(|| r["identity"].as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let endpoints = r["stableEndpoints"]
+                                        .as_array()
+                                        .map(|eps| {
+                                            eps.iter()
+                                                .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    (root_id, endpoints)
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default();
 
                     let id = id_str.parse::<crate::identity::Address>()
@@ -222,12 +279,15 @@ impl Cli {
                         .duration_since(std::time::UNIX_EPOCH)?
                         .as_millis() as u64;
 
-                    let roots = root_ids
+                    let roots: Vec<crate::world::WorldRoot> = roots_raw
                         .iter()
-                        .filter_map(|r| r.parse::<crate::identity::Address>().ok())
-                        .map(|addr| crate::world::WorldRoot {
-                            identity: addr,
-                            stable_endpoints: vec!["dz.dreamzone.cc:9993".to_string()],
+                        .filter_map(|(rid, eps)| {
+                            rid.parse::<crate::identity::Address>().ok().map(|addr| {
+                                crate::world::WorldRoot {
+                                    identity: addr,
+                                    stable_endpoints: eps.clone(),
+                                }
+                            })
                         })
                         .collect();
 
@@ -239,15 +299,21 @@ impl Cli {
                     );
 
                     // Sign the world if a secret signing key is available
-                    if let Some(secret_key_hex) = value["signingKey_secret"].as_str() {
-                        if !secret_key_hex.is_empty() {
-                            let secret_identity = crate::identity::Identity::parse(secret_key_hex)?;
-                            let sig = secret_identity.sign(&world.encode())?;
-                            world.signature = sig.to_vec();
-                        }
+                    // (accepts both the 1.16.x "signingKey_SECRET" and the
+                    // legacy "signingKey_secret" spellings used by ZGALAXY).
+                    let secret_key_hex = value["signingKey_SECRET"].as_str()
+                        .or_else(|| value["signingKey_secret"].as_str())
+                        .unwrap_or("");
+                    if !secret_key_hex.is_empty() {
+                        let secret_identity = crate::identity::Identity::parse(secret_key_hex)?;
+                        let sig = secret_identity.sign(&world.encode())?;
+                        world.signature = sig.to_vec();
                     }
 
-                    let output = moon_json.replace(".json", ".moon");
+                    // Canonical idtool output naming: the world id formatted as
+                    // 16 hex characters, e.g. "000000069ae38092.moon".
+                    // ZGALAXY's MoonService looks for exactly this file name.
+                    let output = format!("{:016x}.moon", id.to_u64());
                     world.save_to_file(&output).await?;
                     println!("Signed moon written to {}", output);
                 }
@@ -278,6 +344,15 @@ async fn fetch_json(url: &str, token: &str) -> Result<Value> {
     stream.read_to_end(&mut response_buf).await?;
 
     let resp_str = String::from_utf8_lossy(&response_buf);
+    if let Some(first_line) = resp_str.lines().next() {
+        if first_line.contains("401") {
+            bail!("401 Unauthorized (invalid or missing secret token)");
+        }
+        if first_line.contains("404") {
+            bail!("404 Not Found");
+        }
+    }
+
     if let Some(body_idx) = resp_str.find("\r\n\r\n") {
         let body = &resp_str[body_idx + 4..];
         let val: Value = serde_json::from_str(body)?;
@@ -338,3 +413,17 @@ async fn delete_req(url: &str, token: &str) -> Result<Value> {
 
     Ok(serde_json::json!({ "deleted": true }))
 }
+
+/// Restrict a secret identity file to owner-only permissions (0600).
+#[cfg(unix)]
+fn restrict_secret_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_secret_permissions(_path: &std::path::Path) {}

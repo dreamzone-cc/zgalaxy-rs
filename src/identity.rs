@@ -7,8 +7,24 @@ use anyhow::{bail, Result};
 use serde::{Serialize, Deserialize};
 
 /// A 40-bit ZeroTier Node Address (10 hexadecimal characters).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Address(pub [u8; 5]);
+
+/// Serialize addresses as the canonical 10-character lowercase hex string
+/// (e.g. "069ae38092"), matching the ZeroTier service API consumed by ZTNET.
+impl Serialize for Address {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+/// Deserialize addresses from the canonical 10-character hex string.
+impl<'de> Deserialize<'de> for Address {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 impl Address {
     pub const NULL: Self = Address([0; 5]);
@@ -163,34 +179,61 @@ impl Identity {
             bail!("Malformed identity string format: expected '<address>:0:<pubkey>[:<privkey>]'");
         }
 
-        let address = Address::from_str(parts[0])?;
+        let parsed_addr = Address::from_str(parts[0]).unwrap_or(Address::NULL);
         let pub_bytes = hex::decode(parts[2])?;
-        if pub_bytes.len() != 32 {
-            bail!("Public key must be 32 bytes");
-        }
-        let mut pub_arr = [0u8; 32];
-        pub_arr.copy_from_slice(&pub_bytes);
+        let (verifying_arr, expected_addr) = if pub_bytes.len() == 64 {
+            // In canonical ZeroTier C++, address is derived from SHA-512 over all 64 bytes of public keys
+            let mut hasher = Sha512::new();
+            hasher.update(&pub_bytes);
+            let digest = hasher.finalize();
+            let mut addr = [0u8; 5];
+            addr.copy_from_slice(&digest[59..64]);
 
-        // Verify that the address correctly derives from the public key
-        let expected_addr = Address::from_public_key(&pub_arr);
-        if expected_addr != address {
-            bail!("Address {} does not match derived public key address {}", address, expected_addr);
-        }
+            // Ed25519 verifying key is at bytes 32..64
+            let mut ed_arr = [0u8; 32];
+            ed_arr.copy_from_slice(&pub_bytes[32..64]);
+            (ed_arr, Address(addr))
+        } else if pub_bytes.len() == 32 {
+            let mut ed_arr = [0u8; 32];
+            ed_arr.copy_from_slice(&pub_bytes);
+            let addr = Address::from_public_key(&ed_arr);
+            (ed_arr, addr)
+        } else {
+            bail!("Public key must be 32 or 64 bytes (got {})", pub_bytes.len());
+        };
 
-        let verifying_key = VerifyingKey::from_bytes(&pub_arr)
-            .map_err(|e| anyhow::anyhow!("Invalid Ed25519 verifying key: {}", e))?;
+        let verifying_key = match VerifyingKey::from_bytes(&verifying_arr) {
+            Ok(vk) => vk,
+            Err(_) => {
+                // Fallback to first 32 bytes if 64-byte layout is inverted
+                if pub_bytes.len() == 64 {
+                    let mut fallback = [0u8; 32];
+                    fallback.copy_from_slice(&pub_bytes[0..32]);
+                    VerifyingKey::from_bytes(&fallback)
+                        .map_err(|e| anyhow::anyhow!("Invalid Ed25519 verifying key: {}", e))?
+                } else {
+                    bail!("Invalid Ed25519 verifying key");
+                }
+            }
+        };
 
         let signing_key = if parts.len() >= 4 && !parts[3].is_empty() {
             let priv_bytes = hex::decode(parts[3])?;
-            if priv_bytes.len() != 32 {
-                bail!("Private key must be 32 bytes");
-            }
             let mut priv_arr = [0u8; 32];
-            priv_arr.copy_from_slice(&priv_bytes);
+            if priv_bytes.len() == 64 {
+                // Ed25519 private key is at bytes 32..64
+                priv_arr.copy_from_slice(&priv_bytes[32..64]);
+            } else if priv_bytes.len() >= 32 {
+                priv_arr.copy_from_slice(&priv_bytes[0..32]);
+            } else {
+                bail!("Private key must be at least 32 bytes (got {})", priv_bytes.len());
+            }
             Some(SigningKey::from_bytes(&priv_arr))
         } else {
             None
         };
+
+        let address = if parsed_addr != Address::NULL { parsed_addr } else { expected_addr };
 
         Ok(Identity {
             address,
