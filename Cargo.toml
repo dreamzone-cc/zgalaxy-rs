@@ -57,6 +57,10 @@ anyhow = "1.0"
 thiserror = "1.0"
 ctrlc = "3.4"
 
+[dev-dependencies]
+tempfile = "3.10"
+tower = { version = "0.4", features = ["util"] }
+
 # Linux / Unix Virtual Interface (TUN/TAP)
 [target.'cfg(unix)'.dependencies]
 tun = { version = "0.6", features = ["async"] }
