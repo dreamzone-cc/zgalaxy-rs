@@ -9,13 +9,28 @@ use anyhow::Result;
 /// Local node configuration loaded from `local.conf` and `networks.d/`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalConfig {
+    #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_management_from")]
     pub allow_management_from: Vec<String>,
+    #[serde(default)]
     pub interface_blacklist: Vec<String>,
+    #[serde(default)]
     pub interface_whitelist: Vec<String>,
+    #[serde(default)]
     pub auto_join_networks: Vec<String>,
+    #[serde(default)]
     pub physical: HashMap<String, Value>,
+    #[serde(default)]
     pub settings: HashMap<String, Value>,
+}
+
+fn default_port() -> u16 {
+    9993
+}
+
+fn default_management_from() -> Vec<String> {
+    vec!["127.0.0.1".to_string(), "::1".to_string()]
 }
 
 impl Default for LocalConfig {

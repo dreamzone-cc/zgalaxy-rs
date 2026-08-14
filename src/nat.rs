@@ -82,14 +82,26 @@ impl NatTraversalEngine {
 
         for peer in peers {
             for path in peer.paths {
-                let sock_addr = path.address;
-                debug!("[ZGALAXY NAT KEEPALIVE] Probing path {} for peer {}", sock_addr, peer.address);
-                if let Some(ref tp) = transport_opt {
+                debug!("[ZGALAXY NAT KEEPALIVE] Probing path {} for peer {}", path.address, peer.address);
+                if let (Some(ref tp), Some(sock_addr)) = (&transport_opt, parse_path_addr(&path.address)) {
                     let _ = tp.send_echo(sock_addr).await;
                 }
             }
         }
     }
+}
+
+/// Parse a ZeroTier path string ("ip/port" or "ip:port", IPv4 or bracketed
+/// IPv6) back into a `SocketAddr`.
+fn parse_path_addr(path: &str) -> Option<SocketAddr> {
+    if let Some(slash) = path.rfind('/') {
+        let host = &path[..slash];
+        let port: u16 = path[slash + 1..].parse().ok()?;
+        return format!("{}:{}", host.trim_start_matches('[').trim_end_matches(']'), port)
+            .parse()
+            .ok();
+    }
+    path.parse().ok()
 }
 
 #[cfg(test)]

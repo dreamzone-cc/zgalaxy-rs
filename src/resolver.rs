@@ -14,9 +14,21 @@ use anyhow::{bail, Result};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DomainEndpointConfig {
     pub domain: String,
+    /// Default port used when the source file omits it (e.g. ZGALAXY's
+    /// `config/domains.json` format has no port field).
+    #[serde(default = "default_domain_port")]
     pub port: u16,
+    #[serde(default = "default_true")]
     pub enabled: bool,
     pub description: Option<String>,
+}
+
+fn default_domain_port() -> u16 {
+    9993
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Resolved runtime state of a dynamic endpoint.
@@ -63,13 +75,17 @@ impl DynamicDnsResolver {
     }
 
     /// Load dynamic domains from all decoupled runtime sources:
-    /// 1. `domains.json` or `domain` file.
-    /// 2. Environment variables (`ZGALAXY_DOMAINS` or `ZGALAXY_DOMAIN`).
-    /// 3. Default community bootstrap (only if no sources provide a domain).
-    pub async fn load_sources(&self, working_dir: &Path) -> Result<()> {
+    /// 1. `domains.json` or `domain` file in the working directory.
+    /// 2. ZGALAXY engine files (`./config/domain`, `./config/domains.json`).
+    /// 3. Environment variables (`ZGALAXY_DOMAINS` or `ZGALAXY_DOMAIN`).
+    /// 4. Default community bootstrap (only if no sources provide a domain).
+    ///
+    /// `default_port` is used for sources that do not carry an explicit port
+    /// (ZGALAXY's `config/domains.json` format has no port field).
+    pub async fn load_sources(&self, working_dir: &Path, default_port: u16) -> Result<()> {
         let mut loaded_any = false;
 
-        // Source 1: Persistent domains.json
+        // Source 1: Persistent domains.json (standard format).
         let domains_json_path = working_dir.join("domains.json");
         if domains_json_path.exists() {
             if let Ok(content) = fs::read_to_string(&domains_json_path).await {
@@ -86,19 +102,64 @@ impl DynamicDnsResolver {
             }
         }
 
-        // Source 2: Single-line domain file
+        // Source 2: Single-line domain file in the working directory.
         let domain_file = working_dir.join("domain");
         if domain_file.exists() {
             if let Ok(content) = fs::read_to_string(&domain_file).await {
                 let domain = content.trim().to_string();
                 if !domain.is_empty() {
-                    self.add_domain(&domain, 9993, Some("Configured via domain file".to_string())).await?;
+                    self.add_domain(&domain, default_port, Some("Configured via domain file".to_string())).await?;
                     loaded_any = true;
                 }
             }
         }
 
-        // Source 3: Environment variables
+        // Source 3: ZGALAXY engine files (drop-in integration).
+        // The ZGALAXY container writes the planet/moon domain to
+        // <app>/config/domain and its DNS state to <app>/config/domains.json.
+        let zgalaxy_domain_file = PathBuf::from("./config/domain");
+        if !loaded_any && zgalaxy_domain_file.exists() {
+            if let Ok(content) = fs::read_to_string(&zgalaxy_domain_file).await {
+                let domain = content.trim().to_string();
+                if !domain.is_empty() {
+                    self.add_domain(&domain, default_port, Some("ZGALAXY config/domain file".to_string())).await?;
+                    loaded_any = true;
+                }
+            }
+        }
+
+        // ZGALAXY's domains.json format:
+        // [{"domain": "...", "boundTo": "...", "resolvedIp4": [...], ...}]
+        // (no port field) — fall back to the daemon's configured port.
+        let zgalaxy_domains_json = PathBuf::from("./config/domains.json");
+        if zgalaxy_domains_json.exists() {
+            if let Ok(content) = fs::read_to_string(&zgalaxy_domains_json).await {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(arr) = value.as_array() {
+                        for entry in arr {
+                            let domain = entry.get("domain").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                            if domain.is_empty() {
+                                continue;
+                            }
+                            let port = entry
+                                .get("port")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(default_port as u64) as u16;
+                            let enabled = entry
+                                .get("enabled")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(true);
+                            if enabled {
+                                self.add_domain(&domain, port, Some("ZGALAXY config/domains.json".to_string())).await?;
+                                loaded_any = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Source 4: Environment variables
         if let Ok(env_domains) = std::env::var("ZGALAXY_DOMAINS") {
             for item in env_domains.split(',') {
                 let trimmed = item.trim();

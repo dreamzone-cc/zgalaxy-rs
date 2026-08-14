@@ -337,3 +337,200 @@ cargo test                  # 8 tests, all passing
    wire and world binary formats with the canonical ZeroTier C++ serialization.
 5. **Add an end-to-end integration test** that exercises the REST API against a running
    daemon instance.
+
+---
+
+# PART II — System Integration Audit (ZGALAXY + ZTNET)
+
+**Date:** 2026-08-14 (second pass)
+**Scope:** zgalaxy-rs drop-in integration with:
+- The ZGALAXY Planet/Moon infrastructure engine (Node.js, `/home/ggonlinux/zt/zgalaxy`, `dreamzone-cc/ZGALAXY`)
+- ZTNET (ZeroTier Web UI for Private Controllers, `sinamics/ztnet`)
+
+All integration fixes below were implemented, verified with live REST flows against a
+running daemon, and covered by new unit tests.
+
+---
+
+## 10. ZTNET Integration — Issues Found & Fixed
+
+ZTNET talks to the local controller on port 9993 (configurable) using the
+`X-ZT1-Auth` header with the token from `/var/lib/zerotier-one/authtoken.secret`.
+
+### 10.1 CRITICAL — Partial network updates wiped the whole network config
+
+**Problem:** ZTNET updates a single setting at a time by POSTing partial payloads to
+`/controller/network/{nwid}` (e.g. `{"name": "..."}`, `{"v4AssignMode": {...}}`,
+`{"mtu": 4000}`, `{"dns": {...}}`, `{"routes": [...]}`). zgalaxy-rs deserialized the
+partial payload into a fresh `NetworkConfig`, silently resetting **every other field**
+to defaults. Renaming a network through ZTNET would have destroyed its routes, IP
+pools, MTU, and privacy settings.
+
+**Fix (`src/controller.rs`):** `save_network` now merges the incoming partial payload
+over the existing network configuration (top-level field merge), bumps the `revision`
+on every save, and preserves `creationTime`.
+
+**Verified:** rename → mtu/pools/routes/v4AssignMode intact; mtu update → name intact;
+dns update → everything else intact (revisions 1→2→3→4).
+
+### 10.2 CRITICAL — Partial member updates de-authorized members
+
+**Problem:** ZTNET renames members with `{"name": "..."}` alone, toggles
+`noAutoAssignIps`, or updates `ipAssignments` — always as partial payloads. zgalaxy-rs
+built a fresh `MemberRecord` from the partial payload, so `authorized` defaulted to
+**false**: renaming a member through ZTNET would have silently kicked it off the
+network.
+
+**Fix (`src/controller.rs`):** `save_member` merges the partial payload over the
+existing member record before applying authorization/auto-assign logic.
+
+**Verified:** rename-only update kept `authorized: true` and the assigned IP.
+
+### 10.3 Missing controller fields used by ZTNET
+
+**Fix (`src/controller.rs`):**
+- `NetworkConfig.dns` (ZTNET DNS mutation posts `{"dns": {"domain", "servers"}}`).
+- `MemberRecord.name`, `MemberRecord.noAutoAssignIps`, `MemberRecord.capabilities`,
+  `MemberRecord.tags` (ZTNET member update fields).
+- Auto-assign now respects `noAutoAssignIps` (ZTNET manual-IP toggle).
+
+### 10.4 Peer JSON shape mismatches (`GET /peer`)
+
+**Problem:** ZTNET reads `role` (uppercase), top-level `latency`,
+`paths[].address` as `"ip/port"`, `lastSend`/`lastReceive` (camelCase), and
+`physicalAddress`. zgalaxy-rs emitted PascalCase roles, `"ip:port"`, snake_case
+timestamps, and `latency_ms`.
+
+**Fix (`src/peer.rs`, `src/nat.rs`, `src/cli.rs`):**
+- `PeerRole` serialized uppercase (`LEAF`/`MOON`/`PLANET`).
+- Path addresses stored/serialized as canonical `"ip/port"` strings.
+- `latency_ms` → JSON `latency`; `lastSend`/`lastReceive` camelCase.
+- Added `trustedPathId`, `active`, `expired`, `fixed`, `physicalAddress`.
+- NAT keepalive worker parses `"ip/port"` back to `SocketAddr`.
+- `Address` now serializes as the 10-char hex string (was a raw byte array).
+
+### 10.5 Verified ZTNET REST flows (live)
+
+| ZTNET call | Result |
+| :--- | :--- |
+| `GET /controller` (version check) | 200, controller: true |
+| `GET /status` | address/version/online |
+| `POST /controller/network/{addr}______` (network_create) | created with pools/routes/v4AssignMode |
+| `GET /controller/network` | `["212556fe37000001"]` |
+| `POST /controller/network/{nwid}` partial updates | merge verified |
+| `POST .../member/{id}` authorize | auto IP from pool |
+| `POST .../member/{id}` rename only | authorized + IP preserved |
+| `noAutoAssignIps` member | no IP assigned |
+| `GET .../member` | object map `{memberId: revision}` |
+| `GET .../member/{id}` | full record |
+| stash update (deauth + clear) | works |
+| `DELETE .../member/{id}` | works |
+| `DELETE /controller/network/{nwid}` | works, disk cleaned |
+| `GET /metrics` | Prometheus text |
+
+---
+
+## 11. ZGALAXY Engine Integration — Issues Found & Fixed
+
+The ZGALAXY engine (Node.js) drives the node through the zerotier-idtool CLI and the
+`/var/lib/zerotier-one` data directory. zgalaxy-rs is the drop-in replacement.
+
+### 11.1 CRITICAL — `idtool genmoon` produced the wrong file name
+
+**Problem:** ZGALAXY's `MoonService.createMoon` and `entrypoint.sh` expect genmoon to
+emit `<worldId-16-hex>.moon` (e.g. `000000069ae38092.moon`). zgalaxy-rs wrote
+`moon.moon`, so ZGALAXY failed with "Failed to locate generated .moon file".
+
+**Fix (`src/cli.rs`):** genmoon now writes `format!("{:016x}.moon", world_id)`.
+**Verified:** `000000845eda834b.moon` produced.
+
+### 11.2 CRITICAL — `idtool initmoon` emitted an empty signing secret
+
+**Problem:** ZGALAXY requires `signingKey` plus a non-empty `signingKey_SECRET` /
+`signingKey_secret`; an empty secret makes `ensureMoonJsonKeys` fail permanently.
+
+**Fix (`src/cli.rs`):** initmoon reads `identity.secret` next to `identity.public`
+(real idtool behavior) and emits the full secret identity string under
+`signingKey_SECRET`, plus `worldType: "moon"` and `updatesMustBeSigned`.
+
+### 11.3 `genmoon` ignored root stableEndpoints
+
+**Problem:** ZGALAXY writes endpoints like `"197.202.16.121/9994"` into
+`moon.json roots[0].stableEndpoints`; genmoon hardcoded `dz.dreamzone.cc:9993`.
+
+**Fix (`src/cli.rs`, `src/world.rs`):** genmoon reads endpoints from the JSON (both
+`roots[].id` and `roots[].identity` accepted). The world binary format now stores the
+endpoints per root; `parse_binary` reads them back (round-trip test updated).
+
+### 11.4 Daemon ignored the ZGALAXY port convention
+
+**Problem:** ZGALAXY runs the node with the port from `/app/config/zerotier-one.port`
+(`ZT_PORT=9994`). zgalaxy-rs hardcoded 9993 for both UDP and REST.
+
+**Fix (`src/main.rs`):** port resolution = local.conf → `./config/zerotier-one.port` →
+`ZT_PORT` env → 9993. The REST control plane now binds the **same** port as the UDP
+transport (matching ZeroTier behavior).
+**Verified:** daemon bound UDP + REST on 9994 with a `config/zerotier-one.port` file.
+
+### 11.5 Resolver ignored ZGALAXY config files
+
+**Fix (`src/resolver.rs`, `src/main.rs`):** `load_sources` now also reads
+`./config/domain` and `./config/domains.json` (ZGALAXY format — no port field, so the
+daemon's port is applied as default). `DomainEndpointConfig` gained serde defaults for
+partial configs.
+
+### 11.6 ZGALAXY engine: identity validation used SHA-384 (fixed in ZGALAXY repo)
+
+**Problem:** `ZGALAXY/src/services/identityService.ts` verified `identity.public` by
+hashing the public key with **SHA-384**, while ZeroTier and zgalaxy-rs derive the
+address from **SHA-512** (last 5 bytes). Every zgalaxy-rs / real-ZeroTier identity was
+reported as `MISMATCH`.
+
+**Fix (`/home/ggonlinux/zt/zgalaxy/src/services/identityService.ts`):** `sha384` →
+`sha512`.
+**Verified:** node check — SHA-512 derives `845eda834b` = stored address (match);
+old SHA-384 logic would have produced `7acb5755f4` (mismatch). `tsc --noEmit` passes.
+
+### 11.7 Secret file permissions (security hardening)
+
+**Fix (`src/main.rs`, `src/cli.rs`):** `identity.secret` and `authtoken.secret` are now
+written with `0600` permissions on Unix (canonical ZeroTier behavior).
+**Verified:** `-rw-------` on both files in a fresh container.
+
+### 11.8 Verified ZGALAXY idtool flows (live)
+
+| ZGALAXY call | Result |
+| :--- | :--- |
+| `idtool generate identity.secret identity.public` | files created, secret 0600 |
+| `idtool initmoon identity.public` | `signingKey` + non-empty `signingKey_SECRET` |
+| `idtool genmoon moon.json` (slash endpoints) | `000000845eda834b.moon`, signed, endpoints embedded |
+
+---
+
+## 12. Remaining Known Gaps (Not Fixed — Out of Scope)
+
+1. **Wire protocol & world binary are not bit-compatible with ZeroTier C++.** The moon
+   file produced by genmoon uses a clean-room binary layout, so it cannot yet be
+   consumed by stock ZeroTier clients. Full byte-compatibility requires porting the
+   canonical ZeroTier World serialization (protobuf-like encoding + signature over
+   fields) — a larger protocol effort.
+2. **`mkmoonworld-x86_64` remains required for planets.** The ZGALAXY engine still
+   calls the C `mkmoonworld-x86_64` binary for `world.bin` (planet) generation;
+   zgalaxy-rs only replaces `zerotier-idtool` flows today.
+3. **REST binds to 127.0.0.1** — same as real ZeroTier's default. ZTNET deployments
+   using `network_mode: host` work out of the box; non-host deployments need a
+   configurable bind address (future `allow_management_from` handling).
+4. **UDP packets are not yet encrypted/authenticated** with the CryptoEngine; the
+   crypto primitives and tests are in place but the wire path is plaintext.
+
+---
+
+## 13. Updated Verification
+
+```bash
+cargo build                 # zero warnings
+cargo build --release       # optimized
+cargo clippy                # zero warnings
+cargo test                  # 14 tests passing (merge, noAutoAssignIps, peer JSON, world round-trip, ...)
+tsc --noEmit                # ZGALAXY engine compiles after SHA-512 fix
+```
