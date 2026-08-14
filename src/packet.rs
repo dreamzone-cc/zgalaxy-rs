@@ -19,6 +19,7 @@ pub enum PacketType {
     Frame = 0x06,
     ExtFrame = 0x07,
     Echo = 0x08,
+    Pong = 0x0f,
     MulticastLike = 0x09,
     NetworkCredentials = 0x0a,
     NetworkConfigRequest = 0x0b,
@@ -49,6 +50,7 @@ impl From<u8> for PacketType {
             0x0c => PacketType::NetworkConfig,
             0x0d => PacketType::MulticastGather,
             0x0e => PacketType::MulticastFrame,
+            0x0f => PacketType::Pong,
             0x10 => PacketType::PushDirectPaths,
             0x12 => PacketType::UserMessage,
             0x13 => PacketType::RemoteTrace,
@@ -69,6 +71,7 @@ impl From<PacketType> for u8 {
             PacketType::Frame => 0x06,
             PacketType::ExtFrame => 0x07,
             PacketType::Echo => 0x08,
+            PacketType::Pong => 0x0f,
             PacketType::MulticastLike => 0x09,
             PacketType::NetworkCredentials => 0x0a,
             PacketType::NetworkConfigRequest => 0x0b,
@@ -183,5 +186,37 @@ mod tests {
         assert_eq!(decoded.packet_id, 1001);
         assert_eq!(decoded.packet_type, PacketType::Echo);
         assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn test_all_packet_types_round_trip() {
+        let dest = Address([0x06, 0x9a, 0xe3, 0x80, 0x92]);
+        let src = Address([0x12, 0x34, 0x56, 0x78, 0x9a]);
+        let types = [
+            PacketType::Nop,
+            PacketType::Hello,
+            PacketType::Error,
+            PacketType::Ok,
+            PacketType::Whois,
+            PacketType::Rendezvous,
+            PacketType::Frame,
+            PacketType::ExtFrame,
+            PacketType::Echo,
+            PacketType::Pong,
+            PacketType::MulticastLike,
+            PacketType::NetworkCredentials,
+            PacketType::NetworkConfigRequest,
+            PacketType::NetworkConfig,
+            PacketType::MulticastGather,
+            PacketType::MulticastFrame,
+            PacketType::PushDirectPaths,
+            PacketType::UserMessage,
+            PacketType::RemoteTrace,
+        ];
+        for pt in types {
+            let pkt = Packet::new(dest, src, 1, pt, Bytes::new());
+            let decoded = Packet::decode(pkt.encode()).unwrap();
+            assert_eq!(decoded.packet_type, pt, "round-trip failed for {pt:?}");
+        }
     }
 }

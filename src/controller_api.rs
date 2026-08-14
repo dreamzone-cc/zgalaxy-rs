@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use axum::{
@@ -137,16 +136,12 @@ async fn get_controller_status(
     })))
 }
 
-async fn get_metrics(
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let metrics = format!(
-        "# HELP zgalaxy_controller_status Status of ZGALAXY controller\n# TYPE zgalaxy_controller_status gauge\nzgalaxy_controller_status 1\n# HELP zgalaxy_version Controller version\n# TYPE zgalaxy_version gauge\nzgalaxy_version 1\n"
-    );
+async fn get_metrics() -> impl IntoResponse {
+    const METRICS: &str = "# HELP zgalaxy_controller_status Status of ZGALAXY controller\n# TYPE zgalaxy_controller_status gauge\nzgalaxy_controller_status 1\n# HELP zgalaxy_version Controller version\n# TYPE zgalaxy_version gauge\nzgalaxy_version 1\n";
     (
         StatusCode::OK,
         [("Content-Type", "text/plain; version=0.0.4")],
-        metrics,
+        METRICS,
     )
 }
 

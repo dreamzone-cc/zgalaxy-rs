@@ -100,7 +100,7 @@ impl Identity {
             let pub_bytes = verifying_key.to_bytes();
 
             let mut hasher = Sha512::new();
-            hasher.update(&pub_bytes);
+            hasher.update(pub_bytes);
             let digest = hasher.finalize();
 
             // Hashcash difficulty condition: digest[0] < 17 and address is not reserved

@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, debug};
 use serde::{Serialize, Deserialize};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 /// Configuration entry for a dynamic domain endpoint source.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

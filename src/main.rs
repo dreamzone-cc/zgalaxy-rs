@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use clap::Parser;
 use tokio::fs;
@@ -46,7 +46,27 @@ async fn main() -> Result<()> {
 
     let data_dir = PathBuf::from("/var/lib/zerotier-one");
     let fallback_dir = PathBuf::from("./zerotier-var");
-    let working_dir = if data_dir.exists() { data_dir } else { fallback_dir };
+    let mut working_dir = fallback_dir.clone();
+    if data_dir.exists() {
+        // Prefer the system data dir only if it is actually writable.
+        if let Ok(meta) = fs::metadata(&data_dir).await {
+            if !meta.permissions().readonly() {
+                let probe = data_dir.join(".zgalaxy_write_probe");
+                match fs::write(&probe, b"").await {
+                    Ok(_) => {
+                        let _ = fs::remove_file(&probe).await;
+                        working_dir = data_dir;
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Data directory {:?} exists but is not writable; falling back to {:?}",
+                            data_dir, fallback_dir
+                        );
+                    }
+                }
+            }
+        }
+    }
     let _ = fs::create_dir_all(&working_dir).await;
 
     // Load Local Configuration (local.conf and networks.d/)
@@ -125,10 +145,27 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Initialize High-Performance UDP Transport Loop
-    let (tun_tx, _tun_rx) = mpsc::channel::<Vec<u8>>(1024);
+    // Initialize High-Performance UDP Transport Loop & Virtual Adapter Routing
+    let (tun_inbound_tx, tun_inbound_rx) = mpsc::channel::<Vec<u8>>(1024);
+    let (tun_outbound_tx, mut tun_outbound_rx) = mpsc::channel::<Vec<u8>>(1024);
+
+    let mut tun_device = zgalaxy_rs::tun::TunDevice::new("zgalaxy0", 2800);
+    let _ = tun_device.create_and_bind(None).await;
+    let tun_arc = Arc::new(tun_device);
+    tun_arc.start_packet_loop(tun_inbound_rx, tun_outbound_tx);
+
     if let Ok(transport) = UdpTransport::bind(local_config.port, identity.clone(), peer_manager.clone(), resolver.clone()).await {
-        transport.start_rx_loop(tun_tx);
+        let transport_arc = Arc::new(transport);
+        transport_arc.start_rx_loop(tun_inbound_tx);
+        nat_engine.set_transport(transport_arc.clone()).await;
+
+        // Relay host outbound frames captured from TUN into UDP wire transport
+        let tp_for_outbound = transport_arc.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = tun_outbound_rx.recv().await {
+                let _ = tp_for_outbound.broadcast_frame(frame).await;
+            }
+        });
     } else {
         warn!("[ZGALAXY UDP] Could not bind UDP port {}, running in client API mode.", local_config.port);
     }

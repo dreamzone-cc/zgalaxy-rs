@@ -1,13 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
 use serde_json::{json, Value};
-use tracing::{info, warn, error};
+use tracing::info;
 use anyhow::{bail, Context, Result};
 
 use crate::identity::{Address, Identity};
@@ -31,47 +31,70 @@ pub struct IpAssignmentPool {
 /// ZeroTier Network Configuration (Embedded Controller Model).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub nwid: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub private: bool,
-    #[serde(rename = "creationTime")]
+    #[serde(rename = "creationTime", default)]
     pub creation_time: u64,
+    #[serde(default)]
     pub revision: u64,
+    #[serde(default = "default_mtu")]
     pub mtu: u32,
-    #[serde(rename = "multicastLimit")]
+    #[serde(rename = "multicastLimit", default = "default_multicast_limit")]
     pub multicast_limit: u32,
-    #[serde(rename = "enableBroadcast")]
+    #[serde(rename = "enableBroadcast", default)]
     pub enable_broadcast: bool,
+    #[serde(default)]
     pub routes: Vec<NetworkRoute>,
-    #[serde(rename = "ipAssignmentPools")]
+    #[serde(rename = "ipAssignmentPools", default)]
     pub ip_assignment_pools: Vec<IpAssignmentPool>,
-    #[serde(rename = "v4AssignMode")]
+    #[serde(rename = "v4AssignMode", default)]
     pub v4_assign_mode: Value,
-    #[serde(rename = "v6AssignMode")]
+    #[serde(rename = "v6AssignMode", default)]
     pub v6_assign_mode: Value,
+    #[serde(default)]
     pub rules: Vec<Value>,
+    #[serde(default)]
     pub capabilities: Vec<Value>,
+    #[serde(default)]
     pub tags: Vec<Value>,
+}
+
+fn default_mtu() -> u32 {
+    2800
+}
+
+fn default_multicast_limit() -> u32 {
+    32
 }
 
 /// Network Member Status and Authorization Record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemberRecord {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub nwid: String,
+    #[serde(default)]
     pub objtype: String,
+    #[serde(default)]
     pub authorized: bool,
-    #[serde(rename = "activeBridge")]
+    #[serde(rename = "activeBridge", default)]
     pub active_bridge: bool,
-    #[serde(rename = "ipAssignments")]
+    #[serde(rename = "ipAssignments", default)]
     pub ip_assignments: Vec<String>,
+    #[serde(default)]
     pub revision: u64,
-    #[serde(rename = "creationTime")]
+    #[serde(rename = "creationTime", default)]
     pub creation_time: u64,
-    #[serde(rename = "lastAuthorizedTime")]
+    #[serde(rename = "lastAuthorizedTime", default)]
     pub last_authorized_time: u64,
-    #[serde(rename = "lastDeauthorizedTime")]
+    #[serde(rename = "lastDeauthorizedTime", default)]
     pub last_deauthorized_time: u64,
     pub identity: Option<String>,
 }
@@ -81,6 +104,7 @@ pub struct MemberRecord {
 #[derive(Clone)]
 pub struct EmbeddedController {
     controller_address: Address,
+    #[allow(dead_code)]
     identity: Identity,
     db_path: PathBuf,
     networks: Arc<RwLock<HashMap<String, NetworkConfig>>>,
@@ -170,19 +194,34 @@ impl EmbeddedController {
         nets.get(nwid).cloned()
     }
 
+    /// Generate the next unique network ID (controller address + 6-hex counter).
+    async fn next_network_id(&self) -> String {
+        let nets = self.networks.read().await;
+        let mut counter: u64 = 1;
+        loop {
+            let candidate = format!("{:06x}", counter);
+            let nwid = format!("{}{}", self.controller_address, candidate);
+            if !nets.contains_key(&nwid) {
+                return nwid;
+            }
+            counter += 1;
+            if counter > 0x00ff_ffff {
+                return format!("{}{:06x}", self.controller_address, rand::random::<u32>() & 0x00ff_ffff);
+            }
+        }
+    }
+
     /// Create or update a network configuration.
     pub async fn save_network(&self, mut config: Value) -> Result<NetworkConfig> {
         let nwid = if let Some(id_val) = config.get("id").or_else(|| config.get("nwid")) {
             let id_str = id_val.as_str().unwrap_or("").to_string();
             if id_str.contains("______") || id_str.is_empty() || id_str.len() != 16 {
-                let count = self.networks.read().await.len() + 1;
-                format!("{}{:06x}", self.controller_address, count)
+                self.next_network_id().await
             } else {
                 id_str
             }
         } else {
-            let count = self.networks.read().await.len() + 1;
-            format!("{}{:06x}", self.controller_address, count)
+            self.next_network_id().await
         };
 
         if nwid.len() != 16 {
@@ -277,7 +316,9 @@ impl EmbeddedController {
             if record.ip_assignments.is_empty() {
                 if let Some(net) = self.get_network(nwid).await {
                     if let Some(pool) = net.ip_assignment_pools.first() {
-                        record.ip_assignments.push(pool.ip_range_start.clone());
+                        if let Some(free_ip) = self.next_free_ip(nwid, pool).await {
+                            record.ip_assignments.push(free_ip);
+                        }
                     }
                 }
             }
@@ -299,6 +340,37 @@ impl EmbeddedController {
 
         info!("[ZGALAXY CONTROLLER] Member {} updated in network {} (authorized: {})", member_id, nwid, record.authorized);
         Ok(record)
+    }
+
+    /// Find the next free IPv4 address within an assignment pool, excluding addresses
+    /// already assigned to other authorized members of the network.
+    async fn next_free_ip(&self, nwid: &str, pool: &IpAssignmentPool) -> Option<String> {
+        let start = pool.ip_range_start.parse::<Ipv4Addr>().ok()?;
+        let end = pool.ip_range_end.parse::<Ipv4Addr>().ok()?;
+        let start_u32 = u32::from(start);
+        let end_u32 = u32::from(end);
+        if end_u32 < start_u32 {
+            return None;
+        }
+
+        let members = self.members.read().await;
+        let used: HashSet<u32> = members
+            .get(nwid)
+            .map(|m| {
+                m.values()
+                    .filter(|r| r.authorized)
+                    .flat_map(|r| r.ip_assignments.iter())
+                    .filter_map(|ip| ip.parse::<Ipv4Addr>().ok().map(u32::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for candidate in start_u32..=end_u32 {
+            if !used.contains(&candidate) {
+                return Some(Ipv4Addr::from(candidate).to_string());
+            }
+        }
+        None
     }
 
     /// Delete member record from controller.

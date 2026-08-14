@@ -1,10 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tokio::fs;
 use serde_json::Value;
 use anyhow::{bail, Context, Result};
 use crate::identity::Identity;
-
 #[derive(Parser, Debug)]
 #[command(name = "zgalaxy-cli", author, version, about = "ZGALAXY Sovereign ZeroTier-Compatible Command-Line Interface")]
 pub struct Cli {
@@ -39,12 +38,15 @@ pub enum Commands {
     },
 
     /// List all currently joined networks
+    #[command(name = "listnetworks", alias = "list-networks")]
     ListNetworks,
 
     /// List active connected peers and roots
+    #[command(name = "listpeers", alias = "list-peers")]
     ListPeers,
 
     /// Identity & Moon management tool (zerotier-idtool compatible)
+    #[command(name = "idtool", alias = "id-tool")]
     IdTool {
         #[command(subcommand)]
         sub: IdToolCommands,
@@ -62,12 +64,14 @@ pub enum IdToolCommands {
     },
 
     /// Initialize moon JSON configuration template from public identity
+    #[command(name = "initmoon", alias = "init-moon")]
     InitMoon {
         #[arg(help = "Input public identity file path", default_value = "identity.public")]
         public_file: String,
     },
 
     /// Compile moon JSON configuration into signed binary .moon file
+    #[command(name = "genmoon", alias = "gen-moon")]
     GenMoon {
         #[arg(help = "Input moon JSON file path", default_value = "moon.json")]
         moon_json: String,
@@ -101,7 +105,6 @@ impl Cli {
     /// Execute a client command via HTTP REST call to the daemon.
     pub async fn execute(self) -> Result<()> {
         let token = self.resolve_token().await;
-        let client = reqwest_or_hyper_get();
 
         match self.command {
             Commands::Status | Commands::Info => {
@@ -203,7 +206,50 @@ impl Cli {
                     println!("{}", serde_json::to_string_pretty(&template)?);
                 }
                 IdToolCommands::GenMoon { moon_json } => {
-                    println!("Signed moon generated from {}", moon_json);
+                    let content = fs::read_to_string(&moon_json).await
+                        .with_context(|| format!("Failed to read moon config {}", moon_json))?;
+                    let value: Value = serde_json::from_str(&content)?;
+
+                    let id_str = value["id"].as_str().unwrap_or("").to_string();
+                    let root_ids: Vec<String> = value["roots"]
+                        .as_array()
+                        .map(|roots| roots.iter().filter_map(|r| r["id"].as_str().map(|s| s.to_string())).collect())
+                        .unwrap_or_default();
+
+                    let id = id_str.parse::<crate::identity::Address>()
+                        .context("Invalid moon id address")?;
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_millis() as u64;
+
+                    let roots = root_ids
+                        .iter()
+                        .filter_map(|r| r.parse::<crate::identity::Address>().ok())
+                        .map(|addr| crate::world::WorldRoot {
+                            identity: addr,
+                            stable_endpoints: vec!["dz.dreamzone.cc:9993".to_string()],
+                        })
+                        .collect();
+
+                    let mut world = crate::world::World::new(
+                        crate::world::WORLD_TYPE_MOON,
+                        id.to_u64(),
+                        timestamp,
+                        roots,
+                    );
+
+                    // Sign the world if a secret signing key is available
+                    if let Some(secret_key_hex) = value["signingKey_secret"].as_str() {
+                        if !secret_key_hex.is_empty() {
+                            let secret_identity = crate::identity::Identity::parse(secret_key_hex)?;
+                            let sig = secret_identity.sign(&world.encode())?;
+                            world.signature = sig.to_vec();
+                        }
+                    }
+
+                    let output = moon_json.replace(".json", ".moon");
+                    world.save_to_file(&output).await?;
+                    println!("Signed moon written to {}", output);
                 }
             },
         }
@@ -211,12 +257,7 @@ impl Cli {
     }
 }
 
-fn reqwest_or_hyper_get() -> () {
-    ()
-}
-
 async fn fetch_json(url: &str, token: &str) -> Result<Value> {
-    use std::io::{Read, Write};
     let parsed = url::Url::parse(url)?;
     let host = parsed.host_str().unwrap_or("127.0.0.1");
     let port = parsed.port().unwrap_or(9993);

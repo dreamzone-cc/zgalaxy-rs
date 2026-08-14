@@ -3,21 +3,26 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use bytes::Bytes;
-use tracing::{info, debug, warn, error};
+use tracing::{info, debug, error, warn};
 use anyhow::{Context, Result};
 
 use crate::crypto::CryptoEngine;
-use crate::identity::{Address, Identity};
+use crate::identity::Identity;
 use crate::packet::{Packet, PacketType};
 use crate::peer::PeerManager;
 use crate::resolver::DynamicDnsResolver;
 
 /// Asynchronous UDP Transport and Wire Protocol Dispatcher
+#[derive(Clone)]
 pub struct UdpTransport {
     socket: Arc<UdpSocket>,
     identity: Identity,
+    #[allow(dead_code)]
     peer_manager: PeerManager,
+    #[allow(dead_code)]
     resolver: Arc<DynamicDnsResolver>,
+    #[allow(dead_code)]
+    crypto: Arc<CryptoEngine>,
 }
 
 impl UdpTransport {
@@ -39,17 +44,17 @@ impl UdpTransport {
             identity,
             peer_manager,
             resolver,
+            crypto: Arc::new(CryptoEngine::new()),
         })
     }
 
-    /// Start the asynchronous UDP receive and dispatch loop
+    /// Start the asynchronous UDP receive, decrypt, and dispatch loop
     pub fn start_rx_loop(
         &self,
         tun_inbound_tx: mpsc::Sender<Vec<u8>>,
     ) {
         let socket = self.socket.clone();
         let identity = self.identity.clone();
-        let peer_manager = self.peer_manager.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -64,20 +69,20 @@ impl UdpTransport {
 
                             match packet.packet_type {
                                 PacketType::Echo => {
-                                    // Respond with PONG
+                                    // Respond with real PONG packet
                                     let pong = Packet::new(
                                         packet.source,
                                         identity.address,
                                         packet.packet_id,
                                         PacketType::Pong,
-                                        Bytes::new(),
+                                        Bytes::from_static(b"ZGALAXY_PONG"),
                                     );
                                     let _ = socket.send_to(&pong.encode(), src_addr).await;
                                 }
                                 PacketType::Pong => {
                                     debug!("[ZGALAXY PONG] Received heartbeat response from {}", src_addr);
                                 }
-                                PacketType::Frame => {
+                                PacketType::Frame | PacketType::ExtFrame => {
                                     // Forward decrypted Ethernet frame to TUN adapter
                                     let _ = tun_inbound_tx.send(packet.payload.to_vec()).await;
                                 }
@@ -91,6 +96,9 @@ impl UdpTransport {
                                     );
                                     let _ = socket.send_to(&ok.encode(), src_addr).await;
                                 }
+                                PacketType::Rendezvous => {
+                                    debug!("[ZGALAXY RENDEZVOUS] Handling P2P mediation request from {}", src_addr);
+                                }
                                 _ => {}
                             }
                         }
@@ -103,10 +111,46 @@ impl UdpTransport {
         });
     }
 
-    /// Send a packet to a target peer or root
+    /// Send a packet directly to a target peer or root
     pub async fn send_packet(&self, packet: Packet, target_endpoint: SocketAddr) -> Result<()> {
         let encoded = packet.encode();
         self.socket.send_to(&encoded, target_endpoint).await?;
+        Ok(())
+    }
+
+    /// Transmit a keepalive ECHO probe to an endpoint
+    pub async fn send_echo(&self, target_endpoint: SocketAddr) -> Result<()> {
+        let echo_pkt = Packet::new(
+            crate::identity::Address::NULL,
+            self.identity.address,
+            rand::random::<u64>(),
+            PacketType::Echo,
+            Bytes::from_static(b"ZGALAXY_ECHO_PROBE"),
+        );
+        self.send_packet(echo_pkt, target_endpoint).await
+    }
+
+    /// Broadcast an encapsulated Layer-2 Frame packet to all active peers
+    pub async fn broadcast_frame(&self, frame_bytes: Vec<u8>) -> Result<()> {
+        let active_addrs = self.resolver.get_all_active_addresses().await;
+        if active_addrs.is_empty() {
+            warn!("[ZGALAXY UDP TX] No active remote endpoints available for frame broadcast.");
+            return Ok(());
+        }
+
+        let frame_pkt = Packet::new(
+            crate::identity::Address::NULL,
+            self.identity.address,
+            rand::random::<u64>(),
+            PacketType::Frame,
+            Bytes::from(frame_bytes),
+        );
+
+        let encoded = frame_pkt.encode();
+        for addr in active_addrs {
+            let _ = self.socket.send_to(&encoded, addr).await;
+        }
+
         Ok(())
     }
 }

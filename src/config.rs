@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::fs;
 use serde::{Serialize, Deserialize};
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::info;
 use anyhow::Result;
 
 /// Local node configuration loaded from `local.conf` and `networks.d/`

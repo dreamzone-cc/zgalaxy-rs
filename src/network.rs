@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
@@ -59,12 +58,12 @@ impl NetworkManager {
             name: format!("ZT-{}", clean_nwid),
             status: NetworkStatus::Ok,
             type_name: "PRIVATE".to_string(),
-            mac: "fe:12:34:56:78:9a".to_string(),
+            mac: Self::derive_mac(&clean_nwid),
             mtu: 2800,
             broadcast_enabled: true,
-            assigned_addresses: vec!["10.147.17.100/24".to_string()],
+            assigned_addresses: vec![Self::derive_ipv4(&clean_nwid)],
             routes: vec![ManagedRoute {
-                target: "10.147.17.0/24".to_string(),
+                target: Self::derive_route_network(&clean_nwid),
                 via: None,
             }],
             port_device_name: format!("zt-{}", &clean_nwid[..6]),
@@ -77,6 +76,37 @@ impl NetworkManager {
         let clean_nwid = nwid.trim().to_lowercase();
         let mut networks = self.networks.write().await;
         Ok(networks.remove(&clean_nwid).is_some())
+    }
+
+    /// Derive a locally-administered unicast MAC address from the network ID.
+    fn derive_mac(nwid: &str) -> String {
+        let b = hex::decode(nwid).unwrap_or_default();
+        let mut mac = [0u8; 6];
+        for (i, byte) in mac.iter_mut().enumerate() {
+            *byte = b.get(i + 4).copied().unwrap_or(0);
+        }
+        mac[0] = (mac[0] & 0xfe) | 0x02;
+        format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        )
+    }
+
+    /// Derive a unique 10.x.x.x IPv4 address from the network ID's tail bytes.
+    fn derive_ipv4(nwid: &str) -> String {
+        let b = hex::decode(nwid).unwrap_or_default();
+        let a = b.get(12).copied().unwrap_or(1);
+        let c = b.get(13).copied().unwrap_or(2);
+        let d = b.get(14).copied().unwrap_or(3);
+        format!("10.{}.{}.{}/24", 128 + (a % 126), c, d)
+    }
+
+    /// Derive the route network address (subnet) for the derived IPv4 address.
+    fn derive_route_network(nwid: &str) -> String {
+        let b = hex::decode(nwid).unwrap_or_default();
+        let a = b.get(12).copied().unwrap_or(1);
+        let c = b.get(13).copied().unwrap_or(2);
+        format!("10.{}.{}.0/24", 128 + (a % 126), c)
     }
 
     pub async fn list(&self) -> Vec<Network> {

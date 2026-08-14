@@ -4,10 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{info, debug, warn};
+use tracing::{info, debug};
 
 use crate::identity::Address;
 use crate::peer::{PeerManager, PeerRole};
+use crate::transport::UdpTransport;
 
 #[derive(Debug, Clone)]
 pub struct NatPathCandidate {
@@ -23,6 +24,7 @@ pub struct NatTraversalEngine {
     peer_manager: PeerManager,
     path_candidates: Arc<RwLock<HashMap<Address, Vec<NatPathCandidate>>>>,
     keepalive_interval: Duration,
+    transport: Arc<RwLock<Option<Arc<UdpTransport>>>>,
 }
 
 impl NatTraversalEngine {
@@ -31,7 +33,14 @@ impl NatTraversalEngine {
             peer_manager,
             path_candidates: Arc::new(RwLock::new(HashMap::new())),
             keepalive_interval: Duration::from_secs(25), // 25s keepalive for stateful NAT firewalls
+            transport: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Attach the active UDP transport to enable transmitting real keepalive probes
+    pub async fn set_transport(&self, transport: Arc<UdpTransport>) {
+        let mut guard = self.transport.write().await;
+        *guard = Some(transport);
     }
 
     /// Register a discovered path candidate (from STUN rendezvous or direct packet)
@@ -69,11 +78,34 @@ impl NatTraversalEngine {
 
     async fn send_keepalives(&self) {
         let peers = self.peer_manager.list_peers().await;
+        let transport_opt = self.transport.read().await.clone();
+
         for peer in peers {
             for path in peer.paths {
-                debug!("[ZGALAXY NAT KEEPALIVE] Probing path {} for peer {}", path.address, peer.address);
-                // The transport layer handles sending the ECHO packet over UDP
+                let sock_addr = path.address;
+                debug!("[ZGALAXY NAT KEEPALIVE] Probing path {} for peer {}", sock_addr, peer.address);
+                if let Some(ref tp) = transport_opt {
+                    let _ = tp.send_echo(sock_addr).await;
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_nat_candidate_registration() {
+        let pm = PeerManager::new();
+        let nat = NatTraversalEngine::new(pm.clone());
+        let addr = Address([1, 2, 3, 4, 5]);
+        let sock: SocketAddr = "127.0.0.1:9993".parse().unwrap();
+
+        nat.register_path_candidate(addr, sock, true, 12).await;
+        let peers = pm.list_peers().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].address, addr);
     }
 }

@@ -1,17 +1,20 @@
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit},
-    ChaCha20Poly1305, Nonce as ChaChaNonce, Tag,
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Nonce as ChaChaNonce,
 };
 use salsa20::cipher::{KeyIvInit, StreamCipher};
 use salsa20::Salsa20;
 use rand::rngs::OsRng;
-use anyhow::{bail, Result};
+use anyhow::Result;
 
-/// Cryptographic engine supporting X25519, ChaCha20-Poly1305, and Salsa20.
+#[derive(Default, Clone, Copy, Debug)]
 pub struct CryptoEngine;
 
 impl CryptoEngine {
+    pub fn new() -> Self {
+        CryptoEngine
+    }
     /// Generate an ephemeral X25519 secret and public key pair for Diffie-Hellman key exchange.
     pub fn generate_ephemeral_keypair() -> (EphemeralSecret, PublicKey) {
         let secret = EphemeralSecret::random_from_rng(OsRng);
