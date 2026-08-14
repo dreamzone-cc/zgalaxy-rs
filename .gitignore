@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Keys and sensitive tokens
+*.secret
+*.key
+identity.secret
+authtoken.secret
+.secret_key
+
+# Temporary and local test files
+zerotier-var/
+controller.d/
+networks.d/
+*.log
+*.bak
+*.tmp
+
+# Operating system files
+.DS_Store
+Thumbs.db

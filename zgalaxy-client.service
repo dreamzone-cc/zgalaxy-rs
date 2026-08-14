@@ -1,0 +1,17 @@
+[Unit]
+Description=ZGALAXY Sovereign ZeroTier Client Daemon (Rust)
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/zgalaxy-rs
+Restart=always
+RestartSec=3
+User=root
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
