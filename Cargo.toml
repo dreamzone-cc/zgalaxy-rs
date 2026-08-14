@@ -2,7 +2,7 @@
 name = "zgalaxy-rs"
 version = "1.3.0"
 edition = "2021"
-authors = ["DreamZone Community <dev@dreamzone.cc>"]
+authors = ["DreamZone Community"]
 license = "AGPL-3.0-or-later"
 description = "High-Performance Sovereign ZeroTier-Compatible Client & Daemon in Rust"
 homepage = "https://github.com/dreamzone-cc/ZGALAXY"

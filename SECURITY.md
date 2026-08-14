@@ -9,6 +9,6 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability within **ZGALAXY-RS**, please send an email to the security team at `security@dreamzone.cc`. 
+If you discover a security vulnerability within **ZGALAXY-RS**, please submit a report privately via GitHub Security Advisories.
 
 Please do NOT create a public GitHub issue for security vulnerabilities. All reports will be promptly acknowledged, analyzed, and patched.

@@ -188,7 +188,7 @@ We welcome community contributions! Please read [`CONTRIBUTING.md`](CONTRIBUTING
 
 ## 🛡️ Security
 
-For vulnerability disclosures, please review [`SECURITY.md`](SECURITY.md) or email `security@dreamzone.cc`.
+For vulnerability disclosures, please review [`SECURITY.md`](SECURITY.md).
 
 ---
 
