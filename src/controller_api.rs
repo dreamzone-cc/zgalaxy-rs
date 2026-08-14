@@ -60,8 +60,8 @@ impl ControllerServer {
 
     pub async fn start(state: AppState, port: u16) -> anyhow::Result<()> {
         let app = Self::build_router(state);
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        info!("[ZGALAXY LOCAL REST API] Listening on http://{}", addr);
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        info!("[ZGALAXY REST API] Listening on http://{}", addr);
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
