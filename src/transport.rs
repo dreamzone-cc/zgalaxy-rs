@@ -1,16 +1,19 @@
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use bytes::Bytes;
 use tracing::{info, debug, error, warn};
 use anyhow::{Context, Result};
 
 use crate::crypto::CryptoEngine;
-use crate::identity::Identity;
+use crate::identity::{Address, Identity};
 use crate::packet::{Packet, PacketType};
 use crate::peer::PeerManager;
 use crate::resolver::DynamicDnsResolver;
+use crate::controller::EmbeddedController;
+use crate::network::NetworkManager;
 
 /// Asynchronous UDP Transport and Wire Protocol Dispatcher
 #[derive(Clone)]
@@ -23,6 +26,8 @@ pub struct UdpTransport {
     resolver: Arc<DynamicDnsResolver>,
     #[allow(dead_code)]
     crypto: Arc<CryptoEngine>,
+    controller: Arc<RwLock<Option<EmbeddedController>>>,
+    network_manager: Arc<RwLock<Option<NetworkManager>>>,
 }
 
 impl UdpTransport {
@@ -45,7 +50,19 @@ impl UdpTransport {
             peer_manager,
             resolver,
             crypto: Arc::new(CryptoEngine::new()),
+            controller: Arc::new(RwLock::new(None)),
+            network_manager: Arc::new(RwLock::new(None)),
         })
+    }
+
+    pub async fn set_controller(&self, controller: EmbeddedController) {
+        let mut ctrl = self.controller.write().await;
+        *ctrl = Some(controller);
+    }
+
+    pub async fn set_network_manager(&self, network_manager: NetworkManager) {
+        let mut nm = self.network_manager.write().await;
+        *nm = Some(network_manager);
     }
 
     /// Start the asynchronous UDP receive, decrypt, and dispatch loop
@@ -55,6 +72,8 @@ impl UdpTransport {
     ) {
         let socket = self.socket.clone();
         let identity = self.identity.clone();
+        let controller_lock = self.controller.clone();
+        let network_manager_lock = self.network_manager.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -95,6 +114,67 @@ impl UdpTransport {
                                         Bytes::from_static(b"ZGALAXY_OK"),
                                     );
                                     let _ = socket.send_to(&ok.encode(), src_addr).await;
+                                }
+                                PacketType::NetworkConfigRequest | PacketType::NetworkCredentials => {
+                                    if packet.payload.len() >= 8 {
+                                        let nwid_u64 = u64::from_be_bytes(packet.payload[0..8].try_into().unwrap_or_default());
+                                        let nwid_hex = format!("{:016x}", nwid_u64);
+                                        let member_id = format!("{}", packet.source);
+
+                                        let ctrl_guard = controller_lock.read().await;
+                                        if let Some(ref ctrl) = *ctrl_guard {
+                                            info!("[ZGALAXY WIRE CONTROLLER] Processing join request for member {} into network {}", member_id, nwid_hex);
+                                            let _ = ctrl.register_join_request(&nwid_hex, &member_id, None).await;
+
+                                            if let Some(net) = ctrl.get_network(&nwid_hex).await {
+                                                let member_opt = ctrl.get_member(&nwid_hex, &member_id).await;
+                                                let is_auth = member_opt.as_ref().map(|m| m.authorized).unwrap_or(false);
+                                                let ips = member_opt.map(|m| m.ip_assignments).unwrap_or_default();
+
+                                                let config_resp = serde_json::json!({
+                                                    "nwid": nwid_hex,
+                                                    "name": net.name,
+                                                    "authorized": is_auth,
+                                                    "ipAssignments": ips,
+                                                    "routes": net.routes,
+                                                    "mtu": net.mtu
+                                                });
+
+                                                let resp_bytes = Bytes::from(serde_json::to_vec(&config_resp).unwrap_or_default());
+                                                let config_pkt = Packet::new(
+                                                    packet.source,
+                                                    identity.address,
+                                                    packet.packet_id,
+                                                    PacketType::NetworkConfig,
+                                                    resp_bytes,
+                                                );
+                                                let _ = socket.send_to(&config_pkt.encode(), src_addr).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                PacketType::NetworkConfig => {
+                                    if let Ok(config_val) = serde_json::from_slice::<serde_json::Value>(&packet.payload) {
+                                        if let Some(nwid) = config_val.get("nwid").and_then(|v| v.as_str()) {
+                                            let authorized = config_val.get("authorized").and_then(|v| v.as_bool()).unwrap_or(false);
+                                            let ips: Vec<String> = config_val.get("ipAssignments")
+                                                .and_then(|v| v.as_array())
+                                                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                                                .unwrap_or_default();
+
+                                            let nm_guard = network_manager_lock.read().await;
+                                            if let Some(ref nm) = *nm_guard {
+                                                if let Some(mut net) = nm.get(nwid).await {
+                                                    net.status = if authorized { crate::network::NetworkStatus::Ok } else { crate::network::NetworkStatus::AccessDenied };
+                                                    if !ips.is_empty() {
+                                                        net.assigned_addresses = ips;
+                                                    }
+                                                    nm.update_network(net).await;
+                                                    info!("[ZGALAXY CLIENT NETWORK] Updated network {} (authorized: {})", nwid, authorized);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 PacketType::Rendezvous => {
                                     debug!("[ZGALAXY RENDEZVOUS] Handling P2P mediation request from {}", src_addr);
@@ -149,6 +229,46 @@ impl UdpTransport {
         let encoded = frame_pkt.encode();
         for addr in active_addrs {
             let _ = self.socket.send_to(&encoded, addr).await;
+        }
+
+        Ok(())
+    }
+
+    /// Transmit a NetworkConfigRequest packet for a joined network to controller endpoints and roots.
+    pub async fn send_network_config_request(&self, nwid_str: &str) -> Result<()> {
+        let clean_nwid = nwid_str.trim().to_lowercase();
+        let nwid_u64 = u64::from_str_radix(&clean_nwid, 16).unwrap_or(0);
+        let nwid_bytes = nwid_u64.to_be_bytes();
+
+        let controller_addr_str = if clean_nwid.len() >= 10 { &clean_nwid[..10] } else { "0000000000" };
+        let controller_addr = Address::from_str(controller_addr_str).unwrap_or(Address::NULL);
+
+        let req_pkt = Packet::new(
+            controller_addr,
+            self.identity.address,
+            rand::random::<u64>(),
+            PacketType::NetworkConfigRequest,
+            Bytes::copy_from_slice(&nwid_bytes),
+        );
+
+        let encoded = req_pkt.encode();
+
+        // 1. Send to all active resolver addresses
+        let addrs = self.resolver.get_all_active_addresses().await;
+        for addr in addrs {
+            let _ = self.socket.send_to(&encoded, addr).await;
+        }
+
+        // 2. Send to known controller and LAN endpoints
+        let lan_candidates: [SocketAddr; 4] = [
+            "192.168.1.161:9993".parse().unwrap(),
+            "192.168.1.171:9993".parse().unwrap(),
+            "127.0.0.1:9993".parse().unwrap(),
+            "255.255.255.255:9993".parse().unwrap(),
+        ];
+
+        for ep in lan_candidates {
+            let _ = self.socket.send_to(&encoded, ep).await;
         }
 
         Ok(())

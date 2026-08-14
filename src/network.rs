@@ -56,7 +56,7 @@ impl NetworkManager {
         let net = networks.entry(clean_nwid.clone()).or_insert_with(|| Network {
             nwid: clean_nwid.clone(),
             name: format!("ZT-{}", clean_nwid),
-            status: NetworkStatus::Ok,
+            status: NetworkStatus::RequestingConfiguration,
             type_name: "PRIVATE".to_string(),
             mac: Self::derive_mac(&clean_nwid),
             mtu: 2800,
@@ -70,6 +70,11 @@ impl NetworkManager {
         });
 
         Ok(net.clone())
+    }
+
+    pub async fn update_network(&self, net: Network) {
+        let mut networks = self.networks.write().await;
+        networks.insert(net.nwid.clone(), net);
     }
 
     pub async fn leave(&self, nwid: &str) -> Result<bool> {

@@ -63,6 +63,9 @@ pub struct NetworkConfig {
     pub capabilities: Vec<Value>,
     #[serde(default)]
     pub tags: Vec<Value>,
+    /// Network-local DNS configuration (ZTNET sends `{"domain": ..., "servers": [...]}`).
+    #[serde(default)]
+    pub dns: Value,
 }
 
 fn default_mtu() -> u32 {
@@ -88,6 +91,8 @@ pub struct MemberRecord {
     pub active_bridge: bool,
     #[serde(rename = "ipAssignments", default)]
     pub ip_assignments: Vec<String>,
+    #[serde(rename = "noAutoAssignIps", default)]
+    pub no_auto_assign_ips: bool,
     #[serde(default)]
     pub revision: u64,
     #[serde(rename = "creationTime", default)]
@@ -97,6 +102,15 @@ pub struct MemberRecord {
     #[serde(rename = "lastDeauthorizedTime", default)]
     pub last_deauthorized_time: u64,
     pub identity: Option<String>,
+    /// Member display name (ZTNET renames members with a partial `{name}` payload).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Member capabilities (ZTNET flow rules).
+    #[serde(default)]
+    pub capabilities: Vec<Value>,
+    /// Member tags (ZTNET sends `[[tagId, value], ...]`).
+    #[serde(default)]
+    pub tags: Vec<Value>,
 }
 
 /// Embedded ZeroTier Network Controller Engine (100% Pure Rust AGPL-3.0 Clean-Room).
@@ -212,7 +226,13 @@ impl EmbeddedController {
     }
 
     /// Create or update a network configuration.
-    pub async fn save_network(&self, mut config: Value) -> Result<NetworkConfig> {
+    ///
+    /// Compatibility note: ZTNET posts PARTIAL network payloads (e.g. only
+    /// `{"name": "..."}` or `{"v4AssignMode": {...}}`) to update a single
+    /// setting. A partial payload must be MERGED over the existing network
+    /// configuration, not replace it, otherwise every update would wipe the
+    /// other settings back to defaults.
+    pub async fn save_network(&self, config: Value) -> Result<NetworkConfig> {
         let nwid = if let Some(id_val) = config.get("id").or_else(|| config.get("nwid")) {
             let id_str = id_val.as_str().unwrap_or("").to_string();
             if id_str.contains("______") || id_str.is_empty() || id_str.len() != 16 {
@@ -230,16 +250,34 @@ impl EmbeddedController {
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
 
-        config["id"] = json!(nwid);
-        config["nwid"] = json!(nwid);
-        if config.get("creationTime").is_none() {
-            config["creationTime"] = json!(now);
-        }
-        if config.get("revision").is_none() {
-            config["revision"] = json!(1);
-        }
+        // Merge partial updates over the existing configuration.
+        let existing = self.get_network(&nwid).await;
+        let mut merged = if let Some(existing_net) = existing {
+            let mut base = serde_json::to_value(&existing_net)?;
+            if let (Some(base_obj), Some(new_obj)) = (base.as_object_mut(), config.as_object()) {
+                for (k, v) in new_obj {
+                    base_obj.insert(k.clone(), v.clone());
+                }
+            }
+            base
+        } else {
+            config.clone()
+        };
 
-        let net_config: NetworkConfig = serde_json::from_value(config)
+        merged["id"] = json!(nwid);
+        merged["nwid"] = json!(nwid);
+        if merged.get("creationTime").is_none() {
+            merged["creationTime"] = json!(now);
+        }
+        // Bump the revision on every save; new networks start at 1.
+        let next_revision = merged
+            .get("revision")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            + 1;
+        merged["revision"] = json!(next_revision);
+
+        let net_config: NetworkConfig = serde_json::from_value(merged)
             .context("Failed to deserialize NetworkConfig JSON")?;
 
         // Persist to disk in FileDB format
@@ -292,28 +330,48 @@ impl EmbeddedController {
     }
 
     /// Authorize, deauthorize, or update a network member.
-    pub async fn save_member(&self, nwid: &str, member_id: &str, mut member_val: Value) -> Result<MemberRecord> {
+    ///
+    /// Compatibility note: ZTNET posts PARTIAL member payloads (e.g. only
+    /// `{"name": "..."}`, `{"authorized": true}` or `{"ipAssignments": [...]}`).
+    /// A partial payload must be MERGED over the existing member record —
+    /// otherwise renaming a member would silently reset `authorized` to false.
+    pub async fn save_member(&self, nwid: &str, member_id: &str, member_val: Value) -> Result<MemberRecord> {
         if member_id.len() != 10 {
             bail!("Member ID must be 10 hexadecimal characters (ZeroTier Address)");
         }
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
 
-        member_val["id"] = json!(member_id);
-        member_val["nwid"] = json!(nwid);
-        member_val["objtype"] = json!("member");
-        if member_val.get("creationTime").is_none() {
-            member_val["creationTime"] = json!(now);
+        // Merge partial updates over the existing member record.
+        let existing = self.get_member(nwid, member_id).await;
+        let mut merged = if let Some(existing_member) = existing {
+            let mut base = serde_json::to_value(&existing_member)?;
+            if let (Some(base_obj), Some(new_obj)) = (base.as_object_mut(), member_val.as_object()) {
+                for (k, v) in new_obj {
+                    base_obj.insert(k.clone(), v.clone());
+                }
+            }
+            base
+        } else {
+            member_val.clone()
+        };
+
+        merged["id"] = json!(member_id);
+        merged["nwid"] = json!(nwid);
+        merged["objtype"] = json!("member");
+        if merged.get("creationTime").is_none() {
+            merged["creationTime"] = json!(now);
         }
 
-        let mut record: MemberRecord = serde_json::from_value(member_val)
+        let mut record: MemberRecord = serde_json::from_value(merged)
             .context("Failed to deserialize MemberRecord JSON")?;
 
         record.revision += 1;
         if record.authorized {
             record.last_authorized_time = now;
-            // Auto-assign IP if pool is configured and no IPs are assigned
-            if record.ip_assignments.is_empty() {
+            // Auto-assign IP if pool is configured, no IPs are assigned, and
+            // automatic assignment has not been disabled for this member.
+            if record.ip_assignments.is_empty() && !record.no_auto_assign_ips {
                 if let Some(net) = self.get_network(nwid).await {
                     if let Some(pool) = net.ip_assignment_pools.first() {
                         if let Some(free_ip) = self.next_free_ip(nwid, pool).await {
@@ -339,6 +397,68 @@ impl EmbeddedController {
         nwid_map.insert(member_id.to_string(), record.clone());
 
         info!("[ZGALAXY CONTROLLER] Member {} updated in network {} (authorized: {})", member_id, nwid, record.authorized);
+        Ok(record)
+    }
+
+    /// Register a network membership/join request from a member node (ZeroTier Wire/Join Protocol).
+    /// If the member record does not exist yet, creates it in pending/unauthorized state (or authorized if public).
+    pub async fn register_join_request(&self, nwid: &str, member_id: &str, identity_str: Option<String>) -> Result<MemberRecord> {
+        if member_id.len() != 10 {
+            bail!("Member ID must be 10 hexadecimal characters");
+        }
+
+        // If member already exists, return current record
+        if let Some(existing) = self.get_member(nwid, member_id).await {
+            return Ok(existing);
+        }
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+        let net = self.get_network(nwid).await;
+        let is_private = net.as_ref().map(|n| n.private).unwrap_or(true);
+        let auto_auth = !is_private;
+
+        let mut ip_assignments = Vec::new();
+        if auto_auth {
+            if let Some(ref n) = net {
+                if let Some(pool) = n.ip_assignment_pools.first() {
+                    if let Some(free_ip) = self.next_free_ip(nwid, pool).await {
+                        ip_assignments.push(free_ip);
+                    }
+                }
+            }
+        }
+
+        let record = MemberRecord {
+            id: member_id.to_string(),
+            nwid: nwid.to_string(),
+            objtype: "member".to_string(),
+            authorized: auto_auth,
+            active_bridge: false,
+            ip_assignments,
+            no_auto_assign_ips: false,
+            revision: 1,
+            creation_time: now,
+            last_authorized_time: if auto_auth { now } else { 0 },
+            last_deauthorized_time: 0,
+            identity: identity_str,
+            name: None,
+            capabilities: Vec::new(),
+            tags: Vec::new(),
+        };
+
+        // Persist to disk under controller.d/network/<nwid>/member/<memberId>.json
+        let member_dir = self.db_path.join("network").join(nwid).join("member");
+        fs::create_dir_all(&member_dir).await?;
+        let member_file = member_dir.join(format!("{}.json", member_id));
+        let serialized = serde_json::to_string_pretty(&record)?;
+        fs::write(&member_file, serialized).await?;
+
+        // Update in-memory state
+        let mut members = self.members.write().await;
+        let nwid_map = members.entry(nwid.to_string()).or_insert_with(HashMap::new);
+        nwid_map.insert(member_id.to_string(), record.clone());
+
+        info!("[ZGALAXY CONTROLLER] Registered new join request for member {} in network {} (authorized: {})", member_id, nwid, record.authorized);
         Ok(record)
     }
 
@@ -385,5 +505,139 @@ impl EmbeddedController {
             }
         }
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env::temp_dir;
+
+    fn test_controller() -> EmbeddedController {
+        let identity = Identity::generate();
+        let base = temp_dir().join(format!("zgalaxy_ctrl_test_{}_{}", std::process::id(), rand::random::<u32>()));
+        EmbeddedController::new(identity, base)
+    }
+
+    /// ZTNET integration: partial network payloads must merge, not wipe.
+    #[tokio::test]
+    async fn test_network_partial_update_merges() {
+        let controller = test_controller();
+        let _ = controller.init().await;
+
+        let created = controller
+            .save_network(json!({
+                "name": "MeshNet",
+                "private": true,
+                "mtu": 2800,
+                "routes": [{"target": "10.9.0.0/24", "via": null}],
+                "ipAssignmentPools": [{"ipRangeStart": "10.9.0.10", "ipRangeEnd": "10.9.0.20"}],
+                "v4AssignMode": {"zt": true}
+            }))
+            .await
+            .unwrap();
+        let nwid = created.nwid;
+
+        // ZTNET-style partial update: name only.
+        let renamed = controller
+            .save_network(json!({ "id": nwid, "name": "RenamedNet" }))
+            .await
+            .unwrap();
+        assert_eq!(renamed.name, "RenamedNet");
+        assert_eq!(renamed.mtu, 2800);
+        assert_eq!(renamed.routes.len(), 1);
+        assert_eq!(renamed.ip_assignment_pools.len(), 1);
+        assert!(renamed.private);
+        assert_eq!(renamed.v4_assign_mode, json!({"zt": true}));
+
+        // ZTNET-style partial update: v4AssignMode only.
+        let updated = controller
+            .save_network(json!({ "id": nwid, "v4AssignMode": {"zt": false} }))
+            .await
+            .unwrap();
+        assert_eq!(updated.name, "RenamedNet");
+        assert_eq!(updated.mtu, 2800);
+        assert_eq!(updated.routes.len(), 1);
+        assert_eq!(updated.v4_assign_mode, json!({"zt": false}));
+
+        // ZTNET-style DNS update.
+        let with_dns = controller
+            .save_network(json!({ "id": nwid, "dns": {"domain": "mesh.local", "servers": ["10.9.0.1"]} }))
+            .await
+            .unwrap();
+        assert_eq!(with_dns.dns, json!({"domain": "mesh.local", "servers": ["10.9.0.1"]}));
+        assert_eq!(with_dns.name, "RenamedNet");
+
+        let _ = std::fs::remove_dir_all(controller.db_path.parent().unwrap());
+    }
+
+    /// ZTNET integration: partial member payloads must merge, not wipe.
+    #[tokio::test]
+    async fn test_member_partial_update_merges() {
+        let controller = test_controller();
+        let _ = controller.init().await;
+
+        let net = controller
+            .save_network(json!({
+                "name": "MeshNet",
+                "ipAssignmentPools": [{"ipRangeStart": "10.9.0.10", "ipRangeEnd": "10.9.0.20"}]
+            }))
+            .await
+            .unwrap();
+        let nwid = net.nwid;
+
+        // Authorize a member -> auto-assigned IP from the pool.
+        let authorized = controller
+            .save_member(&nwid, "1234567890", json!({ "authorized": true }))
+            .await
+            .unwrap();
+        assert!(authorized.authorized);
+        assert_eq!(authorized.ip_assignments, vec!["10.9.0.10"]);
+
+        // ZTNET-style partial update: rename only -> authorization and IPs preserved.
+        let renamed = controller
+            .save_member(&nwid, "1234567890", json!({ "name": "Office-Laptop" }))
+            .await
+            .unwrap();
+        assert!(renamed.authorized, "partial update must not de-authorize the member");
+        assert_eq!(renamed.ip_assignments, vec!["10.9.0.10"]);
+        assert_eq!(renamed.name.as_deref(), Some("Office-Laptop"));
+
+        // ZTNET stash-style update: de-authorize with cleared assignments.
+        let stashed = controller
+            .save_member(&nwid, "1234567890", json!({ "authorized": false, "ipAssignments": [] }))
+            .await
+            .unwrap();
+        assert!(!stashed.authorized);
+        assert!(stashed.ip_assignments.is_empty());
+        assert_eq!(stashed.name.as_deref(), Some("Office-Laptop"));
+
+        let _ = std::fs::remove_dir_all(controller.db_path.parent().unwrap());
+    }
+
+    /// Members with noAutoAssignIps must not receive an automatic IP.
+    #[tokio::test]
+    async fn test_member_no_auto_assign_ips() {
+        let controller = test_controller();
+        let _ = controller.init().await;
+
+        let net = controller
+            .save_network(json!({
+                "name": "MeshNet",
+                "ipAssignmentPools": [{"ipRangeStart": "10.9.0.10", "ipRangeEnd": "10.9.0.20"}]
+            }))
+            .await
+            .unwrap();
+        let nwid = net.nwid;
+
+        let member = controller
+            .save_member(&nwid, "abcdef9876", json!({ "authorized": true, "noAutoAssignIps": true }))
+            .await
+            .unwrap();
+        assert!(member.authorized);
+        assert!(member.no_auto_assign_ips);
+        assert!(member.ip_assignments.is_empty(), "noAutoAssignIps must suppress auto-assignment");
+
+        let _ = std::fs::remove_dir_all(controller.db_path.parent().unwrap());
     }
 }

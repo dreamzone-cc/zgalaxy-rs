@@ -70,7 +70,28 @@ async fn main() -> Result<()> {
     let _ = fs::create_dir_all(&working_dir).await;
 
     // Load Local Configuration (local.conf and networks.d/)
-    let local_config = LocalConfig::load(&working_dir).await;
+    let conf_file = working_dir.join("local.conf");
+    let mut local_config = LocalConfig::load(&working_dir).await;
+
+    // Port resolution for ZGALAXY drop-in compatibility:
+    // 1. Explicit local.conf port wins.
+    // 2. ZGALAXY container: /app/config/zerotier-one.port (relative to CWD).
+    // 3. ZT_PORT environment variable (used by the ZGALAXY Dockerfile).
+    // 4. Default 9993.
+    if !conf_file.exists() {
+        let zgalaxy_port_file = PathBuf::from("./config/zerotier-one.port");
+        if zgalaxy_port_file.exists() {
+            if let Ok(p) = fs::read_to_string(&zgalaxy_port_file).await {
+                if let Ok(v) = p.trim().parse::<u16>() {
+                    local_config.port = v;
+                }
+            }
+        } else if let Ok(env_port) = std::env::var("ZT_PORT") {
+            if let Ok(v) = env_port.parse::<u16>() {
+                local_config.port = v;
+            }
+        }
+    }
 
     // Load or generate identity
     let secret_path = working_dir.join("identity.secret");
@@ -83,6 +104,7 @@ async fn main() -> Result<()> {
         let id = Identity::generate();
         let _ = fs::write(&public_path, id.to_public_string()).await;
         let _ = fs::write(&secret_path, id.to_secret_string()?).await;
+        restrict_secret_permissions(&secret_path);
         id
     };
 
@@ -95,6 +117,7 @@ async fn main() -> Result<()> {
     } else {
         let token = hex::encode(rand::random::<[u8; 16]>());
         let _ = fs::write(&auth_path, &token).await;
+        restrict_secret_permissions(&auth_path);
         token
     };
 
@@ -118,7 +141,7 @@ async fn main() -> Result<()> {
 
     // Start Native Async Dynamic IP Resolver (Zero Rebuild on IP Change, Multi-Source Decoupled)
     let resolver = Arc::new(DynamicDnsResolver::new(30).with_config_file(working_dir.join("domains.json")));
-    let _ = resolver.load_sources(&working_dir).await;
+    let _ = resolver.load_sources(&working_dir, local_config.port).await;
     resolver.clone().start_worker();
 
     // Initialize NAT Traversal & Hole-Punching Engine
@@ -129,18 +152,20 @@ async fn main() -> Result<()> {
     let controller = EmbeddedController::new(identity.clone(), working_dir.clone());
     let _ = controller.init().await;
 
-    // Start Local REST API Controller Plane (Port 9993)
+    // Start Local REST API Controller Plane on the same port as the UDP
+    // transport (ZeroTier binds its control plane and wire socket together).
+    let api_port = local_config.port;
     let app_state = AppState {
         identity: identity.clone(),
         auth_token,
         peer_manager: peer_manager.clone(),
         network_manager: network_manager.clone(),
-        controller,
+        controller: controller.clone(),
         resolver: resolver.clone(),
     };
 
     tokio::spawn(async move {
-        if let Err(e) = ControllerServer::start(app_state, 9993).await {
+        if let Err(e) = ControllerServer::start(app_state, api_port).await {
             error!("[ZGALAXY REST API ERROR] {}", e);
         }
     });
@@ -156,6 +181,8 @@ async fn main() -> Result<()> {
 
     if let Ok(transport) = UdpTransport::bind(local_config.port, identity.clone(), peer_manager.clone(), resolver.clone()).await {
         let transport_arc = Arc::new(transport);
+        transport_arc.set_controller(controller.clone()).await;
+        transport_arc.set_network_manager(network_manager.clone()).await;
         transport_arc.start_rx_loop(tun_inbound_tx);
         nat_engine.set_transport(transport_arc.clone()).await;
 
@@ -164,6 +191,20 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             while let Some(frame) = tun_outbound_rx.recv().await {
                 let _ = tp_for_outbound.broadcast_frame(frame).await;
+            }
+        });
+
+        // Background network join & configuration sync loop
+        let nm_for_sync = network_manager.clone();
+        let tp_for_sync = transport_arc.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                interval.tick().await;
+                let nets = nm_for_sync.list().await;
+                for net in nets {
+                    let _ = tp_for_sync.send_network_config_request(&net.nwid).await;
+                }
             }
         });
     } else {
@@ -183,3 +224,18 @@ async fn main() -> Result<()> {
     info!("Shutting down ZGALAXY Client Daemon cleanly...");
     Ok(())
 }
+
+/// Restrict a secret file (identity.secret, authtoken.secret) to owner-only
+/// permissions (0600), matching canonical ZeroTier behavior.
+#[cfg(unix)]
+fn restrict_secret_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_secret_permissions(_path: &std::path::Path) {}
