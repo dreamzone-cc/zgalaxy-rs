@@ -76,6 +76,14 @@ fn default_multicast_limit() -> u32 {
     32
 }
 
+fn default_proto_version() -> u32 {
+    12
+}
+
+fn default_client_version() -> String {
+    "1.3.0".to_string()
+}
+
 /// Network Member Status and Authorization Record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemberRecord {
@@ -101,6 +109,16 @@ pub struct MemberRecord {
     pub last_authorized_time: u64,
     #[serde(rename = "lastDeauthorizedTime", default)]
     pub last_deauthorized_time: u64,
+    #[serde(rename = "lastSeen", default)]
+    pub last_seen: u64,
+    #[serde(rename = "physicalAddress", default)]
+    pub physical_address: Option<String>,
+    #[serde(rename = "clientVersion", default = "default_client_version")]
+    pub client_version: String,
+    #[serde(rename = "protocolVersion", default = "default_proto_version")]
+    pub protocol_version: u32,
+    #[serde(default)]
+    pub clock: u64,
     pub identity: Option<String>,
     /// Member display name (ZTNET renames members with a partial `{name}` payload).
     #[serde(default)]
@@ -440,6 +458,11 @@ impl EmbeddedController {
             creation_time: now,
             last_authorized_time: if auto_auth { now } else { 0 },
             last_deauthorized_time: 0,
+            last_seen: now,
+            physical_address: None,
+            client_version: "1.3.0".to_string(),
+            protocol_version: 12,
+            clock: now,
             identity: identity_str,
             name: None,
             capabilities: Vec::new(),
@@ -460,6 +483,19 @@ impl EmbeddedController {
 
         info!("[ZGALAXY CONTROLLER] Registered new join request for member {} in network {} (authorized: {})", member_id, nwid, record.authorized);
         Ok(record)
+    }
+
+    /// Update member's lastSeen timestamp and physical address across all networks.
+    pub async fn touch_member_last_seen(&self, member_id: &str, physical_address: &str) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let mut members = self.members.write().await;
+        for (_nwid, nwid_members) in members.iter_mut() {
+            if let Some(member) = nwid_members.get_mut(member_id) {
+                member.last_seen = now;
+                member.clock = now;
+                member.physical_address = Some(physical_address.to_string());
+            }
+        }
     }
 
     /// Find the next free IPv4 address within an assignment pool, excluding addresses

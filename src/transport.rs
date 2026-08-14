@@ -72,6 +72,7 @@ impl UdpTransport {
     ) {
         let socket = self.socket.clone();
         let identity = self.identity.clone();
+        let peer_manager = self.peer_manager.clone();
         let controller_lock = self.controller.clone();
         let network_manager_lock = self.network_manager.clone();
 
@@ -85,6 +86,19 @@ impl UdpTransport {
                         let data = Bytes::copy_from_slice(&buf[..len]);
                         if let Ok(packet) = Packet::decode(data) {
                             debug!("[ZGALAXY UDP PKT] Received {:?} from {} (src_node: {})", packet.packet_type, src_addr, packet.source);
+
+                            if packet.source != Address::NULL && packet.source != identity.address {
+                                // 1. Update PeerManager with active path and latency for ZTNET
+                                peer_manager.add_or_update_peer(packet.source, crate::peer::PeerRole::Leaf, src_addr, 5).await;
+
+                                // 2. Update Controller member lastSeen timestamp and physical address
+                                let ctrl_guard = controller_lock.read().await;
+                                if let Some(ref ctrl) = *ctrl_guard {
+                                    let member_id = format!("{}", packet.source);
+                                    let path_str = format!("{}/{}", src_addr.ip(), src_addr.port());
+                                    ctrl.touch_member_last_seen(&member_id, &path_str).await;
+                                }
+                            }
 
                             match packet.packet_type {
                                 PacketType::Echo => {
