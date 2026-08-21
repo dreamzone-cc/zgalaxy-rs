@@ -251,15 +251,15 @@ impl EmbeddedController {
     /// configuration, not replace it, otherwise every update would wipe the
     /// other settings back to defaults.
     pub async fn save_network(&self, config: Value) -> Result<NetworkConfig> {
-        let nwid = if let Some(id_val) = config.get("id").or_else(|| config.get("nwid")) {
+        let (nwid, generated) = if let Some(id_val) = config.get("id").or_else(|| config.get("nwid")) {
             let id_str = id_val.as_str().unwrap_or("").to_string();
             if id_str.contains("______") || id_str.is_empty() || id_str.len() != 16 {
-                self.next_network_id().await
+                (self.next_network_id().await, true)
             } else {
-                id_str
+                (id_str, false)
             }
         } else {
-            self.next_network_id().await
+            (self.next_network_id().await, true)
         };
 
         if nwid.len() != 16 {
@@ -298,12 +298,26 @@ impl EmbeddedController {
         let net_config: NetworkConfig = serde_json::from_value(merged)
             .context("Failed to deserialize NetworkConfig JSON")?;
 
+        // If the ID was freshly generated, re-check under the write lock to
+        // avoid a duplicate-ID race between concurrent create calls, before
+        // anything is persisted to disk or memory.
+        let nwid = if generated {
+            let nets = self.networks.write().await;
+            let mut id = nwid;
+            while nets.contains_key(&id) {
+                id = format!("{}{:06x}", self.controller_address, rand::random::<u32>() & 0x00ff_ffff);
+            }
+            id
+        } else {
+            nwid
+        };
+
         // Persist to disk in FileDB format
         let net_file = self.db_path.join("network").join(format!("{}.json", nwid));
         let serialized = serde_json::to_string_pretty(&net_config)?;
         fs::write(&net_file, serialized).await?;
 
-        // Update in-memory state
+        // Update in-memory state.
         let mut nets = self.networks.write().await;
         nets.insert(nwid.clone(), net_config.clone());
 
@@ -391,10 +405,8 @@ impl EmbeddedController {
             // automatic assignment has not been disabled for this member.
             if record.ip_assignments.is_empty() && !record.no_auto_assign_ips {
                 if let Some(net) = self.get_network(nwid).await {
-                    if let Some(pool) = net.ip_assignment_pools.first() {
-                        if let Some(free_ip) = self.next_free_ip(nwid, pool).await {
-                            record.ip_assignments.push(free_ip);
-                        }
+                    if let Some(free_ip) = self.next_free_ip(nwid, &net.ip_assignment_pools).await {
+                        record.ip_assignments.push(free_ip);
                     }
                 }
             }
@@ -438,10 +450,8 @@ impl EmbeddedController {
         let mut ip_assignments = Vec::new();
         if auto_auth {
             if let Some(ref n) = net {
-                if let Some(pool) = n.ip_assignment_pools.first() {
-                    if let Some(free_ip) = self.next_free_ip(nwid, pool).await {
-                        ip_assignments.push(free_ip);
-                    }
+                if let Some(free_ip) = self.next_free_ip(nwid, &n.ip_assignment_pools).await {
+                    ip_assignments.push(free_ip);
                 }
             }
         }
@@ -498,32 +508,34 @@ impl EmbeddedController {
         }
     }
 
-    /// Find the next free IPv4 address within an assignment pool, excluding addresses
-    /// already assigned to other authorized members of the network.
-    async fn next_free_ip(&self, nwid: &str, pool: &IpAssignmentPool) -> Option<String> {
-        let start = pool.ip_range_start.parse::<Ipv4Addr>().ok()?;
-        let end = pool.ip_range_end.parse::<Ipv4Addr>().ok()?;
-        let start_u32 = u32::from(start);
-        let end_u32 = u32::from(end);
-        if end_u32 < start_u32 {
-            return None;
-        }
-
+    /// Find the next free IPv4 address within the assignment pools, excluding
+    /// addresses already assigned to any member of the network (authorized or
+    /// not — stale assignments still occupy the address until removed).
+    async fn next_free_ip(&self, nwid: &str, pools: &[IpAssignmentPool]) -> Option<String> {
         let members = self.members.read().await;
         let used: HashSet<u32> = members
             .get(nwid)
             .map(|m| {
                 m.values()
-                    .filter(|r| r.authorized)
                     .flat_map(|r| r.ip_assignments.iter())
                     .filter_map(|ip| ip.parse::<Ipv4Addr>().ok().map(u32::from))
                     .collect()
             })
             .unwrap_or_default();
+        drop(members);
 
-        for candidate in start_u32..=end_u32 {
-            if !used.contains(&candidate) {
-                return Some(Ipv4Addr::from(candidate).to_string());
+        for pool in pools {
+            let start = pool.ip_range_start.parse::<Ipv4Addr>().ok();
+            let end = pool.ip_range_end.parse::<Ipv4Addr>().ok();
+            let (Some(start), Some(end)) = (start, end) else { continue };
+            let (start_u32, end_u32) = (u32::from(start), u32::from(end));
+            if end_u32 < start_u32 {
+                continue;
+            }
+            for candidate in start_u32..=end_u32 {
+                if !used.contains(&candidate) {
+                    return Some(Ipv4Addr::from(candidate).to_string());
+                }
             }
         }
         None

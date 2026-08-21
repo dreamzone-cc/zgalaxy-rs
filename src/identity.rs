@@ -220,20 +220,50 @@ impl Identity {
         let signing_key = if parts.len() >= 4 && !parts[3].is_empty() {
             let priv_bytes = hex::decode(parts[3])?;
             let mut priv_arr = [0u8; 32];
-            if priv_bytes.len() == 64 {
-                // Ed25519 private key is at bytes 32..64
-                priv_arr.copy_from_slice(&priv_bytes[32..64]);
-            } else if priv_bytes.len() >= 32 {
+            if priv_bytes.len() >= 32 {
                 priv_arr.copy_from_slice(&priv_bytes[0..32]);
             } else {
                 bail!("Private key must be at least 32 bytes (got {})", priv_bytes.len());
             }
-            Some(SigningKey::from_bytes(&priv_arr))
+            let sk = SigningKey::from_bytes(&priv_arr);
+            // For canonical ZeroTier (libsodium) secrets the first 32 bytes are
+            // the seed; verify it matches the stated public key and otherwise
+            // fall back to a seed stored in the upper half.
+            if sk.verifying_key().to_bytes() != verifying_arr {
+                if priv_bytes.len() >= 64 {
+                    priv_arr.copy_from_slice(&priv_bytes[32..64]);
+                    let alt = SigningKey::from_bytes(&priv_arr);
+                    if alt.verifying_key().to_bytes() == verifying_arr {
+                        Some(alt)
+                    } else {
+                        Some(sk)
+                    }
+                } else {
+                    Some(sk)
+                }
+            } else {
+                Some(sk)
+            }
         } else {
             None
         };
 
-        let address = if parsed_addr != Address::NULL { parsed_addr } else { expected_addr };
+        // For the native 32-byte format the address is well-defined from the
+        // key, so a mismatch means a spoofed/typo'd identity — reject it.
+        // 64-byte blobs come from mixed provenance (ZeroTier-style files whose
+        // stated address cannot always be re-derived), so those are trusted.
+        let address = if parsed_addr != Address::NULL {
+            if pub_bytes.len() == 32 && parsed_addr != expected_addr {
+                bail!(
+                    "Identity address {} does not match address derived from public key {}",
+                    parsed_addr,
+                    expected_addr
+                );
+            }
+            parsed_addr
+        } else {
+            expected_addr
+        };
 
         Ok(Identity {
             address,

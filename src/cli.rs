@@ -411,6 +411,18 @@ async fn delete_req(url: &str, token: &str) -> Result<Value> {
     let mut response_buf = Vec::new();
     stream.read_to_end(&mut response_buf).await?;
 
+    let resp_str = String::from_utf8_lossy(&response_buf);
+    let status_line = resp_str.lines().next().unwrap_or_default();
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if !(200..300).contains(&status_code) {
+        let body = resp_str.find("\r\n\r\n").map(|i| &resp_str[i + 4..]).unwrap_or_default();
+        bail!("DELETE {} failed: HTTP {} {}", url, status_code, body.trim());
+    }
+
     Ok(serde_json::json!({ "deleted": true }))
 }
 

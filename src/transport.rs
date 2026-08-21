@@ -273,16 +273,21 @@ impl UdpTransport {
             let _ = self.socket.send_to(&encoded, addr).await;
         }
 
-        // 2. Send to known controller and LAN endpoints
-        let lan_candidates: [SocketAddr; 4] = [
-            "192.168.1.161:9993".parse().unwrap(),
-            "192.168.1.171:9993".parse().unwrap(),
-            "127.0.0.1:9993".parse().unwrap(),
-            "255.255.255.255:9993".parse().unwrap(),
-        ];
-
-        for ep in lan_candidates {
-            let _ = self.socket.send_to(&encoded, ep).await;
+        // 2. Send to extra static endpoints configured via ZGALAXY_EXTRA_ENDPOINTS
+        //    (comma-separated host:port list, e.g. "root1.example.com:9993,10.0.0.5:9993")
+        if let Ok(extra) = std::env::var("ZGALAXY_EXTRA_ENDPOINTS") {
+            for ep in extra.split(',') {
+                let ep = ep.trim();
+                if ep.is_empty() {
+                    continue;
+                }
+                match SocketAddr::from_str(ep) {
+                    Ok(addr) => {
+                        let _ = self.socket.send_to(&encoded, addr).await;
+                    }
+                    Err(_) => warn!("[ZGALAXY UDP TX] Ignoring invalid endpoint '{}' in ZGALAXY_EXTRA_ENDPOINTS", ep),
+                }
+            }
         }
 
         Ok(())

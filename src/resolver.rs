@@ -234,6 +234,29 @@ impl DynamicDnsResolver {
         Ok(removed)
     }
 
+    /// Remove all entries for a domain regardless of the port they were
+    /// registered with (the REST delete path does not carry a port).
+    pub async fn remove_domain_any(&self, domain: &str) -> Result<bool> {
+        let clean = domain.trim().to_lowercase();
+        let prefix = format!("{}:", clean);
+        let mut removed = false;
+        self.endpoints.write().await.retain(|key, _| {
+            if key.starts_with(&prefix) {
+                removed = true;
+                false
+            } else {
+                true
+            }
+        });
+        self.resolved_state.write().await.retain(|key, _| !key.starts_with(&prefix));
+
+        if removed {
+            info!("[ZGALAXY DYNAMIC DNS] Dynamically removed domain '{}'", clean);
+            self.persist_to_disk().await;
+        }
+        Ok(removed)
+    }
+
     /// Get all currently registered domains.
     pub async fn list_domains(&self) -> Vec<DomainEndpointConfig> {
         self.endpoints.read().await.values().cloned().collect()

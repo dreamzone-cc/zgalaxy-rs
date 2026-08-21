@@ -401,7 +401,7 @@ async fn remove_dynamic_domain(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    match state.resolver.remove_domain(&domain, 9993).await {
+    match state.resolver.remove_domain_any(&domain).await {
         Ok(true) => Ok(Json(json!({ "success": true, "removed": domain }))),
         _ => Err(StatusCode::NOT_FOUND),
     }
