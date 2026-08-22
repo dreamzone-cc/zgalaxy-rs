@@ -38,6 +38,12 @@
 touch_member_last_seen (بثبات loopback)، RTT prober كل 10s عبر control streams يغذي /peer بزمن
 مُقاس، NAT worker محصور بالوضع القديم. الدليل: B1-PASS بثنائية ب3 + /peer من الطرفين (نظير
 فعلي، مسار حي، latency=1ms على الجسر المحلي). 32 اختباراً أخضر، clippy 0.
+- **أ3 مغلقة (2026-08-22)**: مصافحة تحدي/إثبات إلزامية على كل اتصال QUIC —
+  NodeChallenge → AnnounceProof موقّع ed25519 مرتبط بعنوان العقدة؛ الحضور والتسجيل
+  لا يُمنحان إلا بعد إثبات صالح (رفض مبكر مؤكد حيّاً في سجل zg-a)، مع مصفوفة
+  اختبارات سلبية كاملة. 33 اختباراً أخضر، clippy 0.
+- **الخطوة التالية المقترحة**: ب2 (L2 learning/broadcast فوق QUIC) ثم ب4 (التعافي/
+  connection migration)، أو ج1 (unified planet في المحرك).
 - **الخطوة التالية المقترحة**: أ3 (ربط هوية QUIC: توقيع/تحدي قبل تفعيل transportMode=quic
 إنتاجياً) ثم ب2 (L2 learning/broadcast) ثم ب4 (التعافي)، أو ج1 (unified planet في المحرك).
 - **الخطوة التالية المقترحة** (حسب المسار الحرج في PRE_RESUME_PLAN): ب2 (L2 learning/broadcast) ثم
