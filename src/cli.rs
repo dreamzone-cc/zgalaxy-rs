@@ -19,6 +19,17 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Generic REST call against the local daemon (ops/diagnostics tool):
+    /// `zgalaxy-cli rest GET /status` | `rest POST /controller/network '{}'`
+    Rest {
+        #[arg(help = "HTTP method: GET | POST | DELETE")]
+        method: String,
+        #[arg(help = "API path, e.g. /status or /network/<nwid>")]
+        path: String,
+        #[arg(help = "JSON body for POST (optional)")]
+        body: Option<String>,
+    },
+
     /// Show node status, address, and connectivity
     Status,
 
@@ -119,6 +130,24 @@ impl Cli {
         }
 
         match self.command {
+            Commands::Rest { method, path, body } => {
+                let m = method.to_ascii_uppercase();
+                let url = format!("{}{}", self.endpoint.trim_end_matches('/'), path);
+                let out = match m.as_str() {
+                    "GET" => fetch_json(&url, &token).await?,
+                    "POST" => {
+                        let payload: Value = serde_json::from_str(body.as_deref().unwrap_or("{}"))
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        post_json(&url, &token, payload).await?
+                    }
+                    "DELETE" => delete_req(&url, &token).await?,
+                    other => {
+                        eprintln!("rest: unsupported method {}", other);
+                        std::process::exit(1);
+                    }
+                };
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            }
             Commands::Status | Commands::Info => {
                 let url = format!("{}/status", self.endpoint);
                 match fetch_json(&url, &token).await {
