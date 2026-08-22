@@ -35,9 +35,9 @@ impl ControllerServer {
             .route("/controller", get(get_controller_status))
             .route("/metrics", get(get_metrics))
             
-            // Client Network Join/Leave Routes
+            // Client Network Join/Leave Routes (ZeroTier local-service contract)
             .route("/network", get(list_networks))
-            .route("/network/:nwid", post(join_network).delete(leave_network))
+            .route("/network/:nwid", get(get_network).post(join_network).delete(leave_network))
             
             // Peer Discovery Routes
             .route("/peer", get(list_peers))
@@ -153,7 +153,22 @@ async fn list_networks(
         return Err(StatusCode::UNAUTHORIZED);
     }
     let nets = state.network_manager.list().await;
-    Ok(Json(nets))
+    let arr: Vec<serde_json::Value> = nets.iter().map(network_to_zt_json).collect();
+    Ok(Json(serde_json::Value::Array(arr)))
+}
+
+async fn get_network(
+    State(state): State<AppState>,
+    Path(nwid): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    if !check_auth(&headers, &state.auth_token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    match state.network_manager.get(&nwid.to_lowercase()).await {
+        Some(net) => Ok(Json(network_to_zt_json(&net))),
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 async fn join_network(
@@ -164,8 +179,8 @@ async fn join_network(
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    match state.network_manager.join(&nwid).await {
-        Ok(net) => Ok(Json(net)),
+    match state.network_manager.join(&nwid.to_lowercase()).await {
+        Ok(net) => Ok(Json(network_to_zt_json(&net))),
         Err(_) => Err(StatusCode::BAD_REQUEST),
     }
 }
@@ -178,9 +193,10 @@ async fn leave_network(
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    match state.network_manager.leave(&nwid).await {
-        Ok(true) => Ok(Json(json!({ "nwid": nwid, "deleted": true }))),
-        _ => Err(StatusCode::NOT_FOUND),
+    match state.network_manager.leave(&nwid.to_lowercase()).await {
+        Ok(true) => Ok(Json(json!({ "result": true }))),
+        Ok(false) => Ok(Json(json!({ "result": false }))),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -418,4 +434,51 @@ async fn sync_dynamic_domains(
     state.resolver.check_and_update_all().await;
     let addrs = state.resolver.get_all_active_addresses().await;
     Ok(Json(json!({ "success": true, "synced_addresses": addrs })))
+}
+
+// ---------------------------------------------------------------------------
+// Local network membership API — mirrors ZeroTier's local service contract:
+//   GET    /network          -> JSON array of joined networks
+//   GET    /network/{nwid}   -> single network, 404 if not joined
+//   POST   /network/{nwid}   -> join (idempotent)
+//   DELETE /network/{nwid}   -> leave, {"result": true} if it existed
+// ---------------------------------------------------------------------------
+
+fn network_to_zt_json(net: &crate::network::Network) -> serde_json::Value {
+    use serde_json::json;
+    let status = match net.status {
+        crate::network::NetworkStatus::Ok => "OK",
+        crate::network::NetworkStatus::AccessDenied => "ACCESS_DENIED",
+        crate::network::NetworkStatus::NotFound => "NOT_FOUND",
+        crate::network::NetworkStatus::PortError => "PORT_ERROR",
+        crate::network::NetworkStatus::RequestingConfiguration => "REQUESTING_CONFIGURATION",
+    };
+    json!({
+        "id": net.nwid,
+        "nwid": net.nwid,
+        "name": net.name,
+        "status": status,
+        "type": net.type_name,
+        "mac": net.mac,
+        "mtu": net.mtu,
+        "dhcp": false,
+        "bridge": false,
+        "broadcastEnabled": net.broadcast_enabled,
+        "portError": 0,
+        "netconfRevision": 1,
+        "portDeviceName": net.port_device_name,
+        "allowManaged": true,
+        "allowGlobal": false,
+        "allowDefault": false,
+        "allowDNS": false,
+        "assignedAddresses": net.assigned_addresses,
+        "routes": net.routes.iter().map(|r| json!({
+            "target": r.target,
+            "via": r.via,
+            "flags": 0,
+            "metric": 0,
+        })).collect::<Vec<_>>(),
+        "multicastSubscriptions": [],
+        "dns": { "domain": "", "servers": [] },
+    })
 }

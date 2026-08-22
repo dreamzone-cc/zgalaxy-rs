@@ -36,6 +36,11 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
 etherparse = "0.15"
 
+# QUIC Transport (primary transport layer — replaces raw UDP)
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+
 # Local REST/IPC Server & Web Engine
 axum = { version = "0.7", features = ["json", "tokio"] }
 tower = { version = "0.4", features = ["util"] }

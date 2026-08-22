@@ -24,6 +24,7 @@ pub mod nat;
 pub mod network;
 pub mod packet;
 pub mod peer;
+pub mod quic;
 pub mod resolver;
 pub mod route_manager;
 pub mod transport;
