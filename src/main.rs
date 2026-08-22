@@ -389,22 +389,47 @@ async fn main() -> Result<()> {
                         let mut targets = resolver_for_sync.get_all_active_addresses().await;
                         if let Ok(extra) = std::env::var("ZGALAXY_EXTRA_ENDPOINTS") {
                             for ep in extra.split(',') {
-                                if let Ok(addr) = ep.trim().parse::<std::net::SocketAddr>() {
-                                    targets.push(addr);
+                                let ep = ep.trim();
+                                if ep.is_empty() {
+                                    continue;
+                                }
+                                // SocketAddr::parse cannot resolve hostnames —
+                                // dial names via DNS (docker service names etc.).
+                                match ep.parse::<std::net::SocketAddr>() {
+                                    Ok(addr) => targets.push(addr),
+                                    Err(_) => match tokio::net::lookup_host(ep).await {
+                                        Ok(mut addrs) => {
+                                            if let Some(addr) = addrs.next() {
+                                                targets.push(addr);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("[ZGALAXY QUIC] cannot resolve extra endpoint '{}': {}", ep, e)
+                                        }
+                                    },
                                 }
                             }
                         }
                         for net in nets {
                             for target in &targets {
-                                let _ = quic_for_sync
-                                    .send_control(
-                                        *target,
-                                        &zgalaxy_rs::quic::control::ControlMessage::NetworkConfigRequest {
-                                            nwid: net.nwid.clone(),
-                                            token: net.membership_token.clone(),
-                                        },
-                                    )
-                                    .await;
+                                // Per-target timeout: one dead root (e.g. the
+                                // unreachable default domain) must not starve
+                                // the remaining targets in the sequential loop.
+                                let msg = zgalaxy_rs::quic::control::ControlMessage::NetworkConfigRequest {
+                                    nwid: net.nwid.clone(),
+                                    token: net.membership_token.clone(),
+                                };
+                                let req = quic_for_sync.send_control(*target, &msg);
+                                if let Err(e) = tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    req,
+                                )
+                                .await
+                                .map_err(|_| anyhow::anyhow!("timeout"))
+                                .and_then(|r| r)
+                                {
+                                    tracing::debug!("[ZGALAXY QUIC] config request to {} for {} failed: {}", target, net.nwid, e);
+                                }
                             }
                         }
                     }
