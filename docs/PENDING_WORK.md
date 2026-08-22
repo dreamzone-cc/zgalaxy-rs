@@ -2,12 +2,18 @@
 
 حُفظت هنا قبل الانتقال للمرحلة التالية. التحديث يتم عند إنجاز أي بند.
 
-## zgalaxy-rs — Data Plane (المرحلة 2 من EXECUTION_PLAN.md)
-- [ ] TUN حقيقي على لينكس: فتح /dev/net/tun، قراءة/كتابة إطارات فعلية عبر tokio (الحالي: tun.rs وهمي — يهمل الإطارات الداخلة ولا يلتقط الصادرة).
-- [ ] توجيه L3 عبر route_manager إلى واجهة النظام (الكود موجود لكن لا مستدعي).
-- [ ] قصة MTU فوق QUIC: إما إعادة تجميع للإطارات > 1200 بايت فوق datagrams أو ضبط MTU للواجهة (ZeroTier يستخدم 2800) — دون قص صامت.
-- [ ] MAC حتمي لكل (node address, nwid) بدل الاعتماد على nwid فقط (network.rs derive_mac).
-- [ ] L2 learning/broadcast الصحيح (الحالي: إرسال كل إطار صادر لكل الأقران المتصلين).
+## zgalaxy-rs — Data Plane (المرحلة 2) — منفذة 2026-08-22:
+- [x] TAP حقيقي L2 على لينكس (/dev/net/tun عبر crate tun): قراءة/كتابة Ethernet فعلية + خفض رحيم headless بلا CAP_NET_ADMIN (الـcontroller/ztnet لا يتأثر).
+- [x] التحقق السلوكي بامتيازات فعلية: اختبار loopback ثنائي الاتجاه بمقبس AF_PACKET (host→mesh وmesh→host) ناجح، والـdaemon الحي يُظهر zgalaxy0 (TAP, MTU 1186, UP+LOWER_UP) في ip link.
+- [x] MTU: 1186 في وضع QUIC (1200 - 14 بايت رأس Ethernet) — بلا إسقاط صامت للإطارات الكبيرة.
+- [x] MAC حتمي لكل (node address, nwid) عبر SHA-256 — مستقر عبر إعادة التشغيل ومختلف بين العقد (اختبار وحدة).
+- [x] join لم يعد يخترع عناوين/مسارات: REQUESTING_CONFIGURATION حتى رد الـcontroller.
+- [x] تطبيق عنوان IP + MAC + المسارات المُدارة على الواجهة عند وصول NetworkConfigResponse (مرة لكل شبكة).
+- [x] ZGALAXY_HOME env لتحديد مجلد العمل صراحةً.
+### متبقٍ في المرحلة 2:
+- [ ] L2 learning/broadcast الصحيح (الحالي: إرسال كل إطار صادر لكل الأقران المتصلين — يكفي للـlobbies الصغيرة).
+- [ ] اختبار كامل بين عقدتين حقيقيتين عبر QUIC (TAP↔TAP) على السيرفرات.
+- [ ] ARP traffic بين عقدتين (يحتاج البند أعلاه + عقدتين).
 
 ## zgalaxy-rs — أمان/بروتوكول (المرحلة 1 المتبقي)
 - [ ] ربط شهادة QUIC بعنوان العقدة (pinning) — الحالي SkipServerVerification + NodeAnnounce بدون تحقق إجباري.

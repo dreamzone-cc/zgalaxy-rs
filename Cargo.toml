@@ -70,6 +70,7 @@ tower = { version = "0.4", features = ["util"] }
 [target.'cfg(unix)'.dependencies]
 tun = { version = "0.6", features = ["async"] }
 nix = { version = "0.29", features = ["net", "fs", "signal"] }
+libc = "0.2"
 
 # Windows Virtual Interface (Wintun)
 [target.'cfg(windows)'.dependencies]

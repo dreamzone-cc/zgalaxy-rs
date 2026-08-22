@@ -44,7 +44,9 @@ async fn main() -> Result<()> {
     info!("100% Memory-Safe, AGPL-3.0 Sovereign Open Source");
     info!("=======================================================");
 
-    let data_dir = PathBuf::from("/var/lib/zerotier-one");
+    let data_dir = std::env::var("ZGALAXY_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/lib/zerotier-one"));
     let fallback_dir = PathBuf::from("./zerotier-var");
     let mut working_dir = fallback_dir.clone();
     if data_dir.exists() {
@@ -124,6 +126,9 @@ async fn main() -> Result<()> {
     // Initialize State Managers
     let peer_manager = PeerManager::new();
     let network_manager = NetworkManager::new();
+    network_manager
+        .set_node_address(identity.address.to_string())
+        .await;
 
     // Resolve domain dynamically (Separation of Dynamic Config from Core Build)
     let domain_file = working_dir.join("domain");
@@ -179,9 +184,10 @@ async fn main() -> Result<()> {
         .unwrap_or("udp")
         .to_ascii_lowercase();
 
-    // QUIC datagrams cannot exceed ~1200 bytes on the wire; a larger TUN MTU
-    // would produce frames that get silently dropped instead of fragmented.
-    let tun_mtu: u32 = if transport_mode == "quic" { 1200 } else { 2800 };
+    // QUIC datagrams cannot exceed ~1200 bytes on the wire; a larger adapter
+    // MTU would produce frames that get silently dropped instead of sent.
+    // TAP frames carry a 14-byte Ethernet header, leaving 1186 for payload.
+    let tun_mtu: u32 = if transport_mode == "quic" { 1186 } else { 2800 };
 
     // Initialize High-Performance UDP Transport Loop & Virtual Adapter Routing
     let (tun_inbound_tx, tun_inbound_rx) = mpsc::channel::<Vec<u8>>(1024);
@@ -215,6 +221,9 @@ async fn main() -> Result<()> {
                 let tun_tx = tun_inbound_tx.clone();
                 let quic_engine = Arc::clone(&quic);
                 let ctrl_for_events = controller.clone();
+                let tun_for_events = Arc::clone(&tun_arc);
+                let mut applied_networks: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 tokio::spawn(async move {
                     while let Some(event) = quic_events_rx.recv().await {
                         use zgalaxy_rs::quic::QuicEvent;
@@ -287,8 +296,36 @@ async fn main() -> Result<()> {
                                             if !ips.is_empty() {
                                                 net.assigned_addresses = ips;
                                             }
-                                            nm_for_events.update_network(net).await;
+                                            nm_for_events.update_network(net.clone()).await;
                                             info!("[ZGALAXY QUIC] Network {} updated (authorized: {})", nwid, authorized);
+
+                                            // Apply managed address + routes to the host
+                                            // adapter once per network (idempotent set).
+                                            if authorized
+                                                && !net.assigned_addresses.is_empty()
+                                                && applied_networks.insert(nwid.clone())
+                                            {
+                                                let ip = &net.assigned_addresses[0];
+                                                // Prefer the managed route that contains
+                                                // the assigned IP; fall back to /24.
+                                                let cidr = net
+                                                    .routes
+                                                    .iter()
+                                                    .find(|r| r.via.is_none())
+                                                    .map(|r| r.target.clone())
+                                                    .unwrap_or_else(|| format!("{}/24", ip));
+                                                tun_for_events
+                                                    .assign_address(&cidr, Some(&net.mac))
+                                                    .await;
+                                                for route in &net.routes {
+                                                    if route.target != cidr {
+                                                        let _ = zgalaxy_rs::route_manager::RouteManager::add_route(
+                                                            &tun_for_events.name,
+                                                            &route.target,
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     ControlMessage::Ping { nonce, sent_ms } => {

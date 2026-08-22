@@ -1,5 +1,5 @@
 use std::process::Command;
-use tracing::info;
+use tracing::{info, warn};
 use anyhow::Result;
 
 /// Host Operating System Route and IP Provisioning Manager
@@ -70,5 +70,29 @@ impl RouteManager {
         }
 
         Ok(())
+    }
+}
+
+impl RouteManager {
+    /// Set the hardware (MAC) address of the virtual adapter.
+    /// Idempotent-safe: `ip link set` overwrites the previous value.
+    pub fn set_mac(device_name: &str, mac: &str) {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = Command::new("ip")
+                .args(["link", "set", "dev", device_name, "address", mac])
+                .status()
+                .map(|s| {
+                    if s.success() {
+                        info!("[ZGALAXY ROUTE MANAGER] MAC {} set on {}", mac, device_name);
+                    } else {
+                        warn!("[ZGALAXY ROUTE MANAGER] failed to set MAC {} on {}", mac, device_name);
+                    }
+                });
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (device_name, mac);
+        }
     }
 }
