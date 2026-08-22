@@ -65,7 +65,7 @@ async fn quic_handshake_control_and_datagram() {
     // --- Reliable control path: B sends a NetworkConfigRequest on a stream.
     b.send_control(
         a_addr,
-        &ControlMessage::NetworkConfigRequest { nwid: "0123456789abcdef".into() },
+        &ControlMessage::NetworkConfigRequest { nwid: "0123456789abcdef".into(), token: None },
     )
     .await
     .expect("control send failed");
@@ -78,7 +78,7 @@ async fn quic_handshake_control_and_datagram() {
         QuicEvent::Control { remote, message } => {
             assert_eq!(remote.ip(), a_addr.ip());
             match message {
-                ControlMessage::NetworkConfigRequest { nwid } => {
+                ControlMessage::NetworkConfigRequest { nwid, .. } => {
                     assert_eq!(nwid, "0123456789abcdef");
                 }
                 other => panic!("unexpected control message: {:?}", other),

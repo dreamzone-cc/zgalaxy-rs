@@ -533,7 +533,7 @@ fn ip_allowed(peer: SocketAddr, allowed: &[String]) -> bool {
     }
     let ip = peer.ip();
     allowed.iter().any(|entry| {
-        if let Some(cidr) = entry.parse::<ipnet::IpNet>().ok() {
+        if let Ok(cidr) = entry.parse::<ipnet::IpNet>() {
             return cidr.contains(&ip);
         }
         entry
