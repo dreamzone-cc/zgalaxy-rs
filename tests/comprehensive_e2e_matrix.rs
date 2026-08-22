@@ -317,3 +317,46 @@ async fn test_matrix_nat_path_registration_and_ranking() {
     assert_eq!(updated_peer.paths.len(), 2);
     assert_eq!(updated_peer.latency_ms, 15);
 }
+
+// ============================================================================
+// 8. Join-Request Guard Matrix (audit 2026-08-22)
+// ============================================================================
+
+#[tokio::test]
+async fn test_matrix_join_request_guards() {
+    let temp_dir = tempdir().unwrap();
+    let id = Identity::generate();
+    let controller = EmbeddedController::new(id.clone(), temp_dir.path().to_path_buf());
+    controller.init().await.unwrap();
+
+    // A valid network must exist first.
+    let net = controller
+        .save_network(serde_json::json!({ "name": "guard-net" }))
+        .await
+        .unwrap();
+    let nwid = net.id.clone();
+
+    // 1) Non-hex / wrong-length member ids must be rejected.
+    for bad in ["192.168.1.5", "abcdefghij!", "12345"] {
+        let err = controller.register_join_request(&nwid, bad, None).await;
+        assert!(err.is_err(), "member id {:?} must be rejected", bad);
+    }
+
+    // 2) Joins for networks the controller does not own must be rejected —
+    //    unauthenticated peers must not be able to mint orphan member files.
+    let err = controller
+        .register_join_request(&format!("{}000001", "ffffffffff"), "0123456789", None)
+        .await;
+    assert!(err.is_err(), "join to non-existent network must be rejected");
+
+    // 3) A valid join still succeeds and creates the member record.
+    let rec = controller
+        .register_join_request(&nwid, "a1b2c3d4e5", None)
+        .await
+        .expect("valid join must succeed");
+    assert_eq!(rec.id, "a1b2c3d4e5");
+
+    // 4) No member files were created for rejected networks.
+    let orphan_dir = temp_dir.path().join("network").join("ffffffffff000001");
+    assert!(!orphan_dir.exists(), "rejected network must not create files");
+}
