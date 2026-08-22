@@ -71,22 +71,33 @@ impl ControllerServer {
 
 // Authentication Helper
 fn check_auth(headers: &HeaderMap, expected_token: &str) -> bool {
-    if let Some(auth_val) = headers.get("X-ZT1-Auth") {
-        if let Ok(token_str) = auth_val.to_str() {
-            return token_str.trim() == expected_token.trim();
+    use subtle::ConstantTimeEq;
+    let expected = expected_token.trim().as_bytes();
+    let supplied = headers
+        .get("X-ZT1-Auth")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .or_else(|| {
+            headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| {
+                    s.strip_prefix("Bearer ")
+                        .or_else(|| s.strip_prefix("token "))
+                })
+                .map(str::trim)
+        });
+    match supplied {
+        Some(token) => {
+            // Constant-time comparison over equal-length views; length itself
+            // is padded so it leaks nothing about the token contents.
+            let a = token.as_bytes();
+            let equal_len = a.len() == expected.len();
+            let ct = a.ct_eq(if equal_len { expected } else { a });
+            equal_len & bool::from(ct)
         }
+        None => false,
     }
-    if let Some(auth_val) = headers.get("Authorization") {
-        if let Ok(token_str) = auth_val.to_str() {
-            if let Some(bearer) = token_str.strip_prefix("Bearer ") {
-                return bearer.trim() == expected_token.trim();
-            }
-            if let Some(token) = token_str.strip_prefix("token ") {
-                return token.trim() == expected_token.trim();
-            }
-        }
-    }
-    false
 }
 
 async fn get_status(
@@ -136,13 +147,16 @@ async fn get_controller_status(
     })))
 }
 
-async fn get_metrics() -> impl IntoResponse {
+async fn get_metrics(State(state): State<AppState>, headers: HeaderMap) -> Result<impl IntoResponse, StatusCode> {
+    if !check_auth(&headers, &state.auth_token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     const METRICS: &str = "# HELP zgalaxy_controller_status Status of ZGALAXY controller\n# TYPE zgalaxy_controller_status gauge\nzgalaxy_controller_status 1\n# HELP zgalaxy_version Controller version\n# TYPE zgalaxy_version gauge\nzgalaxy_version 1\n";
-    (
+    Ok((
         StatusCode::OK,
         [("Content-Type", "text/plain; version=0.0.4")],
         METRICS,
-    )
+    ))
 }
 
 async fn list_networks(

@@ -276,13 +276,20 @@ async fn test_matrix_rest_api_auth_and_contract_invariance() {
     let res_ctrl = router.clone().oneshot(req_ctrl).await.unwrap();
     assert_eq!(res_ctrl.status(), StatusCode::OK);
 
-    // Test 4: /metrics (Prometheus) -> 200 OK text/plain
+    // Test 4: /metrics (Prometheus) -> authenticated only (audit fix)
     let req_metrics = Request::builder()
         .uri("/metrics")
         .body(axum::body::Body::empty())
         .unwrap();
     let res_metrics = router.clone().oneshot(req_metrics).await.unwrap();
-    assert_eq!(res_metrics.status(), StatusCode::OK);
+    assert_eq!(res_metrics.status(), StatusCode::UNAUTHORIZED);
+    let req_metrics_auth = Request::builder()
+        .uri("/metrics")
+        .header("X-ZT1-Auth", &auth_token)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res_metrics_auth = router.clone().oneshot(req_metrics_auth).await.unwrap();
+    assert_eq!(res_metrics_auth.status(), StatusCode::OK);
 }
 
 // ============================================================================

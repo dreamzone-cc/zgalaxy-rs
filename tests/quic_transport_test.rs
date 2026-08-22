@@ -48,8 +48,19 @@ async fn quic_handshake_control_and_datagram() {
     let b_runner = Arc::clone(&b);
     tokio::spawn(async move { b_runner.run(tx_b).await });
 
-    // B connects to A.
-    b.connect(a_addr).await.expect("B should connect to A");
+    // B connects to A (retry briefly — B's accept loop must install the
+    // event sink before outbound connections are allowed).
+    let mut connected = false;
+    for _ in 0..50 {
+        match b.connect(a_addr).await {
+            Ok(_) => {
+                connected = true;
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    assert!(connected, "B should connect to A");
 
     // --- Reliable control path: B sends a NetworkConfigRequest on a stream.
     b.send_control(

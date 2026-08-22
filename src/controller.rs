@@ -433,8 +433,14 @@ impl EmbeddedController {
     /// Register a network membership/join request from a member node (ZeroTier Wire/Join Protocol).
     /// If the member record does not exist yet, creates it in pending/unauthorized state (or authorized if public).
     pub async fn register_join_request(&self, nwid: &str, member_id: &str, identity_str: Option<String>) -> Result<MemberRecord> {
-        if member_id.len() != 10 {
+        if member_id.len() != 10 || !member_id.chars().all(|c| c.is_ascii_hexdigit()) {
             bail!("Member ID must be 10 hexadecimal characters");
+        }
+
+        // Reject joins for networks this controller does not own — otherwise
+        // unauthenticated peers could create unlimited orphan member files.
+        if self.get_network(nwid).await.is_none() {
+            bail!("Network {} does not exist on this controller", nwid);
         }
 
         // If member already exists, return current record
@@ -499,7 +505,7 @@ impl EmbeddedController {
     pub async fn touch_member_last_seen(&self, member_id: &str, physical_address: &str) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         let mut members = self.members.write().await;
-        for (_nwid, nwid_members) in members.iter_mut() {
+        for nwid_members in members.values_mut() {
             if let Some(member) = nwid_members.get_mut(member_id) {
                 member.last_seen = now;
                 member.clock = now;

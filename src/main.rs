@@ -170,16 +170,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Initialize High-Performance UDP Transport Loop & Virtual Adapter Routing
-    let (tun_inbound_tx, tun_inbound_rx) = mpsc::channel::<Vec<u8>>(1024);
-    let (tun_outbound_tx, mut tun_outbound_rx) = mpsc::channel::<Vec<u8>>(1024);
-    let mut tun_outbound_rx = Some(tun_outbound_rx);
-
-    let mut tun_device = zgalaxy_rs::tun::TunDevice::new("zgalaxy0", 2800);
-    let _ = tun_device.create_and_bind(None).await;
-    let tun_arc = Arc::new(tun_device);
-    tun_arc.start_packet_loop(tun_inbound_rx, tun_outbound_tx);
-
     // Transport selection: "quic" (primary, per architecture constraint) or
     // "udp" (legacy path, kept until the QUIC data plane is feature-complete).
     let transport_mode = local_config
@@ -188,6 +178,21 @@ async fn main() -> Result<()> {
         .and_then(|v| v.as_str())
         .unwrap_or("udp")
         .to_ascii_lowercase();
+
+    // QUIC datagrams cannot exceed ~1200 bytes on the wire; a larger TUN MTU
+    // would produce frames that get silently dropped instead of fragmented.
+    let tun_mtu: u32 = if transport_mode == "quic" { 1200 } else { 2800 };
+
+    // Initialize High-Performance UDP Transport Loop & Virtual Adapter Routing
+    let (tun_inbound_tx, tun_inbound_rx) = mpsc::channel::<Vec<u8>>(1024);
+    let (tun_outbound_tx, tun_outbound_rx) = mpsc::channel::<Vec<u8>>(1024);
+    let mut tun_outbound_rx = Some(tun_outbound_rx);
+
+    let mut tun_device = zgalaxy_rs::tun::TunDevice::new("zgalaxy0", tun_mtu);
+    let _ = tun_device.create_and_bind(None).await;
+    let tun_arc = Arc::new(tun_device);
+    tun_arc.start_packet_loop(tun_inbound_rx, tun_outbound_tx);
+
     let mut quic_started = false;
 
     if transport_mode == "quic" {
@@ -196,7 +201,7 @@ async fn main() -> Result<()> {
             Ok(quic) => {
                 quic_started = true;
                 let quic = Arc::new(quic);
-                let (quic_events_tx, mut quic_events_rx) = mpsc::channel(256);
+                let (quic_events_tx, mut quic_events_rx) = mpsc::channel(1024);
 
                 let quic_runner = Arc::clone(&quic);
                 tokio::spawn(async move {
@@ -223,14 +228,42 @@ async fn main() -> Result<()> {
                                 match message {
                                     ControlMessage::NodeAnnounce { address, .. } => {
                                         info!("[ZGALAXY QUIC] Peer {} announced as {}", remote, address);
+                                        quic_engine.remember_announce(remote, &address).await;
                                     }
                                     ControlMessage::NetworkConfigRequest { nwid } => {
-                                        // This node acts as controller for its own networks.
-                                        // Member id is the QUIC remote's address string for now;
-                                        // proper node-address binding arrives with the
-                                        // membership-token phase.
-                                        let member = remote.ip().to_string();
-                                        let _ = ctrl_for_events.register_join_request(&nwid, &member, None).await;
+                                        // Act as controller for networks owned by this node.
+                                        // The member id MUST be the announced node address —
+                                        // anything else cannot map to a member record.
+                                        let Some(member) = quic_engine.announced_address(remote).await else {
+                                            warn!("[ZGALAXY QUIC] config request from {} before NodeAnnounce — ignored", remote);
+                                            continue;
+                                        };
+                                        match ctrl_for_events.register_join_request(&nwid, &member, None).await {
+                                            Ok(_) => {
+                                                if let Some(net) = ctrl_for_events.get_network(&nwid).await {
+                                                    let member_rec = ctrl_for_events.get_member(&nwid, &member).await;
+                                                    let authorized = member_rec.as_ref().map(|m| m.authorized).unwrap_or(false);
+                                                    let ips = member_rec.map(|m| m.ip_assignments).unwrap_or_default();
+                                                    let response = serde_json::json!({
+                                                        "nwid": nwid,
+                                                        "name": net.name,
+                                                        "authorized": authorized,
+                                                        "ipAssignments": ips,
+                                                        "routes": net.routes,
+                                                        "mtu": net.mtu,
+                                                    });
+                                                    if let Err(e) = quic_engine.send_control(
+                                                        remote,
+                                                        &ControlMessage::NetworkConfigResponse { nwid, config: response },
+                                                    ).await {
+                                                        warn!("[ZGALAXY QUIC] failed to answer config request from {}: {}", remote, e);
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("[ZGALAXY QUIC] join request {} from {} rejected: {}", nwid, member, e);
+                                            }
+                                        }
                                     }
                                     ControlMessage::NetworkConfigResponse { nwid, config } => {
                                         let authorized = config.get("authorized")
@@ -288,11 +321,12 @@ async fn main() -> Result<()> {
                 if let Some(mut tun_outbound_rx) = tun_outbound_rx.take() {
                 tokio::spawn(async move {
                     while let Some(frame) = tun_outbound_rx.recv().await {
-                        let peers = quic_for_outbound.connected_peers().read().await.clone();
-                        for (remote, _peer) in peers {
-                            let _ = quic_for_outbound
-                                .send_frame(remote, bytes::Bytes::from(frame.clone()))
-                                .await;
+                        let frame = bytes::Bytes::from(frame);
+                        let peers = quic_for_outbound.connected_peers().read().await;
+                        for remote in peers.keys() {
+                            if let Err(e) = quic_for_outbound.send_frame(*remote, frame.clone()).await {
+                                warn!("[ZGALAXY QUIC] frame to {} dropped: {}", remote, e);
+                            }
                         }
                     }
                 });

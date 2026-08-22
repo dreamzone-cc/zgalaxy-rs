@@ -107,7 +107,11 @@ pub struct QuicTransport {
     endpoint: quinn::Endpoint,
     peers: Arc<RwLock<HashMap<SocketAddr, PeerConnection>>>,
     events: RwLock<Option<mpsc::Sender<QuicEvent>>>,
-    /// Node address announced on control streams (app-level identity binding).
+    /// Node address announced by each remote (app-level identity binding).
+    announced: RwLock<HashMap<SocketAddr, String>>,
+    /// Serializes outbound handshakes to close the connect() TOCTOU.
+    connect_lock: tokio::sync::Mutex<()>,
+    /// Our own node address announced on control streams.
     node_address: String,
 }
 
@@ -157,6 +161,8 @@ impl QuicTransport {
             endpoint,
             peers: Arc::new(RwLock::new(HashMap::new())),
             events: RwLock::new(None),
+            announced: RwLock::new(HashMap::new()),
+            connect_lock: tokio::sync::Mutex::new(()),
             node_address,
         })
     }
@@ -194,18 +200,35 @@ impl QuicTransport {
         let remote = conn.remote_address();
         info!("[ZGALAXY QUIC] Peer connected: {}", remote);
 
-        self.register(remote, conn.clone(), events_tx.clone()).await;
-        let _ = events_tx.send(QuicEvent::Connected { remote }).await;
+        if self.activate(remote, conn, events_tx.clone()).await {
+            let _ = events_tx.send(QuicEvent::Connected { remote }).await;
+        }
         Ok(())
     }
 
-    /// Register a connection and spawn its reader loops (datagrams + bi-streams).
-    async fn register(
+    /// The node address a remote announced for itself, if any.
+    pub async fn announced_address(&self, remote: SocketAddr) -> Option<String> {
+        self.announced.read().await.get(&remote).cloned()
+    }
+
+    /// Activate a connection for `remote` and spawn its reader loops exactly
+    /// once. When both mesh sides dial simultaneously, the first connection
+    /// wins; the loser is ignored (its traffic would be duplicate).
+    /// Returns true when this connection became the active one.
+    async fn activate(
         self: &Arc<Self>,
         remote: SocketAddr,
         conn: quinn::Connection,
         events_tx: mpsc::Sender<QuicEvent>,
-    ) {
+    ) -> bool {
+        {
+            let peers = self.peers.read().await;
+            if let Some(existing) = peers.get(&remote) {
+                if existing.conn.stable_id() != conn.stable_id() {
+                    return false; // a live connection already serves this remote
+                }
+            }
+        }
         self.peers
             .write()
             .await
@@ -218,7 +241,9 @@ impl QuicTransport {
         };
         if let Ok(buf) = control::encode(&announce) {
             if let Ok((mut send, _recv)) = conn.open_bi().await {
-                let _ = send.write_all(&buf).await;
+                if let Err(e) = send.write_all(&buf).await {
+                    warn!("[ZGALAXY QUIC] announce write failed: {}", e);
+                }
                 let _ = send.finish();
             }
         }
@@ -228,7 +253,17 @@ impl QuicTransport {
         let events0 = events_tx.clone();
         tokio::spawn(async move {
             let _ = this.read_datagrams(&conn2, remote, events0.clone()).await;
-            this.peers.write().await.remove(&remote);
+            // Remove only if the closing connection is still the active one.
+            let mut peers = this.peers.write().await;
+            if peers
+                .get(&remote)
+                .map(|p| p.conn.stable_id() == conn2.stable_id())
+                .unwrap_or(false)
+            {
+                peers.remove(&remote);
+            }
+            drop(peers);
+            this.announced.write().await.remove(&remote);
             let _ = events0.send(QuicEvent::Disconnected { remote }).await;
         });
 
@@ -238,6 +273,16 @@ impl QuicTransport {
         tokio::spawn(async move {
             let _ = this2.accept_control_streams(&conn3, remote, events1).await;
         });
+        true
+    }
+
+    /// Record a node address announced by a remote over a control stream.
+    pub async fn remember_announce(&self, remote: SocketAddr, address: &str) {
+        if address.len() == 10 && address.chars().all(|c| c.is_ascii_hexdigit()) {
+            self.announced.write().await.insert(remote, address.to_string());
+        } else {
+            warn!("[ZGALAXY QUIC] remote {} announced invalid address '{}'", remote, address);
+        }
     }
 
     async fn read_datagrams(
@@ -288,10 +333,23 @@ impl QuicTransport {
     }
 
     /// Connect to a remote peer (idempotent — reuses an existing connection).
-    pub async fn connect(&self, remote: SocketAddr) -> Result<PeerConnection> {
+    /// Serialized per-process to close the check/handshake/insert race; refuses
+    /// to run before `run()` installed the event sink so inbound traffic can
+    /// never be blackholed.
+    pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> Result<PeerConnection> {
         if let Some(existing) = self.peers.read().await.get(&remote) {
             return Ok(existing.clone());
         }
+        if self.events.read().await.is_none() {
+            bail!("QUIC transport not started (run() must be called before connect)");
+        }
+
+        let _guard = self.connect_lock.lock().await;
+        // Re-check after acquiring the lock — another caller may have won.
+        if let Some(existing) = self.peers.read().await.get(&remote) {
+            return Ok(existing.clone());
+        }
+
         let conn = self
             .endpoint
             .connect(remote, "zgalaxy")
@@ -300,65 +358,25 @@ impl QuicTransport {
             .with_context(|| format!("QUIC handshake with {} failed", remote))?;
 
         let peer = PeerConnection { remote, conn: conn.clone() };
-        self.peers.write().await.insert(remote, peer.clone());
-
-        // Spawn reader loops for this client-side connection, reusing the
-        // shared event channel set by run().
-        let events = self.events.read().await.clone();
-        if let Some(events_tx) = events {
-            // The announce stream we open will also be accepted by the remote
-            // accept_bi loop; mirror register() for the client side.
-            let announce = control::ControlMessage::NodeAnnounce {
-                address: self.node_address.clone(),
-                public_identity: String::new(),
-            };
-            if let Ok(buf) = control::encode(&announce) {
-                if let Ok((mut send, _recv)) = conn.open_bi().await {
-                    let _ = send.write_all(&buf).await;
-                    let _ = send.finish();
-                }
+        let events = self
+            .events
+            .read()
+            .await
+            .clone()
+            .expect("events sink checked above");
+        let activated = self.activate(remote, conn, events).await;
+        if !activated {
+            // A simultaneous inbound connection won the race; reuse it.
+            if let Some(existing) = self.peers.read().await.get(&remote) {
+                return Ok(existing.clone());
             }
-            let peers = Arc::clone(&self.peers);
-            let events2 = events_tx.clone();
-            let conn_dg = conn.clone();
-            tokio::spawn(async move {
-                loop {
-                    match conn_dg.read_datagram().await {
-                        Ok(data) => {
-                            let _ = events2
-                                .send(QuicEvent::Datagram { remote, data })
-                                .await;
-                        }
-                        Err(_) => {
-                            peers.write().await.remove(&remote);
-                            let _ = events2.send(QuicEvent::Disconnected { remote }).await;
-                            return;
-                        }
-                    }
-                }
-            });
-            // control streams from the remote side of this connection
-            let events3 = events_tx;
-            let conn_ctl = conn.clone();
-            tokio::spawn(async move {
-                loop {
-                    match conn_ctl.accept_bi().await {
-                        Ok((_, mut recv)) => {
-                            if let Ok(message) = read_control_message(&mut recv).await {
-                                let _ = events3.send(QuicEvent::Control { remote, message }).await;
-                            }
-                        }
-                        Err(_) => return,
-                    }
-                }
-            });
         }
         info!("[ZGALAXY QUIC] Connected to peer {}", remote);
         Ok(peer)
     }
 
     /// Send an unreliable data-plane frame (Ethernet/IP packet) via QUIC Datagrams.
-    pub async fn send_frame(&self, remote: SocketAddr, frame: Bytes) -> Result<()> {
+    pub async fn send_frame(self: &Arc<Self>, remote: SocketAddr, frame: Bytes) -> Result<()> {
         let peer = self.connect(remote).await?;
         if frame.len() > MAX_DATAGRAM_SIZE {
             bail!("frame of {} bytes exceeds QUIC datagram limit", frame.len());
@@ -370,7 +388,7 @@ impl QuicTransport {
 
     /// Send a reliable control message over a new bidirectional stream.
     pub async fn send_control(
-        &self,
+        self: &Arc<Self>,
         remote: SocketAddr,
         msg: &control::ControlMessage,
     ) -> Result<()> {

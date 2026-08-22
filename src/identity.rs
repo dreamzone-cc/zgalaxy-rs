@@ -236,10 +236,10 @@ impl Identity {
                     if alt.verifying_key().to_bytes() == verifying_arr {
                         Some(alt)
                     } else {
-                        Some(sk)
+                        bail!("Private key does not match the stated public key");
                     }
                 } else {
-                    Some(sk)
+                    bail!("Private key does not match the stated public key");
                 }
             } else {
                 Some(sk)

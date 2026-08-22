@@ -22,8 +22,30 @@
 - [ ] Windows-first: بناء واختبار على Windows 10/11 (cross-compile أو CI).
 - [ ] تفعيل allowManaged/allowGlobal/allowDefault/allowDNS في POST /network/{nwid}.
 
-## ZGALAXY (engine)
-- [ ] خطأ إقلاع: "[ZGALAXY SQLITE] Failed to import sessions.json: FOREIGN KEY constraint failed" (ملاحظ على 171) — يُحقَّق في هذه الجلسة.
+## ZGALAXY (engine) — نتائج فحص 2026-08-22 (المُصلَّح منها في هذا الـcommit):
+- [x] FK constraint failed عند استيراد sessions.json — السبب الجذري: معاملة all-or-nothing + INSERT OR IGNORE لا يغطي FK + جلسات يتيمة. أُصلح (تخطي per-row + seed admin عند فشل الاستيراد).
+- [x] /api/v1/metrics كان عاماً بدون مصادقة — أُصلح.
+- [x] systemd unit في install.sh بدون WorkingDirectory (zgalaxy-rs يقرأ ./config نسبةً إلى CWD) — أُصلح: /var/lib/zerotier-one.
+### متبقٍ (مرتب حسب الخطورة):
+- [ ] H1: بناء unified planet يعطي كل الجذور نفس identity (clusterService/planetService:345-354، ClusterNode.identityPublic لا يُملأ أبداً) — cluster HA معطوب وظيفياً.
+- [ ] H2: localInfo.nodeAddress غير موجود أبداً في getPlanetInfo — أضفه (حلل identity.public).
+- [ ] M2: /api/docs عام — خلف requireRole أو DOCS_PUBLIC=0.
+- [ ] M3: مزودو DDNS (DUCK_DNS/NO_IP/CUSTOM_WEBHOOK) مقبولون في الإعداد لكنهم no-ops — ارفضهم صراحةً.
+- [ ] M4: install.sh — رفض IPv6 literals في Host regex، TRUST_PROXY/X-Forwarded-Proto.
+- [ ] M5: فحص صحة cluster يستخدم منفذ الـengine المحلي للبعيد — أضف apiPort لكل عقدة.
+- [ ] M6: planet وmoon يتشاركان moon.json واحد (الكتابة تتطابق) — فصل أو توثيق كقرار.
+- [ ] L2: كاش الجلسات لا يعيد فحص SESSION_TTL في cacheGet.
+- [ ] L3: /ready عام يقرأ 5 ملفات لكل استدعاء — كاش 5-10 ثوان.
+- [ ] L5: نقاط قراءة بدون requireRole (federation/peers، identity/verify، cloudflare/*، ddns/status).
+- [ ] L6: مقارنة توكن federation ليست constant-time.
+- [ ] L8: entrypoint.sh يقرأ zerotier-one.port دون fallback.
+- [ ] L10: cluster syncSecret مولَّد ولا يُستخدم.
+### zgalaxy-rs — متبقٍ من فحص هذه الجلسة:
+- [ ] H2: PeerManager وtouch_member_last_seen غير موصولين في وضع QUIC (و/peer فارغ)؛ NAT worker يعمل بلا عمل في QUIC.
+- [ ] P2: قناة TUN ما زالت Vec<u8> بدل Bytes (نسخة لكل إطار داخل).
+- [ ] P4: حلقة المزامنة 3s×شبكات×أهداف — تقليل بعد اكتمال C2 (تم إصلاح الرد) بحسب الحاجة.
+- [ ] P5: next_free_ip مسح خطي من بداية الـpool (سيء للـpools الواسعة) — bitmap/free-set.
+- [ ] تنظيف: control::decode غير مستخدم، target_endpoint في main.rs، #[allow(dead_code)] قديم في transport.rs.
 - [ ] Dockerfile: alpine 3.14 قديم + بناء ZeroTier من main غير مثبّت — يحتاج إعادة كتابة عند الانتقال إلى حاويات.
 - [ ] استبدال zerotier-idtool/mkmoonworld الثنائيات المرفقة بتوليد native عبر zgalaxy-rs (world.rs يملك تنسيقه الخاص — توحيد التنسيق).
 - [ ] حذف مراجع zerotier-cli join في web-console واستبدالها بأوامر zgalaxy-cli.

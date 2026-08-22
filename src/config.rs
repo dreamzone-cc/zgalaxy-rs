@@ -62,6 +62,14 @@ impl LocalConfig {
             }
         }
 
+        // Canonical ZeroTier local.conf carries the port under
+        // settings.primaryPort — honor it when the top-level field is absent.
+        if let Some(pp) = cfg.settings.get("primaryPort").and_then(|v| v.as_u64()) {
+            if let Ok(port) = u16::try_from(pp) {
+                cfg.port = port;
+            }
+        }
+
         // Scan networks.d/ directory for configured networks
         let networks_dir = working_dir.join("networks.d");
         if networks_dir.exists() {
