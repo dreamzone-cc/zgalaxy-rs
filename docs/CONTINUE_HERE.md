@@ -34,6 +34,12 @@
   النسخ الاحتياطية: `/home/dz161/backups/{zerotier-one,ztnet_zerotier-volume}.20260822-120708.*`
   والتراجع: `sudo bash /tmp/deploy_161.sh rollback 20260822-120708`. VERIFY-PASS: الهوية محفوظة
   (ef313fb5c9)، 3 شبكات + 5 أعضاء محمّلة، ztnet بلا أخطاء.
+- **ب3 مغلقة (2026-08-22، جلسة التدقيق المستقل)**: NodeAnnounce/Datagrams → PeerManager +
+touch_member_last_seen (بثبات loopback)، RTT prober كل 10s عبر control streams يغذي /peer بزمن
+مُقاس، NAT worker محصور بالوضع القديم. الدليل: B1-PASS بثنائية ب3 + /peer من الطرفين (نظير
+فعلي، مسار حي، latency=1ms على الجسر المحلي). 32 اختباراً أخضر، clippy 0.
+- **الخطوة التالية المقترحة**: أ3 (ربط هوية QUIC: توقيع/تحدي قبل تفعيل transportMode=quic
+إنتاجياً) ثم ب2 (L2 learning/broadcast) ثم ب4 (التعافي)، أو ج1 (unified planet في المحرك).
 - **الخطوة التالية المقترحة** (حسب المسار الحرج في PRE_RESUME_PLAN): ب2 (L2 learning/broadcast) ثم
   ب3 (توصيل PeerManager/touch_member_last_seen في QUIC) وب4 (سلوك التعافي)، أو ج1 (unified planet
   في ZGALAXY engine). تفعيل transportMode=quic على حاوية الإنتاج يبقى معلقاً حتى توكن العضوية

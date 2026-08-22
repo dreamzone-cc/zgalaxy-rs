@@ -528,7 +528,19 @@ async fn delete_req(url: &str, token: &str) -> Result<Value> {
         bail!("DELETE {} failed: HTTP {} {}", url, status_code, body.trim());
     }
 
-    Ok(serde_json::json!({ "deleted": true }))
+    // Return the server's actual JSON body — callers (and diagnostics) must
+    // see the real response (e.g. {"result": true} for network leave), not a
+    // client-side fabrication.
+    let body = resp_str
+        .find("\r\n\r\n")
+        .map(|i| &resp_str[i + 4..])
+        .unwrap_or_default()
+        .trim();
+    if body.is_empty() {
+        return Ok(serde_json::json!({ "result": true }));
+    }
+    serde_json::from_str(body)
+        .with_context(|| format!("DELETE {}: non-JSON response: {}", url, body))
 }
 
 /// Restrict a secret identity file to owner-only permissions (0600).

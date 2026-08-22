@@ -21,6 +21,13 @@
 - [x] اختبار كامل بين عقدتين حقيقيتين عبر QUIC (TAP↔TAP) على السيرفرات — ب1 أعلاه (2026-08-22).
 - [x] ARP traffic بين عقدتين — مثبت سلوكياً ضمن ب1 (نجاح ping يستلزم ARP resolution عبر البث في الشبكة الافتراضية).
 
+## zgalaxy-rs — ب3 مكتملة 2026-08-22 (تحقق حي على 161):
+- [x] NodeAnnounce → PeerManager + touch_member_last_seen (بثبات loopback-guard).
+- [x] Datagram presence refresh مُقيَّد (5s/نظير) — lastContact حي في /peer.
+- [x] RTT حقيقي: prober كل 10s عبر control streams → Pong يقيس عند المرسل → latency في /peer (1ms على جسر docker المحلي).
+- [x] NAT raw-UDP worker يعمل فقط في الوضع القديم (QUIC keep-alive مدمج 5s + probes تؤدي نفس الدور).
+- [x] الدليل: B1-PASS بثنائية ب3 + /peer من الطرفين يعرضان النظير الفعلي بمسار حي وlatency مُقاسة.
+
 ## zgalaxy-rs — أمان/بروتوكول (المرحلة 1 المتبقي)
 - [ ] ربط شهادة QUIC بعنوان العقدة (pinning) — الحالي SkipServerVerification + NodeAnnounce بدون تحقق إجباري.
 - [ ] توكن عضوية موقّع من controller قصير TTL (بديل COM) يُتحقق عند تأسيس جلسة QUIC.
@@ -53,7 +60,6 @@
 - [ ] L8: entrypoint.sh يقرأ zerotier-one.port دون fallback.
 - [ ] L10: cluster syncSecret مولَّد ولا يُستخدم.
 ### zgalaxy-rs — متبقٍ من فحص هذه الجلسة:
-- [ ] H2: PeerManager وtouch_member_last_seen غير موصولين في وضع QUIC (و/peer فارغ)؛ NAT worker يعمل بلا عمل في QUIC.
 - [ ] P2: قناة TUN ما زالت Vec<u8> بدل Bytes (نسخة لكل إطار داخل).
 - [ ] P4: حلقة المزامنة 3s×شبكات×أهداف — تقليل بعد اكتمال C2 (تم إصلاح الرد) بحسب الحاجة.
 - [ ] P5: next_free_ip مسح خطي من بداية الـpool (سيء للـpools الواسعة) — bitmap/free-set.

@@ -502,14 +502,24 @@ impl EmbeddedController {
     }
 
     /// Update member's lastSeen timestamp and physical address across all networks.
+    /// Update member's lastSeen timestamp and physical address across all networks.
+    ///
+    /// Loopback-sourced paths (127.0.0.0/8, ::1) are never recorded: they are
+    /// unreachable from every other node, and recording them would poison the
+    /// rendezvous table distributed to peers.
     pub async fn touch_member_last_seen(&self, member_id: &str, physical_address: &str) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let loopback = physical_address.starts_with("127.")
+            || physical_address.starts_with("[::1]")
+            || physical_address.starts_with("::1");
         let mut members = self.members.write().await;
         for nwid_members in members.values_mut() {
             if let Some(member) = nwid_members.get_mut(member_id) {
                 member.last_seen = now;
                 member.clock = now;
-                member.physical_address = Some(physical_address.to_string());
+                if !loopback {
+                    member.physical_address = Some(physical_address.to_string());
+                }
             }
         }
     }

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use clap::Parser;
 use tokio::fs;
@@ -17,6 +18,11 @@ use zgalaxy_rs::network::NetworkManager;
 use zgalaxy_rs::peer::PeerManager;
 use zgalaxy_rs::resolver::DynamicDnsResolver;
 use zgalaxy_rs::transport::UdpTransport;
+
+/// Presence bookkeeping cadence for datagram-driven refreshes (ب3).
+const PEER_PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// RTT probe cadence over QUIC control streams (ب3).
+const RTT_PROBE_INTERVAL_SECS: u64 = 10;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -215,9 +221,11 @@ async fn main() -> Result<()> {
     let _ = resolver.load_sources(&working_dir, local_config.port).await;
     resolver.clone().start_worker();
 
-    // Initialize NAT Traversal & Hole-Punching Engine
+    // Initialize NAT Traversal & Hole-Punching Engine.
+    // The raw-UDP keepalive worker is only meaningful for the legacy UDP
+    // transport; in QUIC mode keep-alives are built into the connection
+    // (transport.keep_alive_interval), so the worker starts there instead.
     let nat_engine = Arc::new(NatTraversalEngine::new(peer_manager.clone()));
-    nat_engine.clone().start_worker();
 
     // Initialize Embedded Controller (Pure Rust, FileDB compatible with ZeroTier controller.d/)
     let controller = EmbeddedController::new(identity.clone(), working_dir.clone());
@@ -283,20 +291,57 @@ async fn main() -> Result<()> {
                     }
                 });
 
-                // Engine loop: QUIC events → TUN / network manager.
+                // Engine loop: QUIC events → TUN / network manager / presence.
                 let nm_for_events = network_manager.clone();
                 let tun_tx = tun_inbound_tx.clone();
                 let quic_engine = Arc::clone(&quic);
                 let ctrl_for_events = controller.clone();
                 let tun_for_events = Arc::clone(&tun_arc);
+                let peers_for_events = peer_manager.clone();
                 let mut applied_networks: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 tokio::spawn(async move {
                     while let Some(event) = quic_events_rx.recv().await {
                         use zgalaxy_rs::quic::QuicEvent;
+                        // Presence refresh throttle: datagrams can arrive at
+                        // game tick rates; member/peer bookkeeping runs at most
+                        // once per PEER_PRESENCE_INTERVAL per remote.
+                        let mut last_presence: std::collections::HashMap<
+                            std::net::SocketAddr,
+                            std::time::Instant,
+                        > = std::collections::HashMap::new();
                         match event {
                             QuicEvent::Datagram { remote, data } => {
                                 tracing::debug!("[ZGALAXY QUIC] Frame ({}B) from {}", data.len(), remote);
+                                let fresh = last_presence
+                                    .get(&remote)
+                                    .map(|t| t.elapsed() >= PEER_PRESENCE_INTERVAL)
+                                    .unwrap_or(true);
+                                if fresh {
+                                    last_presence.insert(remote, std::time::Instant::now());
+                                    if let Some(addr_str) =
+                                        quic_engine.announced_address(remote).await
+                                    {
+                                        if let Ok(node) =
+                                            zgalaxy_rs::identity::Address::from_str(&addr_str)
+                                        {
+                                            peers_for_events
+                                                .add_or_update_peer(
+                                                    node,
+                                                    zgalaxy_rs::peer::PeerRole::Leaf,
+                                                    remote,
+                                                    0,
+                                                )
+                                                .await;
+                                            ctrl_for_events
+                                                .touch_member_last_seen(
+                                                    &addr_str,
+                                                    &format!("{}/{}", remote.ip(), remote.port()),
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                }
                                 let _ = tun_tx.send(data.to_vec()).await;
                             }
                             QuicEvent::Control { remote, message } => {
@@ -304,7 +349,28 @@ async fn main() -> Result<()> {
                                 match message {
                                     ControlMessage::NodeAnnounce { address, .. } => {
                                         info!("[ZGALAXY QUIC] Peer {} announced as {}", remote, address);
-                                        quic_engine.remember_announce(remote, &address).await;
+                                        if quic_engine.remember_announce(remote, &address).await {
+                                            // ب3: feed ZTNET-facing observability —
+                                            // /peer and member lastSeen come alive here.
+                                            if let Ok(node) =
+                                                zgalaxy_rs::identity::Address::from_str(&address)
+                                            {
+                                                peers_for_events
+                                                    .add_or_update_peer(
+                                                        node,
+                                                        zgalaxy_rs::peer::PeerRole::Leaf,
+                                                        remote,
+                                                        0,
+                                                    )
+                                                    .await;
+                                            }
+                                            ctrl_for_events
+                                                .touch_member_last_seen(
+                                                    &address,
+                                                    &format!("{}/{}", remote.ip(), remote.port()),
+                                                )
+                                                .await;
+                                        }
                                     }
                                     ControlMessage::NetworkConfigRequest { nwid, token: _ } => {
                                         // Act as controller for networks owned by this node.
@@ -409,7 +475,36 @@ async fn main() -> Result<()> {
                                             &ControlMessage::Pong { nonce, sent_ms, received_ms: now },
                                         ).await;
                                     }
-                                    ControlMessage::Pong { .. } => {}
+                                    ControlMessage::Pong { sent_ms, .. } => {
+                                        // Real RTT is measured at the sender:
+                                        // receipt_now - original_sent_ms.
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64;
+                                        let rtt = now.saturating_sub(sent_ms) as i32;
+                                        if let Some(addr_str) =
+                                            quic_engine.announced_address(remote).await
+                                        {
+                                            if let Ok(node) =
+                                                zgalaxy_rs::identity::Address::from_str(&addr_str)
+                                            {
+                                                peers_for_events
+                                                    .add_or_update_peer(
+                                                        node,
+                                                        zgalaxy_rs::peer::PeerRole::Leaf,
+                                                        remote,
+                                                        rtt,
+                                                    )
+                                                    .await;
+                                                tracing::debug!(
+                                                    "[ZGALAXY QUIC RTT] {} -> {}ms",
+                                                    addr_str,
+                                                    rtt
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             QuicEvent::Connected { remote } => {
@@ -439,6 +534,38 @@ async fn main() -> Result<()> {
                     }
                 });
                 }
+
+                // ب3: periodic RTT probes ride the reliable control streams;
+                // Pong handling feeds real latency into PeerManager (ZTNET).
+                // These pings double as NAT-binding keepalives in QUIC mode.
+                let quic_for_rtt = Arc::clone(&quic);
+                spawn_watched("quic-rtt-prober", async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(RTT_PROBE_INTERVAL_SECS));
+                    loop {
+                        interval.tick().await;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let remotes: Vec<std::net::SocketAddr> = quic_for_rtt
+                            .connected_peers()
+                            .read()
+                            .await
+                            .keys()
+                            .copied()
+                            .collect();
+                        for remote in remotes {
+                            let msg = zgalaxy_rs::quic::control::ControlMessage::Ping {
+                                nonce: rand::random::<u64>(),
+                                sent_ms: now,
+                            };
+                            if let Err(e) = quic_for_rtt.send_control(remote, &msg).await {
+                                tracing::debug!("[ZGALAXY QUIC RTT] probe to {} failed: {}", remote, e);
+                            }
+                        }
+                    }
+                });
 
                 // Periodic network-config sync over reliable control streams.
                 let nm_for_sync = network_manager.clone();
@@ -528,6 +655,7 @@ async fn main() -> Result<()> {
     }
 
     if transport_mode != "quic" || !quic_started {
+    nat_engine.clone().start_worker();
     if let Ok(transport) = UdpTransport::bind(local_config.port, identity.clone(), peer_manager.clone(), resolver.clone()).await {
         let transport_arc = Arc::new(transport);
         transport_arc.set_controller(controller.clone()).await;
