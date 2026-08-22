@@ -21,3 +21,4 @@ networks.d/
 # Operating system files
 .DS_Store
 Thumbs.db
+zgalaxy-ui/target

@@ -1,0 +1,105 @@
+// ZGALAXY Desktop Client — Gamer-first main window (Windows 11 inspired).
+// State model mirrors the spec: service/node/networks separated from UI.
+
+import { Button, LineEdit, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export struct NetworkInfo {
+    name: string,
+    nwid: string,
+    status: string,
+    address: string,
+    ready: bool,
+}
+
+export component MainWindow inherits Window {
+    title: "ZGALAXY";
+    preferred-width: 420px;
+    preferred-height: 520px;
+
+    // --- App State (set from Rust core, never mutated by UI logic) ---
+    in-out property <string> node-address: "…";
+    in-out property <string> service-state: "Starting";
+    in-out property <string> status-line: "Checking service…";
+    in-out property <color> status-color: #cccccc;
+    in-out property <[NetworkInfo]> networks;
+    in-out property <string> join-input;
+    in-out property <bool> busy: false;
+
+    // --- Commands (handled in Rust core) ---
+    callback join-network(string);
+    callback leave-network(string);
+    callback refresh();
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 12px;
+
+        Text {
+            text: root.status-line;
+            font-size: 20px;
+            font-weight: 700;
+            color: root.status-color;
+        }
+
+        Text {
+            text: "Node " + root.node-address + " · " + root.service-state;
+            font-size: 12px;
+            color: #666666;
+        }
+
+        // --- Networks list ---
+        if root.networks.length == 0 : Text {
+            text: "No networks yet — join one to get started";
+            color: #888888;
+            vertical-stretch: 1;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+        for net[i] in root.networks : Rectangle {
+            height: 72px;
+            border-radius: 8px;
+            background: #f5f5f5;
+
+            HorizontalBox {
+                padding: 12px;
+                alignment: start;
+
+                VerticalBox {
+                    alignment: center;
+                    padding-left: 4px;
+                    Text {
+                        text: net.ready ? "🟢 " + net.name : "🟠 " + net.name;
+                        font-size: 15px;
+                        font-weight: 600;
+                    }
+                    Text {
+                        text: net.status == "OK" ? "Ready to play · " + net.address : net.status;
+                        font-size: 12px;
+                        color: #666666;
+                    }
+                }
+                Button {
+                    text: "Disconnect";
+                    enabled: !root.busy;
+                    clicked => { root.leave-network(net.nwid); }
+                }
+            }
+        }
+
+        // --- Join Network ---
+        Rectangle { height: 8px; }
+        HorizontalBox {
+            padding: 0;
+            LineEdit {
+                placeholder-text: "Enter network ID";
+                text <=> root.join-input;
+                enabled: !root.busy;
+            }
+            Button {
+                text: "Join";
+                enabled: !root.busy && root.join-input != "";
+                clicked => { root.join-network(root.join-input); }
+            }
+        }
+    }
+}
