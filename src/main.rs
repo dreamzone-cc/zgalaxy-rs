@@ -265,6 +265,9 @@ async fn main() -> Result<()> {
     let tun_mtu: u32 = if transport_mode == "quic" { 1186 } else { 2800 };
 
     // Initialize High-Performance UDP Transport Loop & Virtual Adapter Routing
+    // ب2: one shared L2 learning table across TUN reader, QUIC events,
+    // outbound relay, and RTT prober.
+    let l2_shared = Arc::new(zgalaxy_rs::L2Switch::new());
     let (tun_inbound_tx, tun_inbound_rx) = mpsc::channel::<Vec<u8>>(1024);
     let (tun_outbound_tx, tun_outbound_rx) = mpsc::channel::<Vec<u8>>(1024);
     let mut tun_outbound_rx = Some(tun_outbound_rx);
@@ -305,6 +308,7 @@ async fn main() -> Result<()> {
                 let identity_for_events = identity.clone();
                 let mut applied_networks: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
+                let l2_for_events = Arc::clone(&l2_shared);
                 tokio::spawn(async move {
                     while let Some(event) = quic_events_rx.recv().await {
                         use zgalaxy_rs::quic::QuicEvent;
@@ -318,6 +322,13 @@ async fn main() -> Result<()> {
                         match event {
                             QuicEvent::Datagram { remote, data } => {
                                 tracing::debug!("[ZGALAXY QUIC] Frame ({}B) from {}", data.len(), remote);
+                                // ب2 backward learning: src MAC ↔ delivering endpoint
+                                // (every frame — one map write, no throttle needed).
+                                if let Some((_, src_mac)) =
+                                    zgalaxy_rs::l2_switch::L2Switch::parse_ethernet(&data)
+                                {
+                                    l2_for_events.learn(src_mac, remote).await;
+                                }
                                 let fresh = last_presence
                                     .get(&remote)
                                     .map(|t| t.elapsed() >= PEER_PRESENCE_INTERVAL)
@@ -580,28 +591,60 @@ async fn main() -> Result<()> {
                     }
                 });
 
-                // Relay host outbound frames from TUN over QUIC datagrams to
-                // every connected peer (proper L2 learning comes with the
-                // data-plane phase).
+                // ب2: selective L2 forwarding — unicast frames go only to the
+                // learned owner endpoint; broadcast/multicast/unknown flood to
+                // all connected peers.
                 let quic_for_outbound = Arc::clone(&quic);
-                if let Some(mut tun_outbound_rx) = tun_outbound_rx.take() {
+                // Same shared table: inbound frames teach it, outbound frames consult it.
+                let l2_for_outbound = Arc::clone(&l2_shared);
+                let Some(mut tun_outbound_rx) = tun_outbound_rx.take() else {
+                    return Ok(());
+                };
                 tokio::spawn(async move {
                     while let Some(frame) = tun_outbound_rx.recv().await {
-                        let frame = bytes::Bytes::from(frame);
-                        let peers = quic_for_outbound.connected_peers().read().await;
-                        for remote in peers.keys() {
-                            if let Err(e) = quic_for_outbound.send_frame(*remote, frame.clone()).await {
-                                warn!("[ZGALAXY QUIC] frame to {} dropped: {}", remote, e);
+                        let (dst_known, dst_mac) =
+                            zgalaxy_rs::l2_switch::L2Switch::parse_ethernet(&frame)
+                                .map(|(d, _)| {
+                                    (
+                                        !zgalaxy_rs::l2_switch::L2Switch::is_broadcast(&d)
+                                            && !zgalaxy_rs::l2_switch::L2Switch::is_multicast(&d),
+                                        d,
+                                    )
+                                })
+                                .unwrap_or((false, [0u8; 6]));
+                        let target: Option<std::net::SocketAddr> = if dst_known {
+                            l2_for_outbound.resolve(&dst_mac).await
+                        } else {
+                            None
+                        };
+                        match target {
+                            Some(endpoint) => {
+                                if let Err(e) =
+                                    quic_for_outbound.send_frame(endpoint, bytes::Bytes::from(frame)).await
+                                {
+                                    warn!("[ZGALAXY QUIC] unicast frame to {} dropped: {}", endpoint, e);
+                                }
+                            }
+                            None => {
+                                let frame = bytes::Bytes::from(frame);
+                                let peers = quic_for_outbound.connected_peers().read().await;
+                                for remote in peers.keys() {
+                                    if let Err(e) =
+                                        quic_for_outbound.send_frame(*remote, frame.clone()).await
+                                    {
+                                        warn!("[ZGALAXY QUIC] flooded frame to {} dropped: {}", remote, e);
+                                    }
+                                }
                             }
                         }
                     }
                 });
-                }
 
                 // ب3: periodic RTT probes ride the reliable control streams;
                 // Pong handling feeds real latency into PeerManager (ZTNET).
                 // These pings double as NAT-binding keepalives in QUIC mode.
                 let quic_for_rtt = Arc::clone(&quic);
+                let l2_for_rtt = Arc::clone(&l2_shared);
                 spawn_watched("quic-rtt-prober", async move {
                     let mut interval =
                         tokio::time::interval(std::time::Duration::from_secs(RTT_PROBE_INTERVAL_SECS));
@@ -627,6 +670,8 @@ async fn main() -> Result<()> {
                                 tracing::debug!("[ZGALAXY QUIC RTT] probe to {} failed: {}", remote, e);
                             }
                         }
+                        // ب2 hygiene: drop silent MACs after 5 minutes of silence.
+                        let _ = l2_for_rtt.evict_stale(std::time::Duration::from_secs(300)).await;
                     }
                 });
 

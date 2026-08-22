@@ -42,6 +42,12 @@ touch_member_last_seen (بثبات loopback)، RTT prober كل 10s عبر contro
   NodeChallenge → AnnounceProof موقّع ed25519 مرتبط بعنوان العقدة؛ الحضور والتسجيل
   لا يُمنحان إلا بعد إثبات صالح (رفض مبكر مؤكد حيّاً في سجل zg-a)، مع مصفوفة
   اختبارات سلبية كاملة. 33 اختباراً أخضر، clippy 0.
+- **ب2 مغلقة (2026-08-22)**: وحدة l2_switch (تعلّم MAC→endpoint + evict 5m +
+  6 اختبارات وحدة) وتوجيه انتقائي في مسار الإرسال — unicast للمالك فقط،
+  flood للبث/المجهول. B1-PASS بثنائية ب2 (~0.8ms). 39 اختباراً أخضر، clippy 0.
+- **الخطوة التالية المقترحة**: ب4 (التعافي/connection migration) أو ج1 (unified
+  planet في المحرك) أو تفعيل transportMode=quic على الإنتاج (الأصبحت الشروط
+  الأمنية أ1+أ3+ب1..ب3 مستوفاة — يتبقى توكن العضوية الكامل في مسار QUIC).
 - **الخطوة التالية المقترحة**: ب2 (L2 learning/broadcast فوق QUIC) ثم ب4 (التعافي/
   connection migration)، أو ج1 (unified planet في المحرك).
 - **الخطوة التالية المقترحة**: أ3 (ربط هوية QUIC: توقيع/تحدي قبل تفعيل transportMode=quic

@@ -20,6 +20,7 @@ pub mod controller;
 pub mod controller_api;
 pub mod crypto;
 pub mod identity;
+pub mod l2_switch;
 pub mod nat;
 pub mod network;
 pub mod packet;
@@ -42,6 +43,7 @@ pub use config::LocalConfig;
 pub use nat::NatTraversalEngine;
 pub use route_manager::RouteManager;
 pub use transport::UdpTransport;
+pub use l2_switch::L2Switch;
 
 pub const DEFAULT_PORT: u16 = 9993;
 pub const DEFAULT_CONTROL_PORT: u16 = 9993;

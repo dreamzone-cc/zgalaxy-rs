@@ -17,9 +17,19 @@
 - [x] الدورة الكاملة تعمل: join → طلب تكوين QUIC → تسجيل عضو عند الـcontroller → تخويل عبر REST (بنفس واجهة ztnet) → OK + تعيين IP تلقائي (10.244.0.10) وتطبيقه على zgalaxy0 → ping B→A (10.244.0.1) عبر TAP↔QUIC: 3/3 حزم، 0% فقد، ~0.7ms (يثبت ARP/البث L2 أيضاً لأن ping عبر /24 يتطلب ARP أولاً).
 - [x] ping نهائي B→A — عبر nsenter من مضيف docker داخل network namespace الحاوية (لا iputils-ping في الصورة).
 
-- [ ] L2 learning/broadcast الصحيح (الحالي: إرسال كل إطار صادر لكل الأقران المتصلين — يكفي للـlobbies الصغيرة).
 - [x] اختبار كامل بين عقدتين حقيقيتين عبر QUIC (TAP↔TAP) على السيرفرات — ب1 أعلاه (2026-08-22).
 - [x] ARP traffic بين عقدتين — مثبت سلوكياً ضمن ب1 (نجاح ping يستلزم ARP resolution عبر البث في الشبكة الافتراضية).
+
+## zgalaxy-rs — ب2 مكتملة 2026-08-22 (L2 learning/broadcast):
+- [x] وحدة l2_switch.rs: جدول تعلّم MAC→endpoint (تعلّم رجعي من إطار وارد، أحدث
+      endpoint يفوز عند التجوال، evict بعد صمت 5 دقائق عبر مسبار RTT الدوري).
+- [x] توجيه انتقائي صادر: unicast للمالك المُتعلم فقط؛ broadcast/multicast/مجهول →
+      flood لكل الأقران المتصلين. جدول واحد مشترك بين TUN/QUIC-events/relay/prober.
+- [x] 6 اختبارات وحدة لجدول التعلم (تعلم/حل/تجوال/إخلاء/تحليل Ethernet/كشف bcast-mcast).
+- [x] الدليل الحي: B1-PASS بثنائية ب2 (ping 3/3، 0% فقد، ~0.8ms — يشمل ARP-broadcast
+      ثم ARP-reply وICMP unicast عبر الجدول) + /peer حي.
+- ملاحظة: التفريق بين unicast/flood خارجياً يحتاج عقدة ثالثة مراقبة — السلوك مغطى
+  باختبارات الوحدة والمنطق؛ اختبار 3 عقد مقترح ضمن E2E لاحقاً.
 
 ## zgalaxy-rs — ب3 مكتملة 2026-08-22 (تحقق حي على 161):
 - [x] NodeAnnounce → PeerManager + touch_member_last_seen (بثبات loopback-guard).
