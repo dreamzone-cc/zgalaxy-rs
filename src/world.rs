@@ -7,6 +7,15 @@ use serde::{Serialize, Deserialize};
 pub const WORLD_TYPE_PLANET: u8 = 1;
 pub const WORLD_TYPE_MOON: u8 = 127;
 
+/// Canonical ZeroTier "Earth" planet id (World.hpp: ZT_WORLD_ID_EARTH).
+pub const WORLD_ID_EARTH: u64 = 149604618;
+
+/// Canonical ZeroTier C++ sizes (ECC.hpp):
+/// public key set = 64 bytes (two 32-byte halves), signature = 96 bytes
+/// (64-byte Ed25519 signature + 32-byte signer public key).
+pub const CANONICAL_KEY_SET_LEN: usize = 64;
+pub const CANONICAL_SIGNATURE_LEN: usize = 96;
+
 /// A root node within a Planet or Moon world definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldRoot {
@@ -96,22 +105,48 @@ impl World {
                     let num_eps = data[cursor] as usize;
                     cursor += 1;
                     for _ in 0..num_eps {
-                        if cursor + 20 <= data.len() {
-                            // InetAddress: sockaddr_storage binary format
-                            let fam = u16::from_be_bytes(data[cursor..cursor + 2].try_into()?);
-                            let port = u16::from_be_bytes(data[cursor + 2..cursor + 4].try_into()?);
-                            let ip = if fam == 2 || fam == 0 { // IPv4
-                                format!("{}.{}.{}.{}", data[cursor + 4], data[cursor + 5], data[cursor + 6], data[cursor + 7])
-                            } else { // IPv6
-                                format!("[{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}]",
-                                    data[cursor+4], data[cursor+5], data[cursor+6], data[cursor+7],
-                                    data[cursor+8], data[cursor+9], data[cursor+10], data[cursor+11],
-                                    data[cursor+12], data[cursor+13], data[cursor+14], data[cursor+15],
-                                    data[cursor+16], data[cursor+17], data[cursor+18], data[cursor+19])
-                            };
-                            stable_endpoints.push(format!("{}/{}", ip, port));
-                            cursor += 20;
+                        // InetAddress::serialize (InetAddress.hpp): 1-byte
+                        // family (0x04 IPv4 / 0x06 IPv6), address bytes,
+                        // then a big-endian uint16 port.
+                        if cursor >= data.len() {
+                            break;
                         }
+                        let fam = data[cursor];
+                        cursor += 1;
+                        let (ip_len, ip): (usize, Option<String>) = match fam {
+                            0x04 if cursor + 6 <= data.len() => (
+                                4,
+                                Some(format!(
+                                    "{}.{}.{}.{}",
+                                    data[cursor],
+                                    data[cursor + 1],
+                                    data[cursor + 2],
+                                    data[cursor + 3]
+                                )),
+                            ),
+                            0x06 if cursor + 18 <= data.len() => {
+                                let mut s = String::from("[");
+                                for i in 0..16 {
+                                    if i > 0 && i % 2 == 0 {
+                                        s.push(':');
+                                    }
+                                    s.push_str(&format!("{:02x}", data[cursor + i]));
+                                }
+                                s.push(']');
+                                (16, Some(s))
+                            }
+                            _ => (0, None),
+                        };
+                        if ip.is_none() {
+                            break;
+                        }
+                        cursor += ip_len;
+                        if cursor + 2 > data.len() {
+                            break;
+                        }
+                        let port = u16::from_be_bytes(data[cursor..cursor + 2].try_into()?);
+                        cursor += 2;
+                        stable_endpoints.push(format!("{}/{}", ip.unwrap(), port));
                     }
                 }
             } else {
@@ -198,6 +233,111 @@ impl World {
         fs::write(path.as_ref(), self.encode()).await?;
         Ok(())
     }
+
+    /// Canonical root identity public key set for a root: the Ed25519 public
+    /// key in the first 32 bytes (second half unused, zeroed — the C++
+    /// ECC key set pairs an Ed25519 and a Curve25519 key).
+    fn canonical_key_set(ed25519_pub: Option<&[u8]>) -> [u8; CANONICAL_KEY_SET_LEN] {
+        let mut out = [0u8; CANONICAL_KEY_SET_LEN];
+        if let Some(pub_bytes) = ed25519_pub {
+            if pub_bytes.len() == 32 {
+                out[..32].copy_from_slice(pub_bytes);
+            }
+        }
+        out
+    }
+
+    /// Canonical ZeroTier C++ root serialization: address (5 bytes),
+    /// identity type byte (0), 64-byte public key set (World.hpp
+    /// Identity::serialize), endpoint count, then InetAddress entries.
+    fn encode_canonical_roots(roots: &[WorldRoot], root_keys: &[Option<[u8; 32]>]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.push(roots.len() as u8);
+        for (i, root) in roots.iter().enumerate() {
+            let key: Option<[u8; 32]> = root_keys.get(i).and_then(|k| *k);
+            let endpoints: Vec<Vec<u8>> = root
+                .stable_endpoints
+                .iter()
+                .filter_map(|ep| encode_canonical_endpoint(ep))
+                .collect();
+            data.extend_from_slice(root.identity.as_bytes());
+            data.push(0u8); // identity type (C25519/Ed25519)
+            data.extend_from_slice(&Self::canonical_key_set(key.as_ref().map(|k| k.as_slice())));
+            data.push(endpoints.len() as u8);
+            for ep in endpoints {
+                data.extend_from_slice(&ep);
+            }
+        }
+        data
+    }
+
+    /// Serialize to the canonical ZeroTier C++ binary world format
+    /// (World::serialize with signature), signed by `signer`.
+    ///
+    /// Signed payload follows World::serialize(forSign=true):
+    /// 0x7f*8 prefix + body + 0xf7*8 suffix, where the body is
+    /// type + id + timestamp + updatesMustBeSignedBy(64) + roots + u16(0).
+    /// The signature is the C++ ECC composite: 64-byte Ed25519 signature
+    /// followed by the 32-byte signer public key.
+    pub fn encode_canonical(&self, signer: &crate::identity::Identity, root_keys: &[Option<[u8; 32]>]) -> Result<Vec<u8>> {
+        let signer_pub: [u8; 32] = signer.verifying_key.to_bytes();
+        let updates_must_be_signed_by = Self::canonical_key_set(Some(signer_pub.as_slice()));
+
+        let mut body = Vec::new();
+        body.push(self.world_type);
+        body.extend_from_slice(&self.id.to_be_bytes());
+        body.extend_from_slice(&self.timestamp.to_be_bytes());
+        body.extend_from_slice(&updates_must_be_signed_by);
+        body.extend_from_slice(&Self::encode_canonical_roots(&self.roots, root_keys));
+        body.extend_from_slice(&0u16.to_be_bytes()); // attached dictionary length
+
+        let mut for_sign = Vec::with_capacity(body.len() + 16);
+        for_sign.extend_from_slice(&[0x7fu8; 8]);
+        for_sign.extend_from_slice(&body);
+        for_sign.extend_from_slice(&[0xf7u8; 8]);
+
+        let sig_64 = signer.sign(&for_sign)?;
+        let mut signature = Vec::with_capacity(CANONICAL_SIGNATURE_LEN);
+        signature.extend_from_slice(&sig_64);
+        signature.extend_from_slice(&signer_pub);
+
+        let mut out = Vec::with_capacity(body.len() + CANONICAL_SIGNATURE_LEN);
+        out.extend_from_slice(&body[..17 + CANONICAL_KEY_SET_LEN]);
+        out.extend_from_slice(&signature);
+        out.extend_from_slice(&body[17 + CANONICAL_KEY_SET_LEN..]);
+        Ok(out)
+    }
+}
+
+/// Encode one stable endpoint ("ip/port" or "[v6]/port") in the canonical
+/// InetAddress binary form: 1-byte family + address bytes + BE uint16 port.
+/// Hostname endpoints cannot be represented and yield None (canonical tools
+/// drop them, matching mkmoonworld behavior).
+fn encode_canonical_endpoint(ep: &str) -> Option<Vec<u8>> {
+    let ep = ep.trim();
+    let (host, port_str) = ep.rsplit_once('/')?;
+    let port: u16 = port_str.parse().ok()?;
+    let mut out = Vec::new();
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        out.push(0x04u8);
+        out.extend_from_slice(&v4.octets());
+    } else {
+        let v6 = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(v6) = v6.parse::<std::net::Ipv6Addr>() {
+            out.push(0x06u8);
+            out.extend_from_slice(&v6.octets());
+        } else {
+            return None;
+        }
+    }
+    out.extend_from_slice(&port.to_be_bytes());
+    Some(out)
+}
+
+/// True when the endpoint is a literal IPv4/IPv6 "ip/port" pair that the
+/// canonical binary world format can represent.
+pub fn endpoint_is_ip(ep: &str) -> bool {
+    encode_canonical_endpoint(ep).is_some()
 }
 
 #[cfg(test)]
@@ -247,5 +387,62 @@ mod tests {
         assert_eq!(world.id, 149604618);
         assert_eq!(world.roots.len(), 1);
         assert_eq!(world.roots[0].identity, Address([0x06, 0x9a, 0xe3, 0x80, 0x92]));
+    }
+
+    #[test]
+    fn test_canonical_encode_round_trip() {
+        use crate::identity::Identity;
+        let signer = Identity::generate();
+        let roots = vec![
+            WorldRoot {
+                identity: signer.address,
+                stable_endpoints: vec![
+                    "203.0.113.7/9993".to_string(),
+                    "2001:db8::1/9994".to_string(),
+                ],
+            },
+            WorldRoot {
+                identity: Address([0x12, 0x34, 0x56, 0x78, 0x9a]),
+                stable_endpoints: vec!["198.51.100.4/9993".to_string()],
+            },
+        ];
+        let world = World::new(WORLD_TYPE_PLANET, WORLD_ID_EARTH, 1700000000000, roots.clone());
+        let root_keys = vec![Some(signer.verifying_key.to_bytes()), None];
+
+        let encoded = world.encode_canonical(&signer, &root_keys).unwrap();
+        // Canonical framing: type(1) + id(8) + ts(8) + keyset(64) + sig(96)
+        // + root count(1) + roots + dictionary(2).
+        assert_eq!(encoded[0], WORLD_TYPE_PLANET);
+        assert_eq!(u64::from_be_bytes(encoded[1..9].try_into().unwrap()), WORLD_ID_EARTH);
+
+        let parsed = World::parse_binary(&encoded).unwrap();
+        assert_eq!(parsed.world_type, WORLD_TYPE_PLANET);
+        assert_eq!(parsed.id, WORLD_ID_EARTH);
+        assert_eq!(parsed.timestamp, world.timestamp);
+        assert_eq!(parsed.roots.len(), 2);
+        assert_eq!(parsed.roots[0].identity, signer.address);
+        assert_eq!(
+            parsed.roots[0].stable_endpoints,
+            vec![
+                "203.0.113.7/9993".to_string(),
+                "[2001:0db8:0000:0000:0000:0000:0000:0001]/9994".to_string()
+            ]
+        );
+        assert_eq!(parsed.roots[1].identity, Address([0x12, 0x34, 0x56, 0x78, 0x9a]));
+        assert_eq!(parsed.roots[1].stable_endpoints, vec!["198.51.100.4/9993".to_string()]);
+        // Signature present with the C++ composite length (96 bytes).
+        assert_eq!(parsed.signature.len(), CANONICAL_SIGNATURE_LEN);
+    }
+
+    #[test]
+    fn test_canonical_endpoint_encoder() {
+        assert_eq!(
+            encode_canonical_endpoint("203.0.113.7/9993").unwrap(),
+            [0x04, 203, 0, 113, 7, 0x27, 0x09]
+        );
+        // Hostnames cannot be represented canonically and are dropped,
+        // matching the official mkmoonworld behavior.
+        assert!(encode_canonical_endpoint("dz.dreamzone.cc/9993").is_none());
+        assert!(encode_canonical_endpoint("203.0.113.7").is_none());
     }
 }

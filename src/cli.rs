@@ -87,6 +87,15 @@ pub enum IdToolCommands {
         #[arg(help = "Input moon JSON file path", default_value = "moon.json")]
         moon_json: String,
     },
+
+    /// Build a signed planet (world.bin) from a moon definition — native
+    /// replacement for the C++ mkmoonworld tool. Invocations of a binary
+    /// named `mkmoonworld*` are routed here automatically (argv0 dispatch).
+    #[command(name = "mkmoonworld", alias = "mk-moonworld")]
+    MkMoonWorld {
+        #[arg(help = "Input moon JSON file path", default_value = "moon.json")]
+        moon_json: String,
+    },
 }
 
 impl Cli {
@@ -116,7 +125,10 @@ impl Cli {
     /// Execute a client command via HTTP REST call to the daemon.
     pub async fn execute(self) -> Result<()> {
         let token = self.resolve_token().await;
-        if token.is_empty() {
+        // idtool subcommands are purely local file operations — they must
+        // work during bootstrap before any authtoken.secret exists.
+        let needs_token = !matches!(self.command, Commands::IdTool { .. });
+        if needs_token && token.is_empty() {
             eprintln!("zerotier-cli: authtoken.secret not found or not readable (permission denied).");
             eprintln!("            Please run with sudo: 'sudo zgalaxy-cli {}'", match &self.command {
                 Commands::Status | Commands::Info => "status",
@@ -136,8 +148,13 @@ impl Cli {
                 let out = match m.as_str() {
                     "GET" => fetch_json(&url, &token).await?,
                     "POST" => {
-                        let payload: Value = serde_json::from_str(body.as_deref().unwrap_or("{}"))
-                            .unwrap_or_else(|_| serde_json::json!({}));
+                        // Refuse silently-degraded bodies: a typo'd JSON would
+                        // otherwise be sent as `{`}` and act on the wrong data.
+                        let payload: Value = match body.as_deref() {
+                            None | Some("{}") => serde_json::json!({}),
+                            Some(text) => serde_json::from_str(text)
+                                .with_context(|| format!("invalid JSON body: {}", text))?,
+                        };
                         post_json(&url, &token, payload).await?
                     }
                     "DELETE" => delete_req(&url, &token).await?,
@@ -263,7 +280,11 @@ impl Cli {
                         "worldType": "moon",
                         "updatesMustBeSigned": 1,
                         "roots": [{
-                            "identity": id.address.to_string(),
+                            "id": id.address.to_string(),
+                            // Full public identity (address + public key) so
+                            // genmoon/mkmoonworld can embed the real key set of
+                            // the root in canonical world binaries.
+                            "identity": content.trim(),
                             "stableEndpoints": ["dz.dreamzone.cc/9993"]
                         }],
                         "signingKey": hex::encode(id.verifying_key.to_bytes()),
@@ -275,76 +296,67 @@ impl Cli {
                     let content = fs::read_to_string(&moon_json).await
                         .with_context(|| format!("Failed to read moon config {}", moon_json))?;
                     let value: Value = serde_json::from_str(&content)?;
+                    let def = parse_moon_definition(&value)?;
+                    let signer = def.signer.ok_or_else(|| anyhow::anyhow!(
+                        "moon definition carries no signingKey_SECRET — run `idtool initmoon identity.public` to regenerate signing keys"
+                    ))?;
 
-                    let id_str = value["id"].as_str().unwrap_or("").to_string();
-                    let roots_raw: Vec<(String, Vec<String>)> = value["roots"]
-                        .as_array()
-                        .map(|roots| {
-                            roots.iter()
-                                .map(|r| {
-                                    // ZGALAXY writes roots entries as {"id": ...};
-                                    // canonical moon.json uses {"identity": ...}.
-                                    let root_id = r["id"].as_str()
-                                        .or_else(|| r["identity"].as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let endpoints = r["stableEndpoints"]
-                                        .as_array()
-                                        .map(|eps| {
-                                            eps.iter()
-                                                .filter_map(|e| e.as_str().map(|s| s.to_string()))
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    (root_id, endpoints)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    let id = id_str.parse::<crate::identity::Address>()
-                        .context("Invalid moon id address")?;
                     let timestamp = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)?
                         .as_millis() as u64;
-
-                    let roots: Vec<crate::world::WorldRoot> = roots_raw
-                        .iter()
-                        .filter_map(|(rid, eps)| {
-                            rid.parse::<crate::identity::Address>().ok().map(|addr| {
-                                crate::world::WorldRoot {
-                                    identity: addr,
-                                    stable_endpoints: eps.clone(),
-                                }
-                            })
-                        })
-                        .collect();
-
-                    let mut world = crate::world::World::new(
+                    let world = crate::world::World::new(
                         crate::world::WORLD_TYPE_MOON,
-                        id.to_u64(),
+                        def.world_id,
                         timestamp,
-                        roots,
+                        def.roots,
                     );
-
-                    // Sign the world if a secret signing key is available
-                    // (accepts both the 1.16.x "signingKey_SECRET" and the
-                    // legacy "signingKey_secret" spellings used by ZGALAXY).
-                    let secret_key_hex = value["signingKey_SECRET"].as_str()
-                        .or_else(|| value["signingKey_secret"].as_str())
-                        .unwrap_or("");
-                    if !secret_key_hex.is_empty() {
-                        let secret_identity = crate::identity::Identity::parse(secret_key_hex)?;
-                        let sig = secret_identity.sign(&world.encode())?;
-                        world.signature = sig.to_vec();
-                    }
+                    let bytes = world.encode_canonical(&signer, &def.root_keys)?;
 
                     // Canonical idtool output naming: the world id formatted as
                     // 16 hex characters, e.g. "000000069ae38092.moon".
                     // ZGALAXY's MoonService looks for exactly this file name.
-                    let output = format!("{:016x}.moon", id.to_u64());
-                    world.save_to_file(&output).await?;
-                    println!("Signed moon written to {}", output);
+                    let output = format!("{:016x}.moon", def.world_id);
+                    fs::write(&output, &bytes).await?;
+                    println!("Signed moon written to {} (canonical world format)", output);
+                }
+                IdToolCommands::MkMoonWorld { moon_json } => {
+                    let content = fs::read_to_string(&moon_json).await
+                        .with_context(|| format!("Failed to read moon config {}", moon_json))?;
+                    let value: Value = serde_json::from_str(&content)?;
+                    let def = parse_moon_definition(&value)?;
+                    let signer = def.signer.ok_or_else(|| anyhow::anyhow!(
+                        "moon definition carries no signingKey_SECRET — run `idtool initmoon identity.public` to regenerate signing keys"
+                    ))?;
+
+                    // Canonical InetAddress entries cannot carry hostnames, so
+                    // the official mkmoonworld drops them — mirror that and
+                    // refuse a planet with no reachable root (every client
+                    // would strand otherwise).
+                    let roots: Vec<crate::world::WorldRoot> = def.roots.iter().map(|r| {
+                        crate::world::WorldRoot {
+                            identity: r.identity,
+                            stable_endpoints: r.stable_endpoints.iter()
+                                .filter(|ep| crate::world::endpoint_is_ip(ep))
+                                .cloned()
+                                .collect(),
+                        }
+                    }).collect();
+                    if roots.iter().all(|r| r.stable_endpoints.is_empty()) {
+                        bail!("moon definition has no IP stable endpoints — refusing to build a planet with unreachable roots");
+                    }
+
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_millis() as u64;
+                    let world = crate::world::World::new(
+                        crate::world::WORLD_TYPE_PLANET,
+                        crate::world::WORLD_ID_EARTH,
+                        timestamp,
+                        roots,
+                    );
+                    let bytes = world.encode_canonical(&signer, &def.root_keys)?;
+                    fs::write("world.bin", &bytes).await?;
+                    println!("Signed planet written to world.bin (canonical format, world id {})", crate::world::WORLD_ID_EARTH);
                 }
             },
         }
@@ -352,8 +364,72 @@ impl Cli {
     }
 }
 
-async fn fetch_json(url: &str, token: &str) -> Result<Value> {
-    let parsed = url::Url::parse(url)?;
+/// A parsed moon.json definition (canonical idtool or ZGALAXY flavor).
+struct MoonDefinition {
+    world_id: u64,
+    roots: Vec<crate::world::WorldRoot>,
+    /// Ed25519 public key per root when the root carries a full identity.
+    root_keys: Vec<Option<[u8; 32]>>,
+    signer: Option<crate::identity::Identity>,
+}
+
+/// Parse a moon.json document. Accepts roots written as `{"id": <address>}`
+/// (ZGALAXY style) or `{"identity": "<full public identity>"}` (canonical
+/// idtool style); accepts both `signingKey_SECRET` and `signingKey_secret`.
+fn parse_moon_definition(value: &Value) -> Result<MoonDefinition> {
+    let id_str = value["id"].as_str().unwrap_or("").to_string();
+    let signer = value["signingKey_SECRET"].as_str()
+        .or_else(|| value["signingKey_secret"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(crate::identity::Identity::parse)
+        .transpose()
+        .context("Invalid signingKey_SECRET in moon definition")?;
+
+    let mut roots: Vec<crate::world::WorldRoot> = Vec::new();
+    let mut root_keys: Vec<Option<[u8; 32]>> = Vec::new();
+    if let Some(roots_arr) = value["roots"].as_array() {
+        for r in roots_arr {
+            let root_identity = r["identity"].as_str()
+                .and_then(|s| crate::identity::Identity::parse(s).ok());
+            let addr = match root_identity.as_ref() {
+                Some(id) => id.address,
+                None => {
+                    let rid = r["id"].as_str().unwrap_or("").to_string();
+                    rid.parse::<crate::identity::Address>()
+                        .context("Invalid root address in moon definition")?
+                }
+            };
+            let endpoints: Vec<String> = r["stableEndpoints"].as_array()
+                .map(|eps| eps.iter().filter_map(|e| e.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            // A bare-address root that matches the signer inherits the
+            // signer's key set so canonical binaries carry a real key.
+            let key = root_identity
+                .map(|id| id.verifying_key.to_bytes())
+                .or_else(|| {
+                    if signer.as_ref().map(|s| s.address) == Some(addr) {
+                        signer.as_ref().map(|s| s.verifying_key.to_bytes())
+                    } else {
+                        None
+                    }
+                });
+            roots.push(crate::world::WorldRoot { identity: addr, stable_endpoints: endpoints });
+            root_keys.push(key);
+        }
+    }
+
+    let world_id = if !id_str.is_empty() {
+        id_str.parse::<crate::identity::Address>()
+            .context("Invalid moon id address")?
+            .to_u64()
+    } else {
+        roots.first().map(|r| r.identity.to_u64()).unwrap_or(0)
+    };
+
+    Ok(MoonDefinition { world_id, roots, root_keys, signer })
+}
+
+async fn fetch_json(url: &str, token: &str) -> Result<Value> {    let parsed = url::Url::parse(url)?;
     let host = parsed.host_str().unwrap_or("127.0.0.1");
     let port = parsed.port().unwrap_or(9993);
     let path = parsed.path();

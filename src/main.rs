@@ -29,9 +29,67 @@ async fn main() -> Result<()> {
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 
-    // Handle CLI arguments (if invoked as zgalaxy-cli / zerotier-cli / idtool)
-    if std::env::args().len() > 1 {
-        match Cli::try_parse() {
+    // Handle CLI arguments (if invoked as zgalaxy-cli / zerotier-cli / idtool).
+    // The same binary is symlinked under several names in containers
+    // (zerotier-one, zerotier-cli, zerotier-idtool, mkmoonworld) — route by
+    // argv0 so legacy invocations keep working, e.g.
+    //   zerotier-idtool generate identity.secret identity.public
+    //   mkmoonworld moon.json
+    let argv0 = std::env::args().next().unwrap_or_default();
+    let bin_name = argv0.rsplit('/').next().unwrap_or(&argv0).to_string();
+    let mut cli_args: Vec<String> = std::env::args().skip(1).collect();
+
+    // ZeroTier daemon flags: -d (fork to background) and -p<port> (port
+    // override with highest precedence, e.g. `zerotier-one -p9994 -d`).
+    let mut daemonize = false;
+    let mut port_override: Option<u16> = None;
+    cli_args.retain(|a| {
+        if a == "-d" {
+            daemonize = true;
+            false
+        } else if a.starts_with("-p")
+            && a.len() > 2
+            && a[2..].chars().all(|c| c.is_ascii_digit())
+        {
+            port_override = a[2..].parse().ok();
+            false
+        } else {
+            true
+        }
+    });
+
+    if daemonize {
+        // Re-spawn without -d in a new process group (detached, stdio null)
+        // and exit — matching the ZeroTier `-d` daemonize contract that the
+        // ZGALAXY container entrypoint relies on. The port flag must be
+        // re-passed to the child: it was consumed from argv above.
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe().context("cannot resolve own executable")?;
+        let mut child_args = cli_args.clone();
+        if let Some(p) = port_override {
+            child_args.push(format!("-p{}", p));
+        }
+        std::process::Command::new(exe)
+            .args(&child_args)
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("failed to daemonize")?;
+        return Ok(());
+    }
+
+    if !cli_args.is_empty() {
+        let mut parse_args: Vec<String> = Vec::with_capacity(cli_args.len() + 2);
+        if bin_name.contains("mkmoonworld") {
+            parse_args.push("idtool".to_string());
+            parse_args.push("mkmoonworld".to_string());
+        } else if bin_name.contains("idtool") {
+            parse_args.push("idtool".to_string());
+        }
+        parse_args.extend(cli_args);
+        match Cli::try_parse_from(std::iter::once(argv0).chain(parse_args)) {
             Ok(cli) => return cli.execute().await,
             Err(e) => {
                 e.print()?;
@@ -95,6 +153,12 @@ async fn main() -> Result<()> {
                 local_config.port = v;
             }
         }
+    }
+
+    // Command-line `-p<port>` wins over every other source (ZeroTier
+    // daemon semantics; the ZGALAXY entrypoint passes it explicitly).
+    if let Some(p) = port_override {
+        local_config.port = p;
     }
 
     // Load or generate identity
