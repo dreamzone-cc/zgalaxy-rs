@@ -30,13 +30,13 @@ async fn recv_until(
 async fn quic_handshake_control_and_datagram() {
     // Node A: server side.
     let a = Arc::new(
-        QuicTransport::bind("127.0.0.1:0".parse().unwrap(), "aaaa000001".into()).unwrap(),
+        QuicTransport::bind("127.0.0.1:0".parse().unwrap(), "aaaa000001".into(), "aaaa000001:0:aa".into()).unwrap(),
     );
     let a_addr: SocketAddr = a.local_addr().unwrap();
 
     // Node B: client side (separate endpoint so it can also accept streams).
     let b = std::sync::Arc::new(
-        QuicTransport::bind("127.0.0.1:0".parse().unwrap(), "bbbb000002".into()).unwrap(),
+        QuicTransport::bind("127.0.0.1:0".parse().unwrap(), "bbbb000002".into(), "bbbb000002:0:bb".into()).unwrap(),
     );
 
     let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(64);

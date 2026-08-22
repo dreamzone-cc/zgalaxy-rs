@@ -46,7 +46,15 @@ pub mod control {
     pub enum ControlMessage {
         /// Announce this node's ZGALAXY address so the peer can bind
         /// the connection to the right peer entry (app-level identity).
+        /// `public_identity` must be a full "<address>:0:<pubkey>" string whose
+        /// pubkey derives exactly `address`; the responder challenges it.
         NodeAnnounce { address: String, public_identity: String },
+        /// Responder challenge: prove possession of the announced identity by
+        /// signing (domain || nonce || address) with its secret key.
+        NodeChallenge { nonce: u64 },
+        /// Proof of possession: ed25519 signature over the challenge material,
+        /// produced by the secret key matching the announced public identity.
+        AnnounceProof { nonce: u64, address: String, signature: String, public_identity: String },
         /// Request the network configuration for a network this node joined.
         /// `token` carries the controller-signed membership token (COM
         /// replacement) when the client holds one from a previous response.
@@ -115,6 +123,20 @@ pub struct QuicTransport {
     connect_lock: tokio::sync::Mutex<()>,
     /// Our own node address announced on control streams.
     node_address: String,
+    /// Our own public identity string ("<addr>:0:<pub>") sent with announces.
+    public_identity: String,
+    /// Outstanding challenges awaiting an AnnounceProof, keyed by remote.
+    /// Value: (nonce, announced_address).
+    pending_challenges: Arc<RwLock<HashMap<SocketAddr, (u64, String)>>>,
+}
+
+/// Domain-separated challenge material: sig = ed25519_sign(material).
+pub fn challenge_material(nonce: u64, address: &str) -> Vec<u8> {
+    let mut m = Vec::with_capacity(3 + 8 + address.len());
+    m.extend_from_slice(b"ZG1");
+    m.extend_from_slice(&nonce.to_be_bytes());
+    m.extend_from_slice(address.as_bytes());
+    m
 }
 
 impl QuicTransport {
@@ -124,7 +146,7 @@ impl QuicTransport {
     /// (NodeAnnounce binding; certificate pinning keyed by node address is the
     /// next step). TLS 1.3 still encrypts the channel against passive
     /// attackers.
-    pub fn bind(bind_addr: SocketAddr, node_address: String) -> Result<Self> {
+    pub fn bind(bind_addr: SocketAddr, node_address: String, public_identity: String) -> Result<Self> {
         let cert = rcgen::generate_simple_self_signed(vec!["zgalaxy".into()])
             .context("failed to generate self-signed QUIC certificate")?;
         let cert_der = cert.cert.der().clone();
@@ -166,7 +188,14 @@ impl QuicTransport {
             announced: RwLock::new(HashMap::new()),
             connect_lock: tokio::sync::Mutex::new(()),
             node_address,
+            public_identity,
+            pending_challenges: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Our own public identity string (used when composing announces).
+    pub fn public_identity(&self) -> &str {
+        &self.public_identity
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -236,10 +265,11 @@ impl QuicTransport {
             .await
             .insert(remote, PeerConnection { remote, conn: conn.clone() });
 
-        // Announce our identity on a dedicated control stream.
+        // Announce our identity on a dedicated control stream. The full
+        // public identity lets the peer verify our AnnounceProof.
         let announce = control::ControlMessage::NodeAnnounce {
             address: self.node_address.clone(),
-            public_identity: String::new(),
+            public_identity: self.public_identity.clone(),
         };
         if let Ok(buf) = control::encode(&announce) {
             if let Ok((mut send, _recv)) = conn.open_bi().await {
@@ -299,6 +329,68 @@ impl QuicTransport {
         }
         announced.insert(remote, address.to_string());
         true
+    }
+
+    /// Issue (or refresh) a challenge for the address a remote announced.
+    /// Returns the nonce. The challenge is stored so the matching
+    /// AnnounceProof can be validated later (single outstanding per remote).
+    pub async fn challenge_announce(&self, remote: SocketAddr, address: &str) -> u64 {
+        let nonce = rand::random::<u64>();
+        self.pending_challenges
+            .write()
+            .await
+            .insert(remote, (nonce, address.to_string()));
+        nonce
+    }
+
+    /// Verify an AnnounceProof against the outstanding challenge: (1) a
+    /// challenge exists for `remote`, (2) nonce and announced address match,
+    /// (3) public_identity parses and its pubkey derives exactly `address`,
+    /// (4) the ed25519 signature over the challenge material validates.
+    /// On success the announcement is accepted via [`remember_announce`].
+    pub async fn verify_announce_proof(
+        &self,
+        remote: SocketAddr,
+        nonce: u64,
+        address: &str,
+        signature_hex: &str,
+        public_identity: &str,
+    ) -> bool {
+        let pending = self
+            .pending_challenges
+            .read()
+            .await
+            .get(&remote)
+            .map(|(n, a)| (*n, a.clone()));
+        let Some((expected_nonce, expected_address)) = pending else {
+            warn!("[ZGALAXY QUIC] proof from {} without outstanding challenge", remote);
+            return false;
+        };
+        if expected_nonce != nonce || expected_address != address {
+            warn!("[ZGALAXY QUIC] stale/mismatched proof from {}", remote);
+            return false;
+        }
+        // The public identity must parse and derive the announced address.
+        let Ok(identity) = crate::identity::Identity::parse(public_identity) else {
+            warn!("[ZGALAXY QUIC] unparseable public identity from {}", remote);
+            return false;
+        };
+        if identity.address.to_string() != address {
+            warn!("[ZGALAXY QUIC] identity derives {} but announced {} — rejected", identity.address, address);
+            return false;
+        }
+        let Ok(sig_bytes) = hex::decode(signature_hex) else {
+            return false;
+        };
+        let Ok(sig) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else {
+            return false;
+        };
+        if !identity.verify(&challenge_material(nonce, address), &sig) {
+            warn!("[ZGALAXY QUIC] invalid announce signature from {}", remote);
+            return false;
+        }
+        self.pending_challenges.write().await.remove(&remote);
+        self.remember_announce(remote, address).await
     }
 
     async fn read_datagrams(
@@ -485,5 +577,64 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+
+    /// أ3 negative/positive matrix: the proof must bind (nonce, address,
+    /// pubkey) — anything else is rejected.
+    #[tokio::test]
+    async fn test_announce_challenge_proof_matrix() {
+        let remote: SocketAddr = "203.0.113.9:9993".parse().unwrap();
+        let quic = QuicTransport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            "1111111111".into(),
+            "1111111111:0:aa".into(),
+        )
+        .expect("bind");
+
+        let legit = Identity::generate();
+        let addr = legit.address.to_string();
+        let pub_str = format!("{}:0:{}", addr, hex::encode(legit.verifying_key.as_bytes()));
+
+        // Positive path.
+        let nonce = quic.challenge_announce(remote, &addr).await;
+        let sig = legit.sign(&challenge_material(nonce, &addr)).unwrap();
+        assert!(
+            quic.verify_announce_proof(remote, nonce, &addr, &hex::encode(sig), &pub_str.clone()).await,
+            "valid proof must be accepted"
+        );
+        // Accepted announcement is visible; challenge consumed.
+        assert_eq!(quic.announced_address(remote).await.as_deref(), Some(addr.as_str()));
+
+        // Negative: wrong nonce.
+        let remote2: SocketAddr = "203.0.113.10:9993".parse().unwrap();
+        let nonce = quic.challenge_announce(remote2, &addr).await;
+        let sig = legit.sign(&challenge_material(nonce, &addr)).unwrap();
+        assert!(!quic.verify_announce_proof(remote2, nonce ^ 1, &addr, &hex::encode(sig), &pub_str).await);
+
+        // Negative: address/pubkey mismatch (key derives a different address).
+        let remote3: SocketAddr = "203.0.113.11:9993".parse().unwrap();
+        let nonce = quic.challenge_announce(remote3, &addr).await;
+        let sig = legit.sign(&challenge_material(nonce, &addr)).unwrap();
+        assert!(
+            !quic.verify_announce_proof(remote3, nonce, &addr, &hex::encode(sig), &pub_str.replace(&addr, "2222222222")).await
+        );
+
+        // Negative: signature by a different key.
+        let other = Identity::generate();
+        let remote4: SocketAddr = "203.0.113.12:9993".parse().unwrap();
+        let nonce = quic.challenge_announce(remote4, &addr).await;
+        let wrong_sig = other.sign(&challenge_material(nonce, &addr)).unwrap();
+        assert!(!quic.verify_announce_proof(remote4, nonce, &addr, &hex::encode(wrong_sig), &pub_str).await);
+
+        // Negative: proof without an outstanding challenge.
+        let remote5: SocketAddr = "203.0.113.13:9993".parse().unwrap();
+        let sig = legit.sign(&challenge_material(7, &addr)).unwrap();
+        assert!(!quic.verify_announce_proof(remote5, 7, &addr, &hex::encode(sig), &pub_str).await);
     }
 }

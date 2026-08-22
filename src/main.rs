@@ -278,7 +278,11 @@ async fn main() -> Result<()> {
 
     if transport_mode == "quic" {
         let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], local_config.port));
-        match zgalaxy_rs::quic::QuicTransport::bind(bind_addr, identity.address.to_string()) {
+        match zgalaxy_rs::quic::QuicTransport::bind(
+                        bind_addr,
+                        identity.address.to_string(),
+                        identity.to_public_string(),
+                    ) {
             Ok(quic) => {
                 quic_started = true;
                 let quic = Arc::new(quic);
@@ -298,6 +302,7 @@ async fn main() -> Result<()> {
                 let ctrl_for_events = controller.clone();
                 let tun_for_events = Arc::clone(&tun_arc);
                 let peers_for_events = peer_manager.clone();
+                let identity_for_events = identity.clone();
                 let mut applied_networks: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 tokio::spawn(async move {
@@ -348,10 +353,61 @@ async fn main() -> Result<()> {
                                 use zgalaxy_rs::quic::control::ControlMessage;
                                 match message {
                                     ControlMessage::NodeAnnounce { address, .. } => {
-                                        info!("[ZGALAXY QUIC] Peer {} announced as {}", remote, address);
-                                        if quic_engine.remember_announce(remote, &address).await {
-                                            // ب3: feed ZTNET-facing observability —
-                                            // /peer and member lastSeen come alive here.
+                                        info!("[ZGALAXY QUIC] Peer {} announced as {} — challenging (أ3)", remote, address);
+                                        // أ3: never trust an unproven announcement.
+                                        // Issue a nonce challenge; presence wiring
+                                        // happens only after a valid AnnounceProof.
+                                        let nonce =
+                                            quic_engine.challenge_announce(remote, &address).await;
+                                        let _ = quic_engine
+                                            .send_control(
+                                                remote,
+                                                &ControlMessage::NodeChallenge { nonce },
+                                            )
+                                            .await;
+                                    }
+                                    ControlMessage::NodeChallenge { nonce } => {
+                                        // We are the announcer side: prove possession
+                                        // of our identity's secret key.
+                                        let address =
+                                            identity_for_events.address.to_string();
+                                        let material = zgalaxy_rs::quic::challenge_material(
+                                            nonce,
+                                            &address,
+                                        );
+                                        match identity_for_events.sign(&material) {
+                                            Ok(sig) => {
+                                                let _ = quic_engine
+                                                    .send_control(
+                                                        remote,
+                                                        &ControlMessage::AnnounceProof {
+                                                            nonce,
+                                                            address,
+                                                            signature: hex::encode(sig),
+                                                            public_identity: identity_for_events.to_public_string(),
+                                                        },
+                                                    )
+                                                    .await;
+                                            }
+                                            Err(e) => warn!(
+                                                "[ZGALAXY QUIC] cannot sign announce proof: {}", e
+                                            ),
+                                        }
+                                    }
+                                    ControlMessage::AnnounceProof { nonce, address, signature, public_identity } => {
+                                        // ب3 + أ3: presence/ZTNET observability is
+                                        // granted only to cryptographically proven
+                                        // announcements.
+                                        if quic_engine
+                                            .verify_announce_proof(
+                                                remote, nonce, &address, &signature, &public_identity,
+                                            )
+                                            .await
+                                        {
+                                            info!(
+                                                "[ZGALAXY QUIC] Peer {} proven as {}",
+                                                remote, address
+                                            );
                                             if let Ok(node) =
                                                 zgalaxy_rs::identity::Address::from_str(&address)
                                             {
@@ -370,14 +426,21 @@ async fn main() -> Result<()> {
                                                     &format!("{}/{}", remote.ip(), remote.port()),
                                                 )
                                                 .await;
+                                        } else {
+                                            warn!(
+                                                "[ZGALAXY QUIC] announce proof from {} rejected",
+                                                remote
+                                            );
                                         }
                                     }
                                     ControlMessage::NetworkConfigRequest { nwid, token: _ } => {
                                         // Act as controller for networks owned by this node.
                                         // The member id MUST be the announced node address —
                                         // anything else cannot map to a member record.
+                                        // announced_address is Some only AFTER a valid
+                                        // AnnounceProof (أ3) — unproven peers are refused.
                                         let Some(member) = quic_engine.announced_address(remote).await else {
-                                            warn!("[ZGALAXY QUIC] config request from {} before NodeAnnounce — ignored", remote);
+                                            warn!("[ZGALAXY QUIC] config request from {} before proven announce — ignored", remote);
                                             continue;
                                         };
                                         match ctrl_for_events.register_join_request(&nwid, &member, None).await {
