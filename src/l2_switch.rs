@@ -54,6 +54,16 @@ impl L2Switch {
         self.table.read().await.len()
     }
 
+    /// Drop every MAC bound to `endpoint` (peer went away / migrated).
+    /// Returns the number of removed entries. Subsequent frames to those MACs
+    /// fall back to flooding until the peer re-teaches itself.
+    pub async fn remove_endpoint(&self, endpoint: SocketAddr) -> usize {
+        let mut table = self.table.write().await;
+        let before = table.len();
+        table.retain(|_, e| e.endpoint != endpoint);
+        before - table.len()
+    }
+
     /// Evict entries not refreshed within `max_age` (returns evicted count).
     pub async fn evict_stale(&self, max_age: Duration) -> usize {
         let mut table = self.table.write().await;
@@ -123,6 +133,21 @@ mod tests {
         sw.learn(B_MAC, "172.18.0.4:9993".parse().unwrap()).await;
         sw.learn(C_MAC, "172.18.0.5:9993".parse().unwrap()).await;
         assert_eq!(sw.entry_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_remove_endpoint_on_disconnect() {
+        let sw = L2Switch::new();
+        sw.learn(B_MAC, "172.18.0.4:9993".parse().unwrap()).await;
+        sw.learn(C_MAC, "172.18.0.5:9993".parse().unwrap()).await;
+
+        let gone: SocketAddr = "172.18.0.4:9993".parse().unwrap();
+        assert_eq!(sw.remove_endpoint(gone).await, 1);
+        assert!(sw.resolve(&B_MAC).await.is_none(), "disconnected peer MAC must drop");
+        assert!(sw.resolve(&C_MAC).await.is_some(), "other peers untouched");
+
+        // Removing again is a no-op.
+        assert_eq!(sw.remove_endpoint(gone).await, 0);
     }
 
     #[tokio::test]

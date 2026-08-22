@@ -4,7 +4,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::fs;
 use tokio::sync::mpsc;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 use tracing_subscriber::FmtSubscriber;
 use anyhow::{Context, Result};
 
@@ -419,6 +419,17 @@ async fn main() -> Result<()> {
                                                 "[ZGALAXY QUIC] Peer {} proven as {}",
                                                 remote, address
                                             );
+                                            // Acknowledge so the prover can proceed
+                                            // immediately (no blind retry wait).
+                                            quic_engine.record_accepted(remote, &address).await;
+                                            let _ = quic_engine
+                                                .send_control(
+                                                    remote,
+                                                    &ControlMessage::AnnounceAccepted {
+                                                        address: address.clone(),
+                                                    },
+                                                )
+                                                .await;
                                             if let Ok(node) =
                                                 zgalaxy_rs::identity::Address::from_str(&address)
                                             {
@@ -539,6 +550,15 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                     }
+                                    ControlMessage::AnnounceAccepted { address } => {
+                                        // The peer verified OUR announce proof —
+                                        // config requests are now safe to send.
+                                        quic_engine.record_accepted(remote, &address).await;
+                                        debug!(
+                                            "[ZGALAXY QUIC] our announce accepted by {} for {}",
+                                            remote, address
+                                        );
+                                    }
                                     ControlMessage::Ping { nonce, sent_ms } => {
                                         let now = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
@@ -584,8 +604,35 @@ async fn main() -> Result<()> {
                             QuicEvent::Connected { remote } => {
                                 info!("[ZGALAXY QUIC] Peer session established: {}", remote);
                             }
-                            QuicEvent::Disconnected { remote } => {
-                                info!("[ZGALAXY QUIC] Peer session lost: {}", remote);
+                            QuicEvent::Disconnected { remote, stable_id } => {
+                                // Ignore teardowns of connections that were already
+                                // replaced by a newer one (ب4 replace-on-dial).
+                                let still_active = quic_engine
+                                    .connected_peers()
+                                    .read()
+                                    .await
+                                    .get(&remote)
+                                    .map(|p| p.conn.stable_id() == stable_id)
+                                    .unwrap_or(false);
+                                info!(
+                                    "[ZGALAXY QUIC] Peer session lost: {} (replaced: {})",
+                                    remote,
+                                    !still_active
+                                );
+                                if !still_active {
+                                    continue;
+                                }
+                                // ب4: drop the peer's learned MACs immediately —
+                                // frames to them fall back to flooding until the
+                                // peer reconnects and re-teaches itself.
+                                let removed = l2_for_events.remove_endpoint(remote).await;
+                                if removed > 0 {
+                                    tracing::debug!(
+                                        "[ZGALAXY QUIC] evicted {} learned MAC(s) for {}",
+                                        removed,
+                                        remote
+                                    );
+                                }
                             }
                         }
                     }
@@ -680,15 +727,19 @@ async fn main() -> Result<()> {
                 let resolver_for_sync = resolver.clone();
                 let quic_for_sync = Arc::clone(&quic);
                 spawn_watched("quic-sync-loop", async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+                    // ب4 adaptive cadence: 500ms while any joined network is
+                    // still REQUESTING/ACCESS_DENIED (fast recovery), 3s steady.
                     loop {
-                        interval.tick().await;
                         let nets = nm_for_sync.list().await;
                         if nets.is_empty() {
                             tracing::debug!("[ZGALAXY QUIC SYNC] heartbeat: no joined networks");
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                             continue;
                         }
-                        let mut targets = resolver_for_sync.get_all_active_addresses().await;
+                        // ب4 recovery: pinned/operator endpoints come FIRST
+                        // (they are the intended controllers), then resolver
+                        // roots as fallback; duplicates removed.
+                        let mut targets: Vec<std::net::SocketAddr> = Vec::new();
                         if let Ok(extra) = std::env::var("ZGALAXY_EXTRA_ENDPOINTS") {
                             for ep in extra.split(',') {
                                 let ep = ep.trim();
@@ -698,11 +749,17 @@ async fn main() -> Result<()> {
                                 // SocketAddr::parse cannot resolve hostnames —
                                 // dial names via DNS (docker service names etc.).
                                 match ep.parse::<std::net::SocketAddr>() {
-                                    Ok(addr) => targets.push(addr),
+                                    Ok(addr) => {
+                                        if !targets.contains(&addr) {
+                                            targets.push(addr)
+                                        }
+                                    }
                                     Err(_) => match tokio::net::lookup_host(ep).await {
                                         Ok(mut addrs) => {
                                             if let Some(addr) = addrs.next() {
-                                                targets.push(addr);
+                                                if !targets.contains(&addr) {
+                                                    targets.push(addr);
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -710,6 +767,11 @@ async fn main() -> Result<()> {
                                         }
                                     },
                                 }
+                            }
+                        }
+                        for addr in resolver_for_sync.get_all_active_addresses().await {
+                            if !targets.contains(&addr) {
+                                targets.push(addr);
                             }
                         }
                         // Heartbeat: proves the sync task is alive and shows
@@ -720,30 +782,56 @@ async fn main() -> Result<()> {
                             targets.len(),
                             targets
                         );
-                        let mut ok = 0usize;
-                        let mut failed = 0usize;
+                        // ب4: fire all (net,target) requests CONCURRENTLY — one
+                        // dead root must never delay recovery past its own 5s
+                        // timeout (was: sequential 5s-per-dead-target stall).
+                        let mut jobs = Vec::new();
                         for net in &nets {
                             for target in &targets {
-                                // Per-target timeout: one dead root (e.g. the
-                                // unreachable default domain) must not starve
-                                // the remaining targets in the sequential loop.
-                                let msg = zgalaxy_rs::quic::control::ControlMessage::NetworkConfigRequest {
-                                    nwid: net.nwid.clone(),
-                                    token: net.membership_token.clone(),
-                                };
-                                let req = quic_for_sync.send_control(*target, &msg);
-                                if let Err(e) = tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
-                                    req,
-                                )
-                                .await
-                                .map_err(|_| anyhow::anyhow!("timeout"))
-                                .and_then(|r| r)
-                                {
+                                let msg =
+                                    zgalaxy_rs::quic::control::ControlMessage::NetworkConfigRequest {
+                                        nwid: net.nwid.clone(),
+                                        token: net.membership_token.clone(),
+                                    };
+                                info!("[ZGALAXY QUIC SYNC] dialing {} for {}", target, net.nwid);
+                                let q = Arc::clone(&quic_for_sync);
+                                jobs.push(async move {
+                                    let t = *target;
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        async {
+                                            q.connect(t).await?;
+                                            // أ3 sequencing: wait until THIS side's
+                                            // announce was verified by the peer
+                                            // (bounded), then the config request
+                                            // cannot be dropped as unproven.
+                                            let _ = q.await_accepted(t, std::time::Duration::from_millis(750)).await;
+                                            q.send_control(t, &msg).await
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|_| anyhow::anyhow!("timeout"))
+                                    .and_then(|r| r)
+                                    .map_err(move |e| (t, e))
+                                });
+                            }
+                        }
+                        let results = futures::future::join_all(jobs).await;
+                        info!("[ZGALAXY QUIC SYNC] all {} request(s) dispatched", results.len());
+                        let mut ok = 0usize;
+                        let mut failed = 0usize;
+                        for r in results {
+                            match r {
+                                Ok(_) => ok += 1,
+                                Err((target, e)) => {
                                     failed += 1;
-                                    tracing::debug!("[ZGALAXY QUIC] config request to {} for {} failed: {}", target, net.nwid, e);
-                                } else {
-                                    ok += 1;
+                                    let nwid0 = nets.first().map(|n| n.nwid.clone()).unwrap_or_default();
+                                    tracing::debug!(
+                                        "[ZGALAXY QUIC] config request to {} for {} failed: {}",
+                                        target,
+                                        nwid0,
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -753,6 +841,13 @@ async fn main() -> Result<()> {
                             ok,
                             failed
                         );
+                        let any_pending = nm_for_sync
+                            .list()
+                            .await
+                            .iter()
+                            .any(|n| n.status != zgalaxy_rs::network::NetworkStatus::Ok);
+                        let cadence = if any_pending { 500 } else { 3000 };
+                        tokio::time::sleep(std::time::Duration::from_millis(cadence)).await;
                     }
                 });
             }

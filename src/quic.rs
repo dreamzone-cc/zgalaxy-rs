@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -55,6 +55,9 @@ pub mod control {
         /// Proof of possession: ed25519 signature over the challenge material,
         /// produced by the secret key matching the announced public identity.
         AnnounceProof { nonce: u64, address: String, signature: String, public_identity: String },
+        /// Verifier acknowledges a valid proof — the announcer may now treat
+        /// this connection as fully trusted (send config requests etc.).
+        AnnounceAccepted { address: String },
         /// Request the network configuration for a network this node joined.
         /// `token` carries the controller-signed membership token (COM
         /// replacement) when the client holds one from a previous response.
@@ -109,8 +112,9 @@ pub enum QuicEvent {
     Control { remote: SocketAddr, message: control::ControlMessage },
     /// A connection was established.
     Connected { remote: SocketAddr },
-    /// A connection was lost.
-    Disconnected { remote: SocketAddr },
+    /// A connection was lost. `stable_id` lets consumers ignore teardowns of
+    /// connections that were already replaced by newer ones.
+    Disconnected { remote: SocketAddr, stable_id: usize },
 }
 
 pub struct QuicTransport {
@@ -128,6 +132,8 @@ pub struct QuicTransport {
     /// Outstanding challenges awaiting an AnnounceProof, keyed by remote.
     /// Value: (nonce, announced_address).
     pending_challenges: Arc<RwLock<HashMap<SocketAddr, (u64, String)>>>,
+    /// Remotes whose announcements WE have verified (remote -> address).
+    accepted: Arc<RwLock<HashMap<SocketAddr, String>>>,
 }
 
 /// Domain-separated challenge material: sig = ed25519_sign(material).
@@ -160,6 +166,13 @@ impl QuicTransport {
 
         let mut transport = quinn::TransportConfig::default();
         transport.keep_alive_interval(Some(Duration::from_secs(5)));
+        // ب4: bounded dead-peer detection — a lost peer is declared within
+        // ~15s worst case, letting the 3s sync loop re-establish quickly.
+        transport.max_idle_timeout(Some(
+            Duration::from_secs(15)
+                .try_into()
+                .expect("valid idle timeout"),
+        ));
         let mut server_config =
             quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(
                 server_crypto,
@@ -174,10 +187,17 @@ impl QuicTransport {
             .with_custom_certificate_verifier(SkipServerVerification::new())
             .with_no_client_auth();
         client_crypto.alpn_protocols = vec![ALPN.as_bytes().to_vec()];
+        let mut client_transport = quinn::TransportConfig::default();
+        client_transport.keep_alive_interval(Some(Duration::from_secs(5)));
+        client_transport.max_idle_timeout(Some(
+            Duration::from_secs(15).try_into().expect("valid idle timeout"),
+        ));
         let client_quic_config =
             quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
                 .context("failed to build QUIC client config")?;
-        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(client_quic_config)));
+        let mut client_config = quinn::ClientConfig::new(Arc::new(client_quic_config));
+        client_config.transport_config(Arc::new(client_transport));
+        endpoint.set_default_client_config(client_config);
 
         info!("[ZGALAXY QUIC] Endpoint bound on {}", endpoint.local_addr()?);
 
@@ -190,7 +210,26 @@ impl QuicTransport {
             node_address,
             public_identity,
             pending_challenges: Arc::new(RwLock::new(HashMap::new())),
+            accepted: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Record that `remote`'s announcement (for `address`) passed verification.
+    pub async fn record_accepted(&self, remote: SocketAddr, address: &str) {
+        self.accepted.write().await.insert(remote, address.to_string());
+    }
+
+    /// Wait until `remote` acknowledged OUR announcement (i.e., it verified our
+    /// AnnounceProof), or `dur` elapses. Returns its announced address if known.
+    pub async fn await_accepted(&self, remote: SocketAddr, dur: Duration) -> Option<()> {
+        let deadline = Instant::now() + dur;
+        while Instant::now() < deadline {
+            if self.accepted.read().await.contains_key(&remote) {
+                return Some(());
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        None
     }
 
     /// Our own public identity string (used when composing announces).
@@ -255,15 +294,28 @@ impl QuicTransport {
         {
             let peers = self.peers.read().await;
             if let Some(existing) = peers.get(&remote) {
-                if existing.conn.stable_id() != conn.stable_id() {
-                    return false; // a live connection already serves this remote
+                if existing.conn.stable_id() == conn.stable_id() {
+                    return false; // literally the same connection — already active
                 }
             }
         }
-        self.peers
+        // ب4: a NEW successful handshake always wins. A stale entry (e.g. the
+        // peer restarted and its old connection is half-dead) must never block
+        // recovery — close the old connection and take the slot.
+        if let Some(old) = self
+            .peers
             .write()
             .await
-            .insert(remote, PeerConnection { remote, conn: conn.clone() });
+            .insert(remote, PeerConnection { remote, conn: conn.clone() })
+        {
+            warn!(
+                "[ZGALAXY QUIC] replacing stale connection (stable_id {}) for {}",
+                old.conn.stable_id(),
+                remote
+            );
+            old.conn.close(quinn::VarInt::from_u32(0), b"zgalaxy-replaced");
+            self.accepted.write().await.remove(&remote);
+        }
 
         // Announce our identity on a dedicated control stream. The full
         // public identity lets the peer verify our AnnounceProof.
@@ -296,7 +348,10 @@ impl QuicTransport {
             }
             drop(peers);
             this.announced.write().await.remove(&remote);
-            let _ = events0.send(QuicEvent::Disconnected { remote }).await;
+            this.accepted.write().await.remove(&remote);
+            let _ = events0
+                .send(QuicEvent::Disconnected { remote, stable_id: conn2.stable_id() })
+                .await;
         });
 
         let conn3 = conn.clone();
@@ -465,6 +520,7 @@ impl QuicTransport {
             .await
             .with_context(|| format!("QUIC handshake with {} failed", remote))?;
 
+        info!("[ZGALAXY QUIC DIAL] handshake to {} completed", remote);
         let peer = PeerConnection { remote, conn: conn.clone() };
         let events = self
             .events
