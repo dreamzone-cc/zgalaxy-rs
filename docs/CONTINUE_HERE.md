@@ -1,4 +1,4 @@
-# استكمل من هنا — دليل الجلسة الجديدة (آخر تحديث: 2026-08-22)
+# استكمل من هنا — دليل الجلسة الجديدة (آخر تحديث: 2026-08-22، بعد إغلاق ب1/ب5/ب6)
 
 هذا أول ملف تقرؤه أي جلسة جديدة. كل شيء آخر متفرع منه.
 
@@ -16,29 +16,28 @@
 - GitHub: dreamzone-cc/zgalaxy-rs وdreamzone-cc/ZGALAXY (كل شيء مدفوع).
 - سيرفر ZGALAXY: `ssh dz171@192.168.1.171` — سيرفر ztnet: `ssh dz161@192.168.1.161`
   (كلمة السر لـsudo نفسها لكل من dz161/dz171 والمضيف المحلي).
-- على 161: حاويتا اختبار ب1 `zg-a`/`zg-b` + السكربت `/tmp/b1_test.sh` + الباينري musl `/tmp/zgrs2`.
-  حاوية الإنتاج: `zerotier` (zgalaxy-rs مُسمّى zerotier-one، خلفها ztnet + postgres) — **لا تُمسّ إلا وفق خطة النشر ب5/ب6**.
+- على 161: حاويتا اختبار ب1 `zg-a`/`zg-b` + السكربت `/tmp/b1_test.sh` (v2 — يجتاز كاملاً) + الباينري musl `/tmp/zgrs2`.
+- حاوية الإنتاج: `zerotier` (zgalaxy-rs باسم zerotier-one، خلفها ztnet + postgres على ztnet_app-network) —
+  **النشر/التراجع فقط عبر `scripts/deploy_161.sh`** (نسخة على 161: `/tmp/deploy_161.sh`؛ modes: deploy/verify/rollback).
+- رفع ملفات إلى 161: `python3 ~/zgalaxy-work/bin/sshput.py local user@host:remote` (pexpect+scp).
 
 ## 3. أين نقف بالضبط
-آخر commits: `69ab158` (zgalaxy-rs) و`e85c9da` (ZGALAXY). 30 اختباراً أخضر، clippy نظيف.
+آخر commit: `d3eb712` (zgalaxy-rs). 30 اختباراً أخضر، clippy نظيف.
 - البوابة أ (أمان) مكتملة: توكن عضوية موقّع، ربط هوية معلنة، فرض allowManagementFrom.
-- المرحلة 2 (data plane) مكتملة: TAP حقيقي L2 + MTU 1186 + MAC حتمي + تطبيق التكوين على المضيف،
-  مثبتة سلوكياً بـroot محلياً (loopback AF_PACKET ناجح، الواجهة تظهر في ip link).
-- **النقطة المتوقفة (ب1 على 161)**: مهمة sync loop في الـdaemon الحي لا تنفّذ أي محاولة اتصال
-  (سجل B ساكن تماماً بعد الإقلاع حتى مع RUST_LOG=info,zgalaxy_rs=debug، رغم أن اختبار QUIC
-  المفرد ينجح). قبل التوقف أُصلح: حل أسماء ZGALAXY_EXTRA_ENDPOINTS عبر DNS، ومهلة 5s لكل هدف.
-  الاشتباه: panic صامت يقتل المهمة أو عدم وصولها للحلقة.
-
-### خطوة الاستئناف الفورية (ب1)
-1. أضف heartbeat: `info!` في بداية كل دورة sync (بعد interval.tick) يطبع عدد الشبكات والأهداف —
-   يثبت فوراً هل المهمة حية.
-2. إن كانت حية: ارفع مستوى تسجيل send_control/connect إلى info مؤقتاً وشغّل `/tmp/b1_test.sh`.
-3. إن كانت ميتة: غلّف جسم المهمة بـ`std::panic::catch_unwind` أو استخدم
-   `tokio::spawn` مع معالج panics (JoinHandle خطأ) واكتب panic message للسجل.
-4. بعد نجاح التسجيل: استكمل ب1 (تخويل العضو عبر REST كما في السكربت → انتظار OK+IP → ping من
-   داخل شبكة الحاوية أو ثبّت iputils-ping في حاوية B).
-5. ثم ب5/ب6: نشر musl binary على حاوية الإنتاج (نسخة احتياطية أولاً — نفس خطوات الجلسة السابقة
-   الموثقة في git log commit a15bb72 وما قبله) + فحوص ztnet (status/controller/network/member).
+- المرحلة 2 (data plane) مكتملة ومثبتة: TAP حقيقي L2 + MTU 1186 + MAC حتمي + تطبيق التكوين على المضيف.
+- **ب1 مغلقة (2026-08-22)**: عقدتان حقيقيتان TAP↔TAP عبر QUIC في zg-a/zg-b —
+  join → تسجيل عضو → تخويل REST → OK + IP تلقائي (10.244.0.10) → ping B→A ‏3/3 و0% فقد و~0.7ms
+  (عبر nsenter — الصورة بلا ping). "مهمة sync الميتة" كانت وهماً تشخيصياً: السجل كان يتجاهل RUST_LOG
+  (subscriber ثابت INFO) وفشل الإرسال debug فقط + نافذة السكربت 8s أقصر من أول دورة ناجحة (~15s).
+  أُضيف: EnvFilter + heartbeat لكل دورة + spawn_watched (panic watcher).
+- **ب5/ب6 مغلقة (2026-08-22)**: باينري musl (d3eb712) منشور على حاوية الإنتاج مع UDP افتراضياً.
+  النسخ الاحتياطية: `/home/dz161/backups/{zerotier-one,ztnet_zerotier-volume}.20260822-120708.*`
+  والتراجع: `sudo bash /tmp/deploy_161.sh rollback 20260822-120708`. VERIFY-PASS: الهوية محفوظة
+  (ef313fb5c9)، 3 شبكات + 5 أعضاء محمّلة، ztnet بلا أخطاء.
+- **الخطوة التالية المقترحة** (حسب المسار الحرج في PRE_RESUME_PLAN): ب2 (L2 learning/broadcast) ثم
+  ب3 (توصيل PeerManager/touch_member_last_seen في QUIC) وب4 (سلوك التعافي)، أو ج1 (unified planet
+  في ZGALAXY engine). تفعيل transportMode=quic على حاوية الإنتاج يبقى معلقاً حتى توكن العضوية
+  الكامل في مسار QUIC.
 
 ## 4. فخاخ بيئة معروفة (لا تضيع وقتاً فيها)
 - rustup محلياً مكسور بسبب argv0: استخدم باينري التولشاين مباشرة:
@@ -51,6 +50,9 @@
 - ssh بكلمة سر عبر `python3 ~/zgalaxy-work/bin/sshrun.py user@host 'cmd'` (جاهز).
 - sudo للـTAP محلياً متاح بنفس كلمة السر.
 - مجلد عمل الـdaemon يحدَّد بـ`ZGALAXY_HOME` (بدونه يفضّل /var/lib/zerotier-one عند الكتابة).
+- docker على 161 يحتاج sudo (`echo PASS | sudo -S docker ...`).
+- اقتباس JSON عبر ssh+docker exec متداخل يحوّل `'{"a":b}'` إلى `{a:b}` — استخدم اقتباساً أحادياً
+  داخلياً دائماً، وتذكر: CLI ‏`rest` يستبدل جسم JSON غير الصالح بـ`{}` **بصمت** (خلل موثق في PENDING_WORK).
 
 ## 5. قواعد ثابتة
 لا تعديل على ztnet إطلاقاً · QUIC هو النقل (لا UDP خام) · لا نقل أعمى من zerotier-go ·
