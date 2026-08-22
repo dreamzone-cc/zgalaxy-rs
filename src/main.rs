@@ -3,7 +3,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::fs;
 use tokio::sync::mpsc;
-use tracing::{info, warn, error, Level};
+use tracing::{info, warn, error};
 use tracing_subscriber::FmtSubscriber;
 use anyhow::{Context, Result};
 
@@ -20,10 +20,12 @@ use zgalaxy_rs::transport::UdpTransport;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // Initialize logging. RUST_LOG is honored when set (e.g.
+    // RUST_LOG=info,zgalaxy_rs=debug); without it everything info+ is logged.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_target(false)
+        .with_env_filter(filter)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 
@@ -378,12 +380,13 @@ async fn main() -> Result<()> {
                 let nm_for_sync = network_manager.clone();
                 let resolver_for_sync = resolver.clone();
                 let quic_for_sync = Arc::clone(&quic);
-                tokio::spawn(async move {
+                spawn_watched("quic-sync-loop", async move {
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
                     loop {
                         interval.tick().await;
                         let nets = nm_for_sync.list().await;
                         if nets.is_empty() {
+                            tracing::debug!("[ZGALAXY QUIC SYNC] heartbeat: no joined networks");
                             continue;
                         }
                         let mut targets = resolver_for_sync.get_all_active_addresses().await;
@@ -410,7 +413,17 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
-                        for net in nets {
+                        // Heartbeat: proves the sync task is alive and shows
+                        // exactly what it is about to dial.
+                        info!(
+                            "[ZGALAXY QUIC SYNC] heartbeat: {} network(s), {} target(s): {:?}",
+                            nets.len(),
+                            targets.len(),
+                            targets
+                        );
+                        let mut ok = 0usize;
+                        let mut failed = 0usize;
+                        for net in &nets {
                             for target in &targets {
                                 // Per-target timeout: one dead root (e.g. the
                                 // unreachable default domain) must not starve
@@ -428,10 +441,19 @@ async fn main() -> Result<()> {
                                 .map_err(|_| anyhow::anyhow!("timeout"))
                                 .and_then(|r| r)
                                 {
+                                    failed += 1;
                                     tracing::debug!("[ZGALAXY QUIC] config request to {} for {} failed: {}", target, net.nwid, e);
+                                } else {
+                                    ok += 1;
                                 }
                             }
                         }
+                        info!(
+                            "[ZGALAXY QUIC SYNC] cycle done: sent={} ok={} failed={}",
+                            ok + failed,
+                            ok,
+                            failed
+                        );
                     }
                 });
             }
@@ -462,7 +484,7 @@ async fn main() -> Result<()> {
         // Background network join & configuration sync loop
         let nm_for_sync = network_manager.clone();
         let tp_for_sync = transport_arc.clone();
-        tokio::spawn(async move {
+        spawn_watched("udp-sync-loop", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
             loop {
                 interval.tick().await;
@@ -505,3 +527,25 @@ fn restrict_secret_permissions(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn restrict_secret_permissions(_path: &std::path::Path) {}
+
+/// Spawn an infinite background task whose death (panic or unexpected return)
+/// is logged instead of passing silently — a panicked `tokio::spawn` task
+/// otherwise just stops running with no trace at the spawn site.
+fn spawn_watched(name: &'static str, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+    let handle = tokio::spawn(fut);
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(()) => warn!("[ZGALAXY WATCHDOG] task '{}' finished unexpectedly", name),
+            Err(e) if e.is_panic() => {
+                let payload = e.into_panic();
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                error!("[ZGALAXY WATCHDOG] task '{}' panicked: {}", name, msg);
+            }
+            Err(e) => error!("[ZGALAXY WATCHDOG] task '{}' was cancelled: {}", name, e),
+        }
+    });
+}
