@@ -48,7 +48,9 @@ pub mod control {
         /// the connection to the right peer entry (app-level identity).
         NodeAnnounce { address: String, public_identity: String },
         /// Request the network configuration for a network this node joined.
-        NetworkConfigRequest { nwid: String },
+        /// `token` carries the controller-signed membership token (COM
+        /// replacement) when the client holds one from a previous response.
+        NetworkConfigRequest { nwid: String, token: Option<String> },
         /// Controller-side response with the effective network configuration.
         NetworkConfigResponse { nwid: String, config: serde_json::Value },
         /// Ping over the control stream (diagnostics / RTT measurement).
@@ -277,12 +279,26 @@ impl QuicTransport {
     }
 
     /// Record a node address announced by a remote over a control stream.
-    pub async fn remember_announce(&self, remote: SocketAddr, address: &str) {
-        if address.len() == 10 && address.chars().all(|c| c.is_ascii_hexdigit()) {
-            self.announced.write().await.insert(remote, address.to_string());
-        } else {
+    /// A remote may announce exactly ONE address per connection; a conflicting
+    /// re-announce is rejected (identity binding, audit A3).
+    pub async fn remember_announce(&self, remote: SocketAddr, address: &str) -> bool {
+        if address.len() != 10 || !address.chars().all(|c| c.is_ascii_hexdigit()) {
             warn!("[ZGALAXY QUIC] remote {} announced invalid address '{}'", remote, address);
+            return false;
         }
+        let mut announced = self.announced.write().await;
+        if let Some(existing) = announced.get(&remote) {
+            if existing != address {
+                warn!(
+                    "[ZGALAXY QUIC] remote {} re-announced a different address ({} != {}) — rejected",
+                    remote, address, existing
+                );
+                return false;
+            }
+            return true;
+        }
+        announced.insert(remote, address.to_string());
+        true
     }
 
     async fn read_datagrams(

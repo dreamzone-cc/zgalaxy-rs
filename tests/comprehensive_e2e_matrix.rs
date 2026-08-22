@@ -238,6 +238,7 @@ async fn test_matrix_rest_api_auth_and_contract_invariance() {
 
     let state = AppState {
         identity: id.clone(),
+        allow_management_from: vec!["127.0.0.1".to_string()],
         auth_token: auth_token.clone(),
         peer_manager,
         network_manager,
@@ -359,4 +360,76 @@ async fn test_matrix_join_request_guards() {
     // 4) No member files were created for rejected networks.
     let orphan_dir = temp_dir.path().join("network").join("ffffffffff000001");
     assert!(!orphan_dir.exists(), "rejected network must not create files");
+}
+
+// ============================================================================
+// 9. Membership Token Matrix (Gate A1 — COM replacement)
+// ============================================================================
+
+#[tokio::test]
+async fn test_matrix_membership_token_lifecycle() {
+    let temp_dir = tempdir().unwrap();
+    let id = Identity::generate();
+    let controller = EmbeddedController::new(id.clone(), temp_dir.path().to_path_buf());
+    controller.init().await.unwrap();
+
+    // Controller must be able to sign (secret identity present).
+    let net = controller
+        .save_network(serde_json::json!({ "name": "token-net", "private": true }))
+        .await
+        .unwrap();
+    let nwid = net.id.clone();
+
+    // Unauthorized member: no token issued.
+    controller
+        .register_join_request(&nwid, "a1b2c3d4e5", None)
+        .await
+        .unwrap();
+    assert!(
+        controller.issue_membership_token(&nwid, "a1b2c3d4e5").await.is_none(),
+        "no token for unauthorized member"
+    );
+
+    // Authorize → token issued and verifies for the right member.
+    controller
+        .save_member(
+            &nwid,
+            "a1b2c3d4e5",
+            serde_json::json!({ "authorized": true }),
+        )
+        .await
+        .unwrap();
+    let token = controller
+        .issue_membership_token(&nwid, "a1b2c3d4e5")
+        .await
+        .expect("token for authorized member");
+    assert!(
+        controller
+            .verify_membership_token(&token, &nwid, "a1b2c3d4e5")
+            .is_some(),
+        "valid token must verify"
+    );
+
+    // Wrong member / wrong network must fail.
+    assert!(controller.verify_membership_token(&token, &nwid, "ffffffffee").is_none());
+    assert!(
+        controller
+            .verify_membership_token(&token, &format!("{}ffff", &nwid[..12]), "a1b2c3d4e5")
+            .is_none()
+    );
+
+    // Tampered payload must fail signature verification.
+    let mut parts = token.split('.');
+    let body = parts.next().unwrap().to_string();
+    let sig = parts.next().unwrap().to_string();
+    let tampered = format!("e30.{}", sig); // {} payload with real signature
+    assert!(controller.verify_membership_token(&tampered, &nwid, "a1b2c3d4e5").is_none());
+    let _ = body;
+
+    // Deauthorize → issuance stops immediately (revocation within TTL).
+    controller
+        .save_member(&nwid, "a1b2c3d4e5", serde_json::json!({ "authorized": false }))
+        .await
+        .unwrap();
+    assert!(controller.issue_membership_token(&nwid, "a1b2c3d4e5").await.is_none());
 }

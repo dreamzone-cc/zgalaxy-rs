@@ -31,6 +31,10 @@ pub struct Network {
     pub assigned_addresses: Vec<String>,
     pub routes: Vec<ManagedRoute>,
     pub port_device_name: String,
+    /// Controller-signed membership token from the last NetworkConfig
+    /// (COM replacement). Presented with every config request.
+    #[serde(default)]
+    pub membership_token: Option<String>,
 }
 
 /// Network membership and routing manager
@@ -80,6 +84,7 @@ impl NetworkManager {
             assigned_addresses: Vec::new(),
             routes: Vec::new(),
             port_device_name: format!("zt-{}", &clean_nwid[..6]),
+            membership_token: None,
         });
 
         Ok(net.clone())

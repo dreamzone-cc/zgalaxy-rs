@@ -695,3 +695,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(controller.db_path.parent().unwrap());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Membership tokens (COM replacement for the QUIC era, per docs/PENDING_WORK
+// and REFERENCE_ANALYSIS §4): controller-signed, short-TTL proof that a node
+// is an authorized member of a network. Verified before a QUIC peer is
+// treated as a member; revocation propagates within TTL.
+// ---------------------------------------------------------------------------
+
+/// How long a membership token stays valid after issuance.
+pub const MEMBERSHIP_TOKEN_TTL_SECS: u64 = 3600;
+
+impl EmbeddedController {
+    /// Issue a signed membership token for an AUTHORIZED member, or None when
+    /// the member is unknown / not authorized. The token is
+    /// base64url(payload).base64url(ed25519-signature).
+    pub async fn issue_membership_token(&self, nwid: &str, member_id: &str) -> Option<String> {
+        let member = self.members.read().await.get(nwid)?.get(member_id)?.clone();
+        if !member.authorized {
+            return None;
+        }
+        let rev = self.networks.read().await.get(nwid)?.revision;
+        let iat = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let payload = serde_json::json!({
+            "n": nwid,
+            "m": member_id,
+            "r": rev,
+            "t": iat,
+            "e": iat + MEMBERSHIP_TOKEN_TTL_SECS,
+            "c": self.controller_address.to_string(),
+        });
+        let body = serde_json::to_vec(&payload).ok()?;
+        let sig = self.identity.sign(&body).ok()?;
+        Some(format!(
+            "{}.{}",
+            b64url(&body),
+            b64url(&sig)
+        ))
+    }
+
+    /// Verify a membership token against this controller's identity.
+    /// Returns the token payload when valid for (nwid, member_id).
+    pub fn verify_membership_token(
+        &self,
+        token: &str,
+        nwid: &str,
+        member_id: &str,
+    ) -> Option<serde_json::Value> {
+        let mut parts = token.split('.');
+        let body_b = b64url_decode(parts.next()?)?;
+        let sig_b = b64url_decode(parts.next()?)?;
+        if parts.next().is_some() || sig_b.len() != 64 {
+            return None;
+        }
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&sig_b);
+        if !self.identity.verify(&body_b, &sig) {
+            return None;
+        }
+        let payload: serde_json::Value = serde_json::from_slice(&body_b).ok()?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        let exp = payload.get("e").and_then(|v| v.as_u64())?;
+        let iat = payload.get("t").and_then(|v| v.as_u64())?;
+        if now > exp || iat > exp {
+            return None;
+        }
+        if payload.get("n").and_then(|v| v.as_str())? != nwid
+            || payload.get("m").and_then(|v| v.as_str())? != member_id
+            || payload.get("c").and_then(|v| v.as_str())? != self.controller_address.to_string()
+        {
+            return None;
+        }
+        Some(payload)
+    }
+}
+
+fn b64url(data: &[u8]) -> String {
+    // Minimal standard base64 (no padding stripped on encode side matters here
+    // because decode below tolerates padding).
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+fn b64url_decode(data: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data).ok()
+}

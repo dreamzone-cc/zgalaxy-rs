@@ -163,6 +163,7 @@ async fn main() -> Result<()> {
     let app_state = AppState {
         identity: identity.clone(),
         auth_token,
+        allow_management_from: local_config.allow_management_from.clone(),
         peer_manager: peer_manager.clone(),
         network_manager: network_manager.clone(),
         controller: controller.clone(),
@@ -239,7 +240,7 @@ async fn main() -> Result<()> {
                                         info!("[ZGALAXY QUIC] Peer {} announced as {}", remote, address);
                                         quic_engine.remember_announce(remote, &address).await;
                                     }
-                                    ControlMessage::NetworkConfigRequest { nwid } => {
+                                    ControlMessage::NetworkConfigRequest { nwid, token: _ } => {
                                         // Act as controller for networks owned by this node.
                                         // The member id MUST be the announced node address —
                                         // anything else cannot map to a member record.
@@ -288,6 +289,10 @@ async fn main() -> Result<()> {
                                             })
                                             .unwrap_or_default();
                                         if let Some(mut net) = nm_for_events.get(&nwid).await {
+                                            net.membership_token = config
+                                                .get("membershipToken")
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from);
                                             net.status = if authorized {
                                                 zgalaxy_rs::network::NetworkStatus::Ok
                                             } else {
@@ -396,6 +401,7 @@ async fn main() -> Result<()> {
                                         *target,
                                         &zgalaxy_rs::quic::control::ControlMessage::NetworkConfigRequest {
                                             nwid: net.nwid.clone(),
+                                            token: net.membership_token.clone(),
                                         },
                                     )
                                     .await;

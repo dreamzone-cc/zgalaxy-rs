@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, Request, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -23,6 +24,9 @@ pub struct AppState {
     pub network_manager: NetworkManager,
     pub controller: EmbeddedController,
     pub resolver: Arc<DynamicDnsResolver>,
+    /// CIDRs / plain IPs allowed to reach the management API.
+    /// Loopback is always allowed. (local.conf allowManagementFrom)
+    pub allow_management_from: Vec<String>,
 }
 
 pub struct ControllerServer;
@@ -59,12 +63,19 @@ impl ControllerServer {
     }
 
     pub async fn start(state: AppState, port: u16) -> anyhow::Result<()> {
-        let app = Self::build_router(state);
+        let allowed = state.allow_management_from.clone();
+        let app = Self::build_router(state).layer(
+            axum::middleware::from_fn_with_state(allowed, management_source_guard),
+        );
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         info!("[ZGALAXY REST API] Listening on http://{}", addr);
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -494,5 +505,40 @@ fn network_to_zt_json(net: &crate::network::Network) -> serde_json::Value {
         })).collect::<Vec<_>>(),
         "multicastSubscriptions": [],
         "dns": { "domain": "", "servers": [] },
+    })
+}
+
+/// Enforce local.conf `allowManagementFrom` on every management route.
+/// Loopback is always allowed; everything else must match a listed
+/// CIDR / IP. Applied before bearer-token checks (defense in depth).
+async fn management_source_guard(
+    State(allowed): State<Vec<String>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !ip_allowed(peer, &allowed) {
+        warn!(
+            "[ZGALAXY REST API] management access from {} refused by allowManagementFrom",
+            peer
+        );
+        return (StatusCode::FORBIDDEN, "management access not allowed from this address").into_response();
+    }
+    next.run(req).await
+}
+
+fn ip_allowed(peer: SocketAddr, allowed: &[String]) -> bool {
+    if peer.ip().is_loopback() {
+        return true;
+    }
+    let ip = peer.ip();
+    allowed.iter().any(|entry| {
+        if let Some(cidr) = entry.parse::<ipnet::IpNet>().ok() {
+            return cidr.contains(&ip);
+        }
+        entry
+            .parse::<std::net::IpAddr>()
+            .map(|a| a == ip)
+            .unwrap_or(false)
     })
 }
