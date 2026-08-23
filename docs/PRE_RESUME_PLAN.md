@@ -48,8 +48,8 @@ ztnet البرمجية → OK+IP → ping عبر zgalaxy0) نجحت مرتين �
 
 | # | البند | لماذا | معيار القبول |
 |---|---|---|---|
-| ج1 | H1: unified planet يعطي كل الجذور نفس identity — جمع identityPublic لكل عقدة cluster | عطل وظيفي في HA/التجميع (§14 تكامل المكونات) | بناء unified بعنوانين مختلفين يفحص planet الناتج |
-| ج2 | H2: إضافة nodeAddress إلى getPlanetInfo | تبعية ج1 | القيمة تُقرأ من identity.public |
+| ج1 ✅ 2026-08-22 | H1: unified planet يعطي كل الجذور نفس identity — جمع identityPublic لكل عقدة cluster | عطل وظيفي في HA/التجميع (§14 تكامل المكونات) | بناء unified بعنوانين مختلفين يفحص planet الناتج |
+| ج2 ✅ 2026-08-22 | H2: إضافة nodeAddress إلى getPlanetInfo | تبعية ج1 | القيمة تُقرأ من identity.public |
 | ج3 | M3: رفض مزودي DDNS غير المنفذين صراحةً + M5: apiPort لكل عقدة cluster + L8: fallback للمنفذ | سلوك صامت مخادع للمشغل | رسائل رفض واضحة؛ عقدة بعيدة بمنفذ مختلف تصبح ONLINE |
 | ج4 | L3: كاش قصير لـ/ready (يُقرأ 5 ملفات لكل استدعاء عام) + L2: TTL في cacheGet | أداء (§8) | قياس قبل/بعد بسيط يوثق التحسن |
 

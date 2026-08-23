@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use tokio::fs;
 use serde_json::Value;
 use anyhow::{bail, Context, Result};
-use crate::identity::Identity;
+use crate::identity::{Address, Identity};
 #[derive(Parser, Debug)]
 #[command(name = "zgalaxy-cli", author, version, about = "ZGALAXY Sovereign ZeroTier-Compatible Command-Line Interface")]
 pub struct Cli {
@@ -95,6 +95,14 @@ pub enum IdToolCommands {
     MkMoonWorld {
         #[arg(help = "Input moon JSON file path", default_value = "moon.json")]
         moon_json: String,
+    },
+
+    /// Validate an identity file (canonical zerotier-idtool compatible).
+    /// Prints "<file> is a valid identity" and exits 0 on success. Required by
+    /// the ZGALAXY engine's identity verification delegation (B1).
+    Validate {
+        #[arg(help = "Identity file (secret or public)")]
+        identity_file: String,
     },
 }
 
@@ -358,7 +366,10 @@ impl Cli {
                     fs::write("world.bin", &bytes).await?;
                     println!("Signed planet written to world.bin (canonical format, world id {})", crate::world::WORLD_ID_EARTH);
                 }
-            },
+                IdToolCommands::Validate { identity_file } => {
+                    execute_validate(&identity_file)?;
+                }
+            }
         }
         Ok(())
     }
@@ -427,6 +438,38 @@ fn parse_moon_definition(value: &Value) -> Result<MoonDefinition> {
     };
 
     Ok(MoonDefinition { world_id, roots, root_keys, signer })
+}
+
+/// zerotier-idtool compatible `validate`: parse + local cryptographic checks.
+/// Output contract required by ZGALAXY engine B1 delegation: prints
+/// "<file> is a valid identity" and exits 0 on success.
+fn execute_validate(path: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Identity argument invalid or file unreadable: {}", path))?;
+    let id = Identity::parse(&content)
+        .map_err(|e| anyhow::anyhow!("{}: malformed identity ({})", path, e))?;
+
+    if id.signing_key.is_some() {
+        let probe = b"zgalaxy-idtool-validate";
+        let sig = id.sign(probe)?;
+        if !id.verify(probe, &sig) {
+            anyhow::bail!("{}: key-pair self-check failed", path);
+        }
+    }
+
+    let parts: Vec<&str> = content.trim().split(':').collect();
+    if parts.len() >= 3 && hex::decode(parts[2]).map(|b| b.len()).unwrap_or(0) == 32 {
+        let pk_bytes = hex::decode(parts[2])?;
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&pk_bytes);
+        let derived = Address::from_public_key(&pk);
+        if derived.to_string() != id.address.to_string() {
+            anyhow::bail!("{}: address does not derive from public key", path);
+        }
+    }
+
+    println!("{} is a valid identity", path);
+    Ok(())
 }
 
 async fn fetch_json(url: &str, token: &str) -> Result<Value> {    let parsed = url::Url::parse(url)?;

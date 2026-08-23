@@ -99,7 +99,9 @@ async fn main() -> Result<()> {
             Ok(cli) => return cli.execute().await,
             Err(e) => {
                 e.print()?;
-                return Ok(());
+                // Match clap convention: bad usage is an exit-code failure,
+                // never a silent success (rc=0 broke engine B1 delegation).
+                std::process::exit(2);
             }
         }
     }
