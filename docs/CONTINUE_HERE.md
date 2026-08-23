@@ -65,6 +65,8 @@ touch_member_last_seen (بثبات loopback)، RTT prober كل 10s عبر contro
 - **الخطوة التالية المقترحة**: نشر آخر ثنائية على حاوية الإنتاج وتفعيل
   transportMode=quic عبر scripts/deploy_161.sh (deploy→verify، rollback جاهز)،
   ثم المرحلة 3: واجهة Slint.
+  **الدليل التشغيلي الكامل**: `docs/ROLLOUT-QUIC-PRODUCTION.md` — مراحل R1/R2/R3
+  بمعايير نجاح وأوامر تراجع ونقطة قرار توافق الأعضاء (D1) وسجل تنفيذ فارغ.
 - **الخطوة التالية المقترحة**: تفعيل transportMode=quic تدريجياً على الإنتاج
   (الأبواب مغلقة؛ ابدأ بحاوية اختبار ثم zg-tool ثم الإنتاج مع مراقبة ztnet)، أو
   المرحلة 3: واجهة Slint.

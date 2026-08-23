@@ -125,6 +125,9 @@
 ## نشر/تكامل
 - [x] **ب5/ب6 منجزة 2026-08-22**: نشر باينري المرحلة الحالية (musl, commit d3eb712) على حاوية الإنتاج `zerotier` في 161 مع UDP افتراضياً (local.conf بلا transportMode). النسخ الاحتياطية: `/home/dz161/backups/zerotier-one.20260822-120708.bak` + `ztnet_zerotier-volume.20260822-120708.tgz`؛ التراجع بأمر واحد: `bash /tmp/deploy_161.sh rollback 20260822-120708`. فحوص ما بعد النشر (سكربت `scripts/deploy_161.sh` في المستودع — deploy/verify/rollback): هوية العقدة محفوظة (ef313fb5c9)، الشبكات الثلاث والأعضاء الخمسة محمّلة، /status و/controller/network وmember و/network تجيب، TAP حقيقي أُنشئ، ztnet يعمل بلا أخطاء.
 - [ ] تفعيل transportMode=quic على 161 بعد اكتمال data plane + توكن العضوية، مع اختبار دورة كاملة من الواجهة (join→تخويل عبر ztnet→جاهزية).
+      ↳ **الدليل التشغيلي الكامل جاهز**: `docs/ROLLOUT-QUIC-PRODUCTION.md`
+        (R0 شروط ✅ كلها · R1 نشر UDP محدث · R2 استيعاب بتجربة واجهة ztnet ·
+        R3 تفعيل + نقطة قرار D1 لتوافق الأعضاء + أوامر تراجع لكل مرحلة)
 - [ ] Benchmarks: زمن إنشاء اتصال QUIC، throughput، CPU/ذاكرة idle، مقارنة قبل/بعد كل تحسين.
 - [ ] اختبارات فقدان حزم/تأخير/إعادة اتصال/high-load طويلة المدى.
 
