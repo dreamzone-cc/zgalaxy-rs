@@ -457,7 +457,7 @@ async fn main() -> Result<()> {
                                             );
                                         }
                                     }
-                                    ControlMessage::NetworkConfigRequest { nwid, token: _ } => {
+                                    ControlMessage::NetworkConfigRequest { nwid, token } => {
                                         // Act as controller for networks owned by this node.
                                         // The member id MUST be the announced node address —
                                         // anything else cannot map to a member record.
@@ -473,6 +473,33 @@ async fn main() -> Result<()> {
                                                     let member_rec = ctrl_for_events.get_member(&nwid, &member).await;
                                                     let authorized = member_rec.as_ref().map(|m| m.authorized).unwrap_or(false);
                                                     let ips = member_rec.map(|m| m.ip_assignments).unwrap_or_default();
+
+                                                    // أ1 enforcement: a PRESENTED token must
+                                                    // verify for (nwid, member). An invalid
+                                                    // token means revocation/revision-bump —
+                                                    // refuse instead of re-arming the peer.
+                                                    if let Some(presented) = token.as_deref() {
+                                                        if authorized
+                                                            && ctrl_for_events
+                                                                .verify_membership_token(presented, &nwid, &member)
+                                                                .is_none()
+                                                        {
+                                                            warn!(
+                                                                "[ZGALAXY QUIC] invalid membership token from {} for {} — refused",
+                                                                member, nwid
+                                                            );
+                                                            continue;
+                                                        }
+                                                    }
+
+                                                    // Issue a fresh short-TTL token for
+                                                    // authorized members (COM replacement).
+                                                    let issued = if authorized {
+                                                        ctrl_for_events.issue_membership_token(&nwid, &member).await
+                                                    } else {
+                                                        None
+                                                    };
+
                                                     let response = serde_json::json!({
                                                         "nwid": nwid,
                                                         "name": net.name,
@@ -480,6 +507,7 @@ async fn main() -> Result<()> {
                                                         "ipAssignments": ips,
                                                         "routes": net.routes,
                                                         "mtu": net.mtu,
+                                                        "membershipToken": issued,
                                                     });
                                                     if let Err(e) = quic_engine.send_control(
                                                         remote,

@@ -505,6 +505,9 @@ fn network_to_zt_json(net: &crate::network::Network) -> serde_json::Value {
         })).collect::<Vec<_>>(),
         "multicastSubscriptions": [],
         "dns": { "domain": "", "servers": [] },
+        // Observability for أ1: the controller-signed membership token this
+        // client will present on its next config request (null until issued).
+        "membershipToken": net.membership_token,
     })
 }
 
