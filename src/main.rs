@@ -189,11 +189,12 @@ async fn main() -> Result<()> {
     // Load or generate authtoken.secret
     let auth_path = working_dir.join("authtoken.secret");
     let auth_token = if auth_path.exists() {
+        set_authtoken_permissions(&auth_path);
         fs::read_to_string(&auth_path).await?.trim().to_string()
     } else {
         let token = hex::encode(rand::random::<[u8; 16]>());
         let _ = fs::write(&auth_path, &token).await;
-        restrict_secret_permissions(&auth_path);
+        set_authtoken_permissions(&auth_path);
         token
     };
 
@@ -964,8 +965,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Restrict a secret file (identity.secret, authtoken.secret) to owner-only
-/// permissions (0600), matching canonical ZeroTier behavior.
+/// Restrict private key files (identity.secret) to owner-only permissions (0600).
 #[cfg(unix)]
 fn restrict_secret_permissions(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -978,6 +978,20 @@ fn restrict_secret_permissions(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn restrict_secret_permissions(_path: &std::path::Path) {}
+
+/// Ensure authtoken.secret is readable by local user desktop apps and CLI (0644).
+#[cfg(unix)]
+fn set_authtoken_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o644);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_authtoken_permissions(_path: &std::path::Path) {}
 
 /// Spawn an infinite background task whose death (panic or unexpected return)
 /// is logged instead of passing silently — a panicked `tokio::spawn` task

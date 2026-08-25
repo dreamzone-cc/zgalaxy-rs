@@ -12,20 +12,37 @@ pub struct DaemonClient {
 impl DaemonClient {
     pub fn from_env() -> Self {
         let port = std::env::var("ZGALAXY_PORT").unwrap_or_else(|_| "9993".into());
-        let token = std::env::var("ZGALAXY_TOKEN")
-            .ok()
-            .or_else(|| std::fs::read_to_string("/var/lib/zerotier-one/authtoken.secret").ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
         DaemonClient {
             base: format!("http://127.0.0.1:{}", port),
-            token,
+            token: Self::load_token(),
+        }
+    }
+
+    fn load_token() -> String {
+        let home_token = std::env::var("HOME").ok().and_then(|h| {
+            std::fs::read_to_string(format!("{}/.zeroTierOneAuthToken", h)).ok()
+                .or_else(|| std::fs::read_to_string(format!("{}/.config/zgalaxy-ui/authtoken.secret", h)).ok())
+        });
+        std::env::var("ZGALAXY_TOKEN")
+            .ok()
+            .or_else(|| std::fs::read_to_string("/var/lib/zerotier-one/authtoken.secret").ok())
+            .or(home_token)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    fn current_token(&self) -> String {
+        if !self.token.is_empty() {
+            self.token.clone()
+        } else {
+            Self::load_token()
         }
     }
 
     fn get(&self, path: &str) -> Option<serde_json::Value> {
+        let token = self.current_token();
         ureq::get(&format!("{}{}", self.base, path))
-            .set("X-ZT1-Auth", &self.token)
+            .set("X-ZT1-Auth", &token)
             .timeout(Duration::from_secs(3))
             .call()
             .ok()?
@@ -34,8 +51,9 @@ impl DaemonClient {
     }
 
     fn post(&self, path: &str) -> Option<serde_json::Value> {
+        let token = self.current_token();
         ureq::post(&format!("{}{}", self.base, path))
-            .set("X-ZT1-Auth", &self.token)
+            .set("X-ZT1-Auth", &token)
             .timeout(Duration::from_secs(5))
             .call()
             .ok()?
@@ -44,8 +62,9 @@ impl DaemonClient {
     }
 
     fn post_json(&self, path: &str, body: &serde_json::Value) -> Option<serde_json::Value> {
+        let token = self.current_token();
         ureq::post(&format!("{}{}", self.base, path))
-            .set("X-ZT1-Auth", &self.token)
+            .set("X-ZT1-Auth", &token)
             .set("Content-Type", "application/json")
             .timeout(Duration::from_secs(5))
             .send_json(body.clone())
@@ -55,8 +74,9 @@ impl DaemonClient {
     }
 
     fn delete(&self, path: &str) -> Option<serde_json::Value> {
+        let token = self.current_token();
         ureq::delete(&format!("{}{}", self.base, path))
-            .set("X-ZT1-Auth", &self.token)
+            .set("X-ZT1-Auth", &token)
             .timeout(Duration::from_secs(5))
             .call()
             .ok()?
