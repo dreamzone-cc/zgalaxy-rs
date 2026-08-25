@@ -237,6 +237,7 @@ async fn main() -> Result<()> {
     // Start Local REST API Controller Plane on the same port as the UDP
     // transport (ZeroTier binds its control plane and wire socket together).
     let api_port = local_config.port;
+    let (join_tx, mut join_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let app_state = AppState {
         identity: identity.clone(),
         auth_token,
@@ -245,6 +246,7 @@ async fn main() -> Result<()> {
         network_manager: network_manager.clone(),
         controller: controller.clone(),
         resolver: resolver.clone(),
+        join_trigger: Some(join_tx),
     };
 
     tokio::spawn(async move {
@@ -932,6 +934,15 @@ async fn main() -> Result<()> {
             }
         });
         }
+
+        // Instant network join trigger task
+        let tp_for_instant = transport_arc.clone();
+        spawn_watched("instant-udp-join-trigger", async move {
+            while let Some(nwid) = join_rx.recv().await {
+                info!("[ZGALAXY INSTANT JOIN] Dispatched NetworkConfigRequest immediately for {}", nwid);
+                let _ = tp_for_instant.send_network_config_request(&nwid).await;
+            }
+        });
 
         // Background network join & configuration sync loop
         let nm_for_sync = network_manager.clone();

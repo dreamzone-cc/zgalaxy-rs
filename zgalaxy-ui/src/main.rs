@@ -214,16 +214,18 @@ fn main() {
 
     main_w.on_copy_text(|text| platform::copy_to_clipboard(&text));
     let c = Arc::clone(&client);
+    let leave_flag = Arc::clone(&poll_now);
     main_w.on_leave_network(move |nwid| {
         let nwid = nwid.trim().to_string();
         if !nwid.is_empty() {
-            app::commands::leave(Arc::clone(&c), nwid);
+            app::commands::leave(Arc::clone(&c), nwid, Some(Arc::clone(&leave_flag)));
         }
     });
 
     // --- JoinDialog ---
     let c = Arc::clone(&client);
     let dlg_close = join_dlg.as_weak();
+    let join_flag = Arc::clone(&poll_now);
     join_dlg.on_request_join(move |nwid| {
         let nwid = nwid.trim().to_string();
         if nwid.is_empty() {
@@ -242,7 +244,7 @@ fn main() {
             d.set_join_input("".into());
             let _ = d.hide();
         }
-        app::commands::join(Arc::clone(&c), nwid.to_lowercase());
+        app::commands::join(Arc::clone(&c), nwid.to_lowercase(), Some(Arc::clone(&join_flag)));
     });
     let dlg_close2 = join_dlg.as_weak();
     join_dlg.on_request_close(move || {
@@ -257,9 +259,10 @@ fn main() {
     let c = Arc::clone(&client);
     let det_close = det.as_weak();
     let sel_det = Arc::clone(&advanced_selected);
+    let det_flag = Arc::clone(&poll_now);
     det.on_request_disconnect(move || {
         if let Some(nwid) = sel_det.lock().unwrap().clone() {
-            app::commands::leave(Arc::clone(&c), nwid);
+            app::commands::leave(Arc::clone(&c), nwid, Some(Arc::clone(&det_flag)));
         }
         if let Some(d) = det_close.upgrade() {
             let _ = d.hide();
@@ -297,6 +300,7 @@ fn main() {
     let adv_flags = adv.as_weak();
     let client_flags = Arc::clone(&client);
     let sel_flags = Arc::clone(&advanced_selected);
+    let adv_flag = Arc::clone(&poll_now);
     let edit_stamp = Arc::clone(&last_local_edit_ms);
     adv.on_advanced_flags_changed(move || {
         let Some(a) = adv_flags.upgrade() else { return };
@@ -314,7 +318,7 @@ fn main() {
                 .as_millis() as u64,
             Ordering::Relaxed,
         );
-        app::commands::update_flags(Arc::clone(&client_flags), nwid, body);
+        app::commands::update_flags(Arc::clone(&client_flags), nwid, body, Some(Arc::clone(&adv_flag)));
     });
 
     // --- Preferences ---

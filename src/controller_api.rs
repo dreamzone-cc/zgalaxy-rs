@@ -27,6 +27,7 @@ pub struct AppState {
     /// CIDRs / plain IPs allowed to reach the management API.
     /// Loopback is always allowed. (local.conf allowManagementFrom)
     pub allow_management_from: Vec<String>,
+    pub join_trigger: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 pub struct ControllerServer;
@@ -208,6 +209,9 @@ async fn join_network(
     let clean = nwid.to_lowercase();
     match state.network_manager.join(&clean).await {
         Ok(net) => {
+            if let Some(ref tx) = state.join_trigger {
+                let _ = tx.send(clean.clone());
+            }
             let settings = match body {
                 Ok(Json(v)) => crate::network::NetworkSettingsUpdate::from_json(&v),
                 Err(_) => crate::network::NetworkSettingsUpdate::default(),

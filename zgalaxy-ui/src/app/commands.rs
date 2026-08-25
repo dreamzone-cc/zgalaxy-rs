@@ -4,6 +4,7 @@
 //! join/leave are idempotent server-side.
 
 use crate::network::client::DaemonClient;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Same rule the daemon enforces on POST /network/{nwid}: 16 hex chars.
@@ -14,21 +15,30 @@ pub fn is_valid_nwid(s: &str) -> bool {
     s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-pub fn join(client: Arc<DaemonClient>, nwid: String) {
+pub fn join(client: Arc<DaemonClient>, nwid: String, wake_flag: Option<Arc<AtomicBool>>) {
     std::thread::spawn(move || {
-        client.post_network(&nwid.to_lowercase());
+        let _ = client.post_network(&nwid.to_lowercase());
+        if let Some(flag) = wake_flag {
+            flag.store(true, Ordering::Relaxed);
+        }
     });
 }
 
-pub fn leave(client: Arc<DaemonClient>, nwid: String) {
+pub fn leave(client: Arc<DaemonClient>, nwid: String, wake_flag: Option<Arc<AtomicBool>>) {
     std::thread::spawn(move || {
-        client.delete_network(&nwid);
+        let _ = client.delete_network(&nwid);
+        if let Some(flag) = wake_flag {
+            flag.store(true, Ordering::Relaxed);
+        }
     });
 }
 
-pub fn update_flags(client: Arc<DaemonClient>, nwid: String, body: serde_json::Value) {
+pub fn update_flags(client: Arc<DaemonClient>, nwid: String, body: serde_json::Value, wake_flag: Option<Arc<AtomicBool>>) {
     std::thread::spawn(move || {
-        client.post_network_settings(&nwid, &body);
+        let _ = client.post_network_settings(&nwid, &body);
+        if let Some(flag) = wake_flag {
+            flag.store(true, Ordering::Relaxed);
+        }
     });
 }
 

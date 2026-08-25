@@ -244,6 +244,7 @@ async fn test_matrix_rest_api_auth_and_contract_invariance() {
         network_manager,
         controller,
         resolver,
+        join_trigger: None,
     };
 
     let router = ControllerServer::build_router(state);
@@ -314,6 +315,7 @@ async fn test_matrix_network_settings_update_via_post_body() {
         network_manager,
         controller,
         resolver,
+        join_trigger: None,
     };
 
     let router = ControllerServer::build_router(state);

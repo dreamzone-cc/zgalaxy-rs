@@ -50,17 +50,6 @@ impl DaemonClient {
             .ok()
     }
 
-    fn post(&self, path: &str) -> Option<serde_json::Value> {
-        let token = self.current_token();
-        ureq::post(&format!("{}{}", self.base, path))
-            .set("X-ZT1-Auth", &token)
-            .timeout(Duration::from_secs(5))
-            .call()
-            .ok()?
-            .into_json()
-            .ok()
-    }
-
     fn post_json(&self, path: &str, body: &serde_json::Value) -> Option<serde_json::Value> {
         let token = self.current_token();
         ureq::post(&format!("{}{}", self.base, path))
@@ -124,7 +113,7 @@ impl DaemonClient {
     }
 
     pub fn post_network(&self, nwid: &str) {
-        let _ = self.post(&format!("/network/{}", nwid));
+        let _ = self.post_json(&format!("/network/{}", nwid), &serde_json::json!({}));
     }
 
     pub fn delete_network(&self, nwid: &str) {
