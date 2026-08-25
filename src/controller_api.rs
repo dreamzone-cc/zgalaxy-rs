@@ -200,12 +200,27 @@ async fn join_network(
     State(state): State<AppState>,
     Path(nwid): Path<String>,
     headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Result<impl IntoResponse, StatusCode> {
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    match state.network_manager.join(&nwid.to_lowercase()).await {
-        Ok(net) => Ok(Json(network_to_zt_json(&net))),
+    let clean = nwid.to_lowercase();
+    match state.network_manager.join(&clean).await {
+        Ok(net) => {
+            let settings = match body {
+                Ok(Json(v)) => crate::network::NetworkSettingsUpdate::from_json(&v),
+                Err(_) => crate::network::NetworkSettingsUpdate::default(),
+            };
+            if !settings.is_empty() {
+                if let Some(updated) =
+                    state.network_manager.update_settings(&clean, settings).await
+                {
+                    return Ok(Json(network_to_zt_json(&updated)));
+                }
+            }
+            Ok(Json(network_to_zt_json(&net)))
+        }
         Err(_) => Err(StatusCode::BAD_REQUEST),
     }
 }
@@ -492,10 +507,10 @@ fn network_to_zt_json(net: &crate::network::Network) -> serde_json::Value {
         "portError": 0,
         "netconfRevision": 1,
         "portDeviceName": net.port_device_name,
-        "allowManaged": true,
-        "allowGlobal": false,
-        "allowDefault": false,
-        "allowDNS": false,
+        "allowManaged": net.allow_managed,
+        "allowGlobal": net.allow_global,
+        "allowDefault": net.allow_default,
+        "allowDNS": net.allow_dns,
         "assignedAddresses": net.assigned_addresses,
         "routes": net.routes.iter().map(|r| json!({
             "target": r.target,

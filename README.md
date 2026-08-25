@@ -77,6 +77,27 @@ irm https://raw.githubusercontent.com/dreamzone-cc/zgalaxy-rs/main/install.ps1 |
 
 ---
 
+### Run the ZTNET web UI on top of zgalaxy-rs (zerotier fully replaced)
+
+The complete ztnet stack — postgres + zgalaxy-rs engine + the **official,
+unmodified ztnet image** — with zerotier never installed. One command for a
+brand-new deployment, and a one-command in-place migration for servers already
+running ztnet over zerotier (identity, networks and members preserved):
+
+```bash
+cargo build --release --target x86_64-unknown-linux-musl
+cd deploy/ztnet
+SUDO_PASS='...' ./setup.sh fresh --bin ../../target/x86_64-unknown-linux-musl/release/zgalaxy-rs \
+  --url http://<SERVER-IP>:3000      # new deployment
+SUDO_PASS='...' ./setup.sh migrate --dir ~/ztnet --bin <musl-binary>   # replace an existing zerotier
+./setup.sh verify | update-binary | rollback                          # operate
+```
+
+Full guide: [docs/ZTNET-INTEGRATION.md](docs/ZTNET-INTEGRATION.md) (architecture,
+compatibility contracts, the `allowManagementFrom` pitfall, troubleshooting).
+
+---
+
 ### Build from Source
 
 #### Prerequisites:

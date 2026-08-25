@@ -70,6 +70,27 @@ impl LocalConfig {
             }
         }
 
+        // Canonical ZeroTier local.conf likewise carries the management
+        // allow-list under settings.allowManagementFrom. The top-level serde
+        // field only matches non-standard files, so mirror the primaryPort
+        // handling: lift the list out of `settings` when present. Without
+        // this, the guard silently falls back to loopback-only and refuses
+        // legitimate callers such as ztnet (observed live on the production
+        // container: "management access from 172.31.255.3 refused").
+        if let Some(list) = cfg
+            .settings
+            .get("allowManagementFrom")
+            .and_then(|v| v.as_array())
+        {
+            let entries: Vec<String> = list
+                .iter()
+                .filter_map(|x| x.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from))
+                .collect();
+            if !entries.is_empty() {
+                cfg.allow_management_from = entries;
+            }
+        }
+
         // Scan networks.d/ directory for configured networks
         let networks_dir = working_dir.join("networks.d");
         if networks_dir.exists() {
@@ -107,5 +128,58 @@ impl LocalConfig {
             let _ = fs::remove_file(conf_file).await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn canonical_zerotier_local_conf_lifts_allow_management_from_and_port() {
+        let dir = std::env::temp_dir().join(format!("zgrs-cfg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Exactly the shape used on the production container.
+        std::fs::write(
+            dir.join("local.conf"),
+            r#"{"settings":{"primaryPort":9993,"portMappingEnabled":true,"softwareUpdate":"disable","allowManagementFrom":["172.31.255.0/29"],"allowTcpFallbackRelay":true}}"#,
+        )
+        .unwrap();
+
+        let cfg = LocalConfig::load(&dir).await;
+        assert_eq!(cfg.port, 9993, "primaryPort must lift out of settings");
+        assert!(
+            cfg.allow_management_from.contains(&"172.31.255.0/29".to_string()),
+            "settings.allowManagementFrom must be honored, got {:?}",
+            cfg.allow_management_from
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn missing_local_conf_defaults_to_loopback_only() {
+        let dir = std::env::temp_dir().join(format!("zgrs-cfg-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = LocalConfig::load(&dir).await;
+        assert!(cfg.allow_management_from.contains(&"127.0.0.1".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn empty_settings_list_keeps_existing_values() {
+        let dir = std::env::temp_dir().join(format!("zgrs-cfg-blank-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("local.conf"),
+            r#"{"settings":{"allowManagementFrom":[]}}"#,
+        )
+        .unwrap();
+        let cfg = LocalConfig::load(&dir).await;
+        assert!(
+            cfg.allow_management_from.contains(&"127.0.0.1".to_string()),
+            "an empty list must not wipe the safe default"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

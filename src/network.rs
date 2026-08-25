@@ -35,6 +35,47 @@ pub struct Network {
     /// (COM replacement). Presented with every config request.
     #[serde(default)]
     pub membership_token: Option<String>,
+    #[serde(default = "default_true")]
+    pub allow_managed: bool,
+    #[serde(default)]
+    pub allow_global: bool,
+    #[serde(default)]
+    pub allow_default: bool,
+    #[serde(default)]
+    pub allow_dns: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Partial update of user-controllable network flags (ZeroTier local-service
+/// semantics: absent keys are left untouched). Keys are ZeroTier-style
+/// camelCase (allowManaged, allowGlobal, allowDefault, allowDNS).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkSettingsUpdate {
+    #[serde(default)]
+    pub allow_managed: Option<bool>,
+    #[serde(default)]
+    pub allow_global: Option<bool>,
+    #[serde(default)]
+    pub allow_default: Option<bool>,
+    #[serde(default, rename = "allowDNS")]
+    pub allow_dns: Option<bool>,
+}
+
+impl NetworkSettingsUpdate {
+    pub fn from_json(v: &serde_json::Value) -> Self {
+        serde_json::from_value(v.clone()).unwrap_or_default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.allow_managed.is_none()
+            && self.allow_global.is_none()
+            && self.allow_default.is_none()
+            && self.allow_dns.is_none()
+    }
 }
 
 /// Network membership and routing manager
@@ -85,6 +126,10 @@ impl NetworkManager {
             routes: Vec::new(),
             port_device_name: format!("zt-{}", &clean_nwid[..6]),
             membership_token: None,
+            allow_managed: true,
+            allow_global: false,
+            allow_default: false,
+            allow_dns: false,
         });
 
         Ok(net.clone())
@@ -93,6 +138,31 @@ impl NetworkManager {
     pub async fn update_network(&self, net: Network) {
         let mut networks = self.networks.write().await;
         networks.insert(net.nwid.clone(), net);
+    }
+
+    /// Apply a partial settings update to a joined network. Returns the
+    /// updated network, or None when not a member.
+    pub async fn update_settings(
+        &self,
+        nwid: &str,
+        update: NetworkSettingsUpdate,
+    ) -> Option<Network> {
+        let clean_nwid = nwid.trim().to_lowercase();
+        let mut networks = self.networks.write().await;
+        let net = networks.get_mut(&clean_nwid)?;
+        if let Some(v) = update.allow_managed {
+            net.allow_managed = v;
+        }
+        if let Some(v) = update.allow_global {
+            net.allow_global = v;
+        }
+        if let Some(v) = update.allow_default {
+            net.allow_default = v;
+        }
+        if let Some(v) = update.allow_dns {
+            net.allow_dns = v;
+        }
+        Some(net.clone())
     }
 
     pub async fn leave(&self, nwid: &str) -> Result<bool> {
@@ -183,5 +253,49 @@ mod tests {
         // locally administered unicast byte
         let first = u8::from_str_radix(&m1a[..2], 16).unwrap();
         assert_eq!(first & 0x03, 0x02);
+    }
+
+    #[tokio::test]
+    async fn settings_update_applies_partial_flags_and_requires_membership() {
+        let nm = NetworkManager::new();
+        nm.set_node_address("a1b2c3d4e5".into()).await;
+        let nwid = "0123456789abcdef";
+        let net = nm.join(nwid).await.unwrap();
+        assert!(net.allow_managed);
+        assert!(!net.allow_global);
+        assert!(!net.allow_default);
+        assert!(!net.allow_dns);
+
+        let u = NetworkSettingsUpdate {
+            allow_default: Some(true),
+            ..Default::default()
+        };
+        assert!(!u.is_empty());
+        let net = nm.update_settings(nwid, u).await.unwrap();
+        assert!(net.allow_managed, "untouched key must stay");
+        assert!(net.allow_default);
+
+        let empty = NetworkSettingsUpdate::default();
+        assert!(empty.is_empty());
+        let net = nm.update_settings(nwid, empty).await.unwrap();
+        assert!(net.allow_managed && net.allow_default);
+
+        assert!(
+            nm.update_settings("ffffffffffffffff", NetworkSettingsUpdate::default())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_update_parses_zt_style_keys_only() {
+        let v = serde_json::json!({"allowManaged": false, "bogus": 7});
+        let u = NetworkSettingsUpdate::from_json(&v);
+        assert_eq!(u.allow_managed, Some(false));
+        assert_eq!(u.allow_global, None);
+
+        let garbage = serde_json::json!({"allowManaged": "not-a-bool"});
+        let u = NetworkSettingsUpdate::from_json(&garbage);
+        assert_eq!(u.allow_managed, None, "bad types fall back to defaults");
     }
 }

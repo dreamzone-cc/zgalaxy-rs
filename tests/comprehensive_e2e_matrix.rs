@@ -293,6 +293,91 @@ async fn test_matrix_rest_api_auth_and_contract_invariance() {
     assert_eq!(res_metrics_auth.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn test_matrix_network_settings_update_via_post_body() {
+    let temp_dir = tempdir().unwrap();
+    let id = Identity::generate();
+    let auth_token = "secret_test_token_2026".to_string();
+
+    let controller = EmbeddedController::new(id.clone(), temp_dir.path().to_path_buf());
+    controller.init().await.unwrap();
+
+    let peer_manager = PeerManager::new();
+    let network_manager = NetworkManager::new();
+    let resolver = Arc::new(DynamicDnsResolver::new(30));
+
+    let state = AppState {
+        identity: id.clone(),
+        allow_management_from: vec!["127.0.0.1".to_string()],
+        auth_token: auth_token.clone(),
+        peer_manager,
+        network_manager,
+        controller,
+        resolver,
+    };
+
+    let router = ControllerServer::build_router(state);
+
+    use axum::body::to_bytes;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let nwid = "74b4ea0e6d000001";
+    let post = |uri: String, body: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("X-ZT1-Auth", &auth_token)
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    };
+
+    let req_join = post(format!("/network/{}", nwid), "{}");
+    let res_join = router.clone().oneshot(req_join).await.unwrap();
+    assert_eq!(res_join.status(), StatusCode::OK);
+    let b = to_bytes(res_join.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["allowManaged"], json!(true));
+    assert_eq!(v["allowDefault"], json!(false));
+
+    let req_upd = post(
+        format!("/network/{}", nwid),
+        r#"{"allowDefault":true,"allowGlobal":false,"allowDNS":true}"#,
+    );
+    let res_upd = router.clone().oneshot(req_upd).await.unwrap();
+    assert_eq!(res_upd.status(), StatusCode::OK);
+    let b = to_bytes(res_upd.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["allowDefault"], json!(true), "updated key must apply");
+    assert_eq!(v["allowDNS"], json!(true));
+    assert_eq!(
+        v["allowManaged"], json!(true),
+        "absent key must remain untouched"
+    );
+
+    let req_get = Request::builder()
+        .uri(format!("/network/{}", nwid))
+        .header("X-ZT1-Auth", &auth_token)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res_get = router.clone().oneshot(req_get).await.unwrap();
+    assert_eq!(res_get.status(), StatusCode::OK);
+    let b = to_bytes(res_get.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["allowDefault"], json!(true));
+    assert_eq!(v["allowDNS"], json!(true));
+
+    let res_bad = router
+        .oneshot(post(
+            "/network/nothex!!".to_string(),
+            r#"{"allowManaged":true}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res_bad.status(), StatusCode::BAD_REQUEST);
+}
+
 // ============================================================================
 // 7. NAT Candidate & Traversal Engine Matrix Tests
 // ============================================================================

@@ -226,19 +226,17 @@ impl EmbeddedController {
         nets.get(nwid).cloned()
     }
 
-    /// Generate the next unique network ID (controller address + 6-hex counter).
+    /// Generate the next unique network ID using cryptographically secure 24-bit random entropy.
     async fn next_network_id(&self) -> String {
         let nets = self.networks.read().await;
-        let mut counter: u64 = 1;
         loop {
-            let candidate = format!("{:06x}", counter);
-            let nwid = format!("{}{}", self.controller_address, candidate);
+            let mut postfix = rand::random::<u32>() & 0x00ff_ffff;
+            if postfix == 0 {
+                postfix = 1;
+            }
+            let nwid = format!("{}{:06x}", self.controller_address, postfix);
             if !nets.contains_key(&nwid) {
                 return nwid;
-            }
-            counter += 1;
-            if counter > 0x00ff_ffff {
-                return format!("{}{:06x}", self.controller_address, rand::random::<u32>() & 0x00ff_ffff);
             }
         }
     }
@@ -305,12 +303,19 @@ impl EmbeddedController {
             let nets = self.networks.write().await;
             let mut id = nwid;
             while nets.contains_key(&id) {
-                id = format!("{}{:06x}", self.controller_address, rand::random::<u32>() & 0x00ff_ffff);
+                let mut postfix = rand::random::<u32>() & 0x00ff_ffff;
+                if postfix == 0 {
+                    postfix = 1;
+                }
+                id = format!("{}{:06x}", self.controller_address, postfix);
             }
             id
         } else {
             nwid
         };
+        let mut net_config = net_config;
+        net_config.id = nwid.clone();
+        net_config.nwid = nwid.clone();
 
         // Persist to disk in FileDB format
         let net_file = self.db_path.join("network").join(format!("{}.json", nwid));
@@ -790,6 +795,29 @@ mod tests {
         assert!(member.authorized);
         assert!(member.no_auto_assign_ips);
         assert!(member.ip_assignments.is_empty(), "noAutoAssignIps must suppress auto-assignment");
+
+        let _ = std::fs::remove_dir_all(controller.db_path.parent().unwrap());
+    }
+
+    /// Generated network IDs must have 24-bit random entropy and must not be sequential (e.g. 000001, 000002).
+    #[tokio::test]
+    async fn test_random_non_sequential_network_ids() {
+        let controller = test_controller();
+        let _ = controller.init().await;
+
+        let net1 = controller.save_network(json!({ "name": "Net1" })).await.unwrap();
+        let net2 = controller.save_network(json!({ "name": "Net2" })).await.unwrap();
+
+        assert_eq!(net1.nwid.len(), 16);
+        assert_eq!(net2.nwid.len(), 16);
+        assert!(net1.nwid.starts_with(&controller.controller_address.to_string()));
+        assert!(net2.nwid.starts_with(&controller.controller_address.to_string()));
+        assert_ne!(net1.nwid, net2.nwid);
+
+        let suffix1 = &net1.nwid[10..];
+        let suffix2 = &net2.nwid[10..];
+        // Must not be sequential 000001 and 000002
+        assert!(!(suffix1 == "000001" && suffix2 == "000002"), "Network IDs must be randomly generated, not sequential counters");
 
         let _ = std::fs::remove_dir_all(controller.db_path.parent().unwrap());
     }

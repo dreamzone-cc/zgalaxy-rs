@@ -290,6 +290,17 @@ impl UdpTransport {
             }
         }
 
+        // 3. Send directly to active paths of the controller peer if known in peer_manager
+        if controller_addr != Address::NULL {
+            if let Some(peer) = self.peer_manager.get_peer(&controller_addr).await {
+                for path in peer.paths.iter().filter(|p| p.active) {
+                    if let Ok(endpoint) = path.address.replace('/', ":").parse::<SocketAddr>() {
+                        let _ = self.socket.send_to(&encoded, endpoint).await;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }

@@ -553,7 +553,12 @@ async fn main() -> Result<()> {
 
                                             // Apply managed address + routes to the host
                                             // adapter once per network (idempotent set).
+                                            // Gated by the user-facing network flags:
+                                            // allowManaged gates everything; a
+                                            // default route additionally requires
+                                            // allowDefault.
                                             if authorized
+                                                && net.allow_managed
                                                 && !net.assigned_addresses.is_empty()
                                                 && applied_networks.insert(nwid.clone())
                                             {
@@ -571,6 +576,11 @@ async fn main() -> Result<()> {
                                                     .await;
                                                 for route in &net.routes {
                                                     if route.target != cidr {
+                                                        let is_default = route.target == "0.0.0.0/0"
+                                                            || route.target == "::/0";
+                                                        if is_default && !net.allow_default {
+                                                            continue;
+                                                        }
                                                         let _ = zgalaxy_rs::route_manager::RouteManager::add_route(
                                                             &tun_for_events.name,
                                                             &route.target,
@@ -755,6 +765,7 @@ async fn main() -> Result<()> {
                 // Periodic network-config sync over reliable control streams.
                 let nm_for_sync = network_manager.clone();
                 let resolver_for_sync = resolver.clone();
+                let peers_for_sync = peer_manager.clone();
                 let quic_for_sync = Arc::clone(&quic);
                 spawn_watched("quic-sync-loop", async move {
                     // ب4 adaptive cadence: 500ms while any joined network is
@@ -796,6 +807,21 @@ async fn main() -> Result<()> {
                                             warn!("[ZGALAXY QUIC] cannot resolve extra endpoint '{}': {}", ep, e)
                                         }
                                     },
+                                }
+                            }
+                        }
+                        // Add active paths of the controllers for all joined networks
+                        for net in &nets {
+                            let ctrl_str = if net.nwid.len() >= 10 { &net.nwid[..10] } else { "" };
+                            if let Ok(ctrl_addr) = zgalaxy_rs::identity::Address::from_str(ctrl_str) {
+                                if let Some(peer) = peers_for_sync.get_peer(&ctrl_addr).await {
+                                    for path in peer.paths.iter().filter(|p| p.active) {
+                                        if let Ok(addr) = path.address.replace('/', ":").parse::<std::net::SocketAddr>() {
+                                            if !targets.contains(&addr) {
+                                                targets.push(addr);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

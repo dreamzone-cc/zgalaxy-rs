@@ -51,7 +51,54 @@ setup_service() {
   fi
 }
 
+# Desktop client (zgalaxy-ui): applications-menu shortcut + login autostart.
+# - Menu category: Utility (deliberately NOT Internet).
+# - Autostart: /etc/xdg/autostart (session start for every user). The same
+#   desktop-file ID also lives in ~/.config/autostart when the user toggles
+#   the in-app preference — XDG treats identical IDs as an override, never a
+#   duplicate launch.
+install_desktop() {
+  local UI_BIN=""
+  for c in target/release/zgalaxy-ui target/debug/zgalaxy-ui \
+           zgalaxy-ui/target/release/zgalaxy-ui zgalaxy-ui/target/debug/zgalaxy-ui; do
+    [ -x "$c" ] && UI_BIN="$c" && break
+  done
+  if [ -z "$UI_BIN" ]; then
+    log "Desktop client binary not found (build zgalaxy-ui first) — skipping menu/autostart."
+    return 0
+  fi
+
+  log "Installing desktop client to /usr/local/bin/zgalaxy-ui..."
+  install -m 0755 "$UI_BIN" /usr/local/bin/zgalaxy-ui
+
+  log "Installing application icon..."
+  if [ -f zgalaxy-ui/ui/assets/app-icon-gold.png ]; then
+    install -D -m 0644 zgalaxy-ui/ui/assets/app-icon-gold.png \
+      /usr/share/icons/hicolor/256x256/apps/zgalaxy.png
+    install -m 0644 zgalaxy-ui/ui/assets/app-icon-gold.png /usr/share/pixmaps/zgalaxy.png
+  fi
+
+  log "Installing applications-menu shortcut (category: Utility)..."
+  install -m 0644 zgalaxy-ui.desktop /usr/share/applications/zgalaxy-ui.desktop
+
+  log "Enabling start-at-login (system-wide autostart)..."
+  install -m 0644 zgalaxy-ui.desktop /etc/xdg/autostart/zgalaxy-ui.desktop
+
+  if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate /usr/share/applications/zgalaxy-ui.desktop \
+      || log "WARN: desktop file validation reported issues"
+  fi
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database /usr/share/applications 2>/dev/null || true
+  fi
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -qf /usr/share/icons/hicolor 2>/dev/null || true
+  fi
+  log "Menu shortcut + login autostart installed ✓"
+}
+
 build_and_install
 setup_service
+install_desktop
 
 log "Installation complete! Check status with: zgalaxy-cli status"

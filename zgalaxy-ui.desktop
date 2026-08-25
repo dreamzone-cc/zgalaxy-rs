@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ZGALAXY
+GenericName=Mesh Network Client
+Comment=ZGALAXY sovereign mesh network client
+Exec=/usr/local/bin/zgalaxy-ui
+TryExec=/usr/local/bin/zgalaxy-ui
+Icon=/usr/share/pixmaps/zgalaxy.png
+Terminal=false
+Categories=Utility;
+Keywords=zgalaxy;zerotier;mesh;network;gaming;
+StartupWMClass=zgalaxy-ui
+X-GNOME-Autostart-enabled=true

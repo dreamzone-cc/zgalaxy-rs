@@ -158,11 +158,7 @@ impl Cli {
                     "POST" => {
                         // Refuse silently-degraded bodies: a typo'd JSON would
                         // otherwise be sent as `{`}` and act on the wrong data.
-                        let payload: Value = match body.as_deref() {
-                            None | Some("{}") => serde_json::json!({}),
-                            Some(text) => serde_json::from_str(text)
-                                .with_context(|| format!("invalid JSON body: {}", text))?,
-                        };
+                        let payload: Value = parse_rest_body(body.as_deref())?;
                         post_json(&url, &token, payload).await?
                     }
                     "DELETE" => delete_req(&url, &token).await?,
@@ -599,3 +595,42 @@ fn restrict_secret_permissions(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn restrict_secret_permissions(_path: &std::path::Path) {}
+
+fn parse_rest_body(body: Option<&str>) -> anyhow::Result<Value> {
+    match body {
+        None | Some("{}") => Ok(serde_json::json!({})),
+        Some(text) => serde_json::from_str(text)
+            .with_context(|| format!("invalid JSON body: {}", text)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rest_body;
+
+    #[test]
+    fn rest_body_none_and_empty_object_default_to_empty() {
+        assert_eq!(parse_rest_body(None).unwrap(), serde_json::json!({}));
+        assert_eq!(parse_rest_body(Some("{}")).unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn rest_body_valid_json_parses_verbatim() {
+        let out = parse_rest_body(Some(r#"{"allowManaged":false,"n":1}"#)).unwrap();
+        assert_eq!(out["allowManaged"], serde_json::json!(false));
+        assert_eq!(out["n"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn rest_body_invalid_json_is_a_loud_error_not_silent_empty() {
+        let err = parse_rest_body(Some("{allowManaged:true}")).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("invalid JSON body"),
+            "expected loud parse error, got: {}",
+            msg
+        );
+        let err = parse_rest_body(Some("")).unwrap_err();
+        assert!(format!("{}", err).contains("invalid JSON body"));
+    }
+}
