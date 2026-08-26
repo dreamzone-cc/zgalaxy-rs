@@ -17,10 +17,6 @@ use storage::Config;
 
 fn present(w: &impl slint::ComponentHandle) {
     let _ = w.show();
-    if w.window().is_visible() {
-        let _ = w.hide();
-    }
-    let _ = w.show();
 }
 
 fn s<'a>(v: &'a serde_json::Value, k: &str) -> &'a str {
