@@ -567,6 +567,11 @@ fn main() {
         }
         slint::CloseRequestResponse::HideWindow
     });
+    join_dlg.window().on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+    det.window().on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+    adv.window().on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+    prefs.window().on_close_requested(|| slint::CloseRequestResponse::HideWindow);
+    about.window().on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
     // Never leave the app unreachable: background start without a tray icon
     // would be an invisible process with no handle — show the window instead.
