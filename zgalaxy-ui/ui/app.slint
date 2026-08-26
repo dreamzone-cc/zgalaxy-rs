@@ -372,6 +372,16 @@ export component MainWindow inherits Window {
     in-out property <string> about-node-id: "";
     in-out property <[PeerInfo]> diag-peers;
 
+    // ZGALAXY Dynamic Sync State
+    in-out property <string> sync-domain: "";
+    in-out property <string> sync-token: "";
+    in-out property <string> sync-status-label: "Not configured (Local)";
+    in-out property <string> sync-status-emoji: "⚪";
+    in-out property <string> sync-status-kind: "neutral";
+    in-out property <string> sync-last-time: "Never";
+    in-out property <string> sync-topology-info: "1 Planet · 0 Moons";
+    in-out property <bool> sync-busy: false;
+
     // Callbacks
     callback open-join();
     callback close-join();
@@ -388,6 +398,8 @@ export component MainWindow inherits Window {
     callback disconnect-current();
     callback advanced-flags-changed();
     callback prefs-changed();
+    callback sync-now(string, string);
+    callback remove-sync-provider();
 
     // Root Key Listener for ESC
     FocusScope {
@@ -827,8 +839,9 @@ export component MainWindow inherits Window {
                 spacing: Tokens.sp-1;
                 NavRow { icon: "⚙"; label: "General"; selected: root.prefs-page == 0; activated => { root.prefs-page = 0; } }
                 NavRow { icon: "🔔"; label: "Notifications"; selected: root.prefs-page == 1; activated => { root.prefs-page = 1; } }
-                NavRow { icon: "🛠"; label: "Advanced"; selected: root.prefs-page == 2; activated => { root.prefs-page = 2; } }
-                NavRow { icon: "📊"; label: "Diagnostics"; selected: root.prefs-page == 3; activated => { root.prefs-page = 3; } }
+                NavRow { icon: "🌐"; label: "ZGALAXY Sync"; selected: root.prefs-page == 2; activated => { root.prefs-page = 2; } }
+                NavRow { icon: "🛠"; label: "Advanced"; selected: root.prefs-page == 3; activated => { root.prefs-page = 3; } }
+                NavRow { icon: "📊"; label: "Diagnostics"; selected: root.prefs-page == 4; activated => { root.prefs-page = 4; } }
                 Rectangle { vertical-stretch: 1; }
             }
 
@@ -876,6 +889,75 @@ export component MainWindow inherits Window {
 
                 if root.prefs-page == 2 : VerticalLayout {
                     spacing: Tokens.sp-3;
+                    Text { text: "ZGALAXY Cloud Synchronization"; font-size: Tokens.font-section; font-weight: 700; }
+                    SecondaryText { text: "Connect to a ZGALAXY provider to dynamically discover and synchronize Planets and Moons."; font-size: Tokens.font-secondary; }
+
+                    VerticalLayout {
+                        spacing: Tokens.sp-1;
+                        Text { text: "Service Domain / URL"; font-size: Tokens.font-small; font-weight: 600; }
+                        LineEdit {
+                            text <=> root.sync-domain;
+                            placeholder-text: "dz.dreamzone.cc or http://192.168.1.161:3000";
+                            font-size: Tokens.font-body;
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: Tokens.sp-1;
+                        Text { text: "Access Token / Signature"; font-size: Tokens.font-small; font-weight: 600; }
+                        LineEdit {
+                            text <=> root.sync-token;
+                            placeholder-text: "ZG-tok_... or Capability Token";
+                            font-size: Tokens.font-body;
+                            input-type: password;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: Tokens.sp-2;
+                        Text { text: "Status:"; font-size: Tokens.font-secondary; font-weight: 600; vertical-alignment: center; }
+                        Text {
+                            text: root.sync-status-emoji + " " + root.sync-status-label;
+                            font-size: Tokens.font-secondary;
+                            color: root.sync-status-kind == "success" ? Tokens.success : root.sync-status-kind == "error" ? Tokens.error : Palette.foreground.with-alpha(0.7);
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+
+                    HorizontalLayout {
+                        Text { text: "Active Topology:"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.sync-topology-info; font-size: Tokens.font-secondary; }
+                    }
+
+                    HorizontalLayout {
+                        Text { text: "Last Sync:"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.sync-last-time; font-size: Tokens.font-secondary; }
+                    }
+
+                    Rectangle { vertical-stretch: 1; }
+
+                    HorizontalLayout {
+                        spacing: Tokens.sp-3;
+                        alignment: end;
+                        if root.sync-domain != "" || root.sync-token != "" : Button {
+                            text: "Remove Provider";
+                            min-height: Tokens.ctrl-h;
+                            clicked => { root.remove-sync-provider(); }
+                        }
+                        Button {
+                            text: root.sync-busy ? "Syncing…" : "Sync Now";
+                            min-height: Tokens.ctrl-h;
+                            min-width: 90px;
+                            clicked => { root.sync-now(root.sync-domain, root.sync-token); }
+                        }
+                    }
+                }
+
+                if root.prefs-page == 3 : VerticalLayout {
+                    spacing: Tokens.sp-3;
                     Text { text: "Service Details"; font-size: Tokens.font-section; font-weight: 700; }
                     HorizontalLayout {
                         Text { text: "Local Daemon"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
@@ -890,7 +972,7 @@ export component MainWindow inherits Window {
                     Rectangle { vertical-stretch: 1; }
                 }
 
-                if root.prefs-page == 3 : VerticalLayout {
+                if root.prefs-page == 4 : VerticalLayout {
                     spacing: Tokens.sp-2;
                     Text { text: "Connected Peers"; font-size: Tokens.font-section; font-weight: 700; }
                     if root.diag-peers.length == 0 : SecondaryText {

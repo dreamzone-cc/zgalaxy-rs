@@ -334,6 +334,83 @@ fn main() {
         *cfg_ref.lock().unwrap() = c;
     });
 
+    let mw_sync = main_w.as_weak();
+    main_w.on_sync_now(move |domain, token| {
+        let domain = domain.trim().to_string();
+        let token = token.trim().to_string();
+        if let Some(ui) = mw_sync.upgrade() {
+            if domain.is_empty() || token.is_empty() {
+                ui.set_sync_status_label("Domain and Token are required".into());
+                ui.set_sync_status_emoji("⚠️".into());
+                ui.set_sync_status_kind("warning".into());
+                return;
+            }
+            ui.set_sync_busy(true);
+            ui.set_sync_status_label("Connecting & verifying token…".into());
+            ui.set_sync_status_emoji("🟡".into());
+            ui.set_sync_status_kind("warning".into());
+        }
+
+        let mw_cb = mw_sync.clone();
+        std::thread::spawn(move || {
+            let base_url = if domain.starts_with("http://") || domain.starts_with("https://") {
+                domain.clone()
+            } else {
+                format!("http://{}:3000", domain)
+            };
+            let manifest_url = format!("{}/api/v1/sync/manifest", base_url.trim_end_matches('/'));
+
+            let resp = ureq::get(&manifest_url)
+                .set("X-ZGALAXY-Signature", &token)
+                .timeout(std::time::Duration::from_secs(10))
+                .call();
+
+            let (label, emoji, kind, topology, now_str) = match resp {
+                Ok(response) => {
+                    if let Ok(val) = response.into_json::<serde_json::Value>() {
+                        let planets_cnt = val.get("planets").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(1);
+                        let moons_cnt = val.get("moons").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                        let topo = format!("{} Planet · {} Moons", planets_cnt, moons_cnt);
+                        ("Synced & Verified".to_string(), "🟢".to_string(), "success".to_string(), topo, "Just now".to_string())
+                    } else {
+                        ("Connected (Malformed Response)".to_string(), "⚠️".to_string(), "warning".to_string(), "1 Planet · 0 Moons".to_string(), "Just now".to_string())
+                    }
+                }
+                Err(e) => {
+                    let err_str = match e {
+                        ureq::Error::Status(code, _) => format!("Rejected (HTTP {})", code),
+                        ureq::Error::Transport(t) => format!("Connection failed: {}", t.kind()),
+                    };
+                    (err_str, "🔴".to_string(), "error".to_string(), "—".to_string(), "Failed".to_string())
+                }
+            };
+
+            slint::invoke_from_event_loop(move || {
+                if let Some(ui) = mw_cb.upgrade() {
+                    ui.set_sync_busy(false);
+                    ui.set_sync_status_label(label.into());
+                    ui.set_sync_status_emoji(emoji.into());
+                    ui.set_sync_status_kind(kind.into());
+                    ui.set_sync_topology_info(topology.into());
+                    ui.set_sync_last_time(now_str.into());
+                }
+            }).ok();
+        });
+    });
+
+    let mw_remove_sync = main_w.as_weak();
+    main_w.on_remove_sync_provider(move || {
+        if let Some(ui) = mw_remove_sync.upgrade() {
+            ui.set_sync_domain("".into());
+            ui.set_sync_token("".into());
+            ui.set_sync_status_label("Not configured (Local)".into());
+            ui.set_sync_status_emoji("⚪".into());
+            ui.set_sync_status_kind("neutral".into());
+            ui.set_sync_last_time("Never".into());
+            ui.set_sync_topology_info("1 Planet · 0 Moons".into());
+        }
+    });
+
     // --- System Tray Actions ---
     let mw_tray_open = main_w.as_weak();
     if let Some(tray) = &tray {
