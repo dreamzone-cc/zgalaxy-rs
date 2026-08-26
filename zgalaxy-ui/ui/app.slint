@@ -1,23 +1,14 @@
 // ZGALAXY Desktop Client — Gamer-first, Windows 11 inspired (spec §8).
-// Windows hold layout only: no network logic, no status wording — labels and
-// emoji always arrive from the Rust core (NetworkInfo / OverallState).
+// Unified Single-Window Architecture: ONE top-level OS Window with internal page views.
 
 import { Button, LineEdit, VerticalBox, HorizontalBox, CheckBox, ScrollView, ListView, Palette } from "std-widgets.slint";
 
-// Tray state is a global because Slint does not expose a setter for the
-// builtin SystemTrayIcon.icon `in` property; the binding below feeds it, and
-// Rust updates this global when the connection state changes (gold=ready,
-// gray=not). Globals on a SystemTrayIcon component are per-instance, which is
-// exactly what we want.
 export global AppTrayState {
     in-out property <image> icon: @image-url("assets/app-icon-gold.png");
 }
 
-// Design tokens (spec §19): the single source of truth for spacing,
-// typography, radii, control sizes and window dimensions. Every literal in
-// this file derives from here so the whole app stays on one visual scale.
 export global Tokens {
-    // spacing scale 4/8/12/16/24 (spec §8.3 "نظام ثابت")
+    // spacing scale 4/8/12/16/24
     out property <length> sp-1: 4px;
     out property <length> sp-2: 8px;
     out property <length> sp-3: 12px;
@@ -40,26 +31,17 @@ export global Tokens {
     out property <length> nav-width: 140px;
     out property <length> pill-height: 28px;
     out property <length> accent-bar: 3px;
-    // control geometry — one calculated scale for every interactive element
-    // (spec §15 comfortable targets; §8.3 fixed spacing system)
-    out property <length> ctrl-h: 36px;      // buttons + inputs + nav rows
-    out property <length> btn-min-w: 96px;   // primary/secondary actions
-    out property <length> btn-sm-w: 72px;    // compact actions (Copy)
-    // semantic colors (spec §8.4)
+    // control geometry
+    out property <length> ctrl-h: 36px;
+    out property <length> btn-min-w: 96px;
+    out property <length> btn-sm-w: 72px;
+    // semantic colors
     out property <color> success: #1a7f37;
     out property <color> warning: #b8860b;
     out property <color> error: #c62828;
-    // window dimensions: ONE unified width across the app; each window's
-    // height follows its own content (spec §8.3 — consistent gutters, no
-    // arbitrary uniformity that fights the content).
-    out property <length> win-w: 460px;
-    // content-driven heights
-    out property <length> win-main-h: 560px;
-    out property <length> win-join-h: 200px;
-    out property <length> win-details-h: 480px;
-    out property <length> win-advanced-h: 640px;
-    out property <length> win-prefs-h: 440px;
-    out property <length> win-about-h: 320px;
+    // window dimensions
+    out property <length> win-w: 480px;
+    out property <length> win-main-h: 580px;
 }
 
 export struct NetworkInfo {
@@ -108,8 +90,6 @@ component SectionHeader inherits HorizontalLayout {
     }
 }
 
-// Rounded status badge: emoji + human label on a soft tint of the state
-// color. Color never carries meaning alone — emoji and text ride along (§15).
 component StatusPill inherits Rectangle {
     in property <string> emoji;
     in property <string> label;
@@ -146,16 +126,13 @@ component StatusPill inherits Rectangle {
     }
 }
 
-// One network row in the Networks window (spec §6.4): name + status on the
-// first line, network id small underneath. No buttons — the whole card is
-// one click target that opens Network Details.
 component NetworkCard inherits Rectangle {
     in property <string> c-name;
     in property <string> c-nwid;
     in property <string> c-address;
     in property <string> c-state-label;
     in property <string> c-state-emoji;
-    in property <string> c-state-kind; // success | warning | error | neutral
+    in property <string> c-state-kind;
     in property <bool> c-ready;
     callback card-clicked();
     callback ctx-open();
@@ -169,7 +146,6 @@ component NetworkCard inherits Rectangle {
     border-color: Palette.foreground.with-alpha(0.08);
     clip: true;
 
-    // state accent bar — redundant state signal (color + emoji + text §15)
     Rectangle {
         x: 0;
         y: 0;
@@ -187,8 +163,6 @@ component NetworkCard inherits Rectangle {
 
     background: ta.has-hover ? Palette.alternate-background.brighter(0.06) : Palette.alternate-background;
 
-    // Right-click actions (spec §6.4/§3.2 reference model): quick operations
-    // without leaving the list.
     ContextMenuArea {
         Menu {
             MenuItem {
@@ -238,15 +212,44 @@ component NetworkCard inherits Rectangle {
     }
 }
 
+component NavRow inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> selected;
+    callback activated();
+
+    height: Tokens.nav-height;
+    border-radius: Tokens.radius-sm;
+    background: root.selected ? Palette.alternate-background : (ta.has-hover ? Palette.alternate-background.with-alpha(0.5) : transparent);
+
+    ta := TouchArea {
+        clicked => { root.activated(); }
+    }
+
+    HorizontalLayout {
+        padding-left: Tokens.sp-3;
+        padding-right: Tokens.sp-3;
+        spacing: Tokens.sp-2;
+        Text {
+            text: root.icon;
+            font-size: Tokens.font-body;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.label;
+            font-size: Tokens.font-small;
+            font-weight: root.selected ? 700 : 400;
+            vertical-alignment: center;
+            color: Palette.foreground;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// System Tray — the primary interface (spec §6.1/§9)
+// System Tray Icon
 // ---------------------------------------------------------------------------
 export component AppTray inherits SystemTrayIcon {
-    // icon: deliberately NOT bound here — assigned from Rust so it can follow
-    // connection state (gold when ready, gray otherwise). Slint creates the
-    // tray icon once a non-empty image is set.
     tooltip: "ZGALAXY";
-
     icon: AppTrayState.icon;
     in-out property <string> status-text: "⚪ Not connected";
     in-out property <[NetworkInfo]> networks;
@@ -286,30 +289,39 @@ export component AppTray inherits SystemTrayIcon {
         }
         MenuSeparator {}
         MenuItem {
-            title: "Settings";
+            title: "Preferences...";
             activated => { root.open-prefs(); }
         }
         MenuItem {
-            title: "About";
+            title: "About ZGALAXY";
             activated => { root.open-about(); }
         }
         MenuSeparator {}
         MenuItem {
-            title: "Quit";
+            title: "Quit ZGALAXY";
             activated => { root.quit-app(); }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Networks window (spec §6.4): calm list, click a card for details.
+// UNIFIED MAIN WINDOW (The ONE and ONLY top-level OS Window)
 // ---------------------------------------------------------------------------
 export component MainWindow inherits Window {
-    title: "ZGALAXY — Networks";
+    title: root.current-view == "main" ? "ZGALAXY — Networks"
+        : root.current-view == "details" ? "ZGALAXY — Network Details"
+        : root.current-view == "advanced" ? "ZGALAXY — Advanced Settings"
+        : root.current-view == "preferences" ? "ZGALAXY — Preferences"
+        : "ZGALAXY — About";
     icon: @image-url("assets/app-icon-gold.png");
     width: Tokens.win-w;
     height: Tokens.win-main-h;
 
+    // View Routing: "main" | "details" | "advanced" | "preferences" | "about"
+    in-out property <string> current-view: "main";
+    in-out property <bool> show-join-modal: false;
+
+    // Node & Service State
     in-out property <string> node-address: "…";
     in-out property <string> service-state: "Starting";
     in-out property <string> status-line: "Checking service…";
@@ -319,222 +331,13 @@ export component MainWindow inherits Window {
     in-out property <[NetworkInfo]> networks;
     in-out property <string> app-version: "";
 
-    callback open-details(string);
-    callback open-join();
-    callback retry();
-    callback copy-text(string);
-    callback leave-network(string);
+    // Join Modal State
+    in-out property <string> join-input: "";
+    in-out property <bool> join-busy: false;
+    in-out property <string> join-error-text: "";
 
-    VerticalBox {
-        padding: Tokens.sp-4;
-        spacing: Tokens.sp-3;
-
-        HorizontalLayout {
-            spacing: Tokens.sp-2;
-            StatusPill {
-                emoji: root.status-emoji;
-                label: root.status-line;
-                kind: root.status-kind;
-            }
-            Rectangle { horizontal-stretch: 1; }
-            if !root.service-ok : Button {
-                text: "Retry";
-                min-height: Tokens.ctrl-h;
-                clicked => { root.retry(); }
-            }
-            Rectangle {
-                width: Tokens.btn-sm-w;
-                height: Tokens.ctrl-h;
-                border-radius: Tokens.radius-sm;
-                background: join-btn-ta.has-hover
-                    ? Palette.accent-background.brighter(0.15)
-                    : Palette.accent-background;
-
-                join-btn-ta := TouchArea {
-                    clicked => { root.open-join(); }
-                }
-
-                Text {
-                    text: "Join";
-                    color: Palette.accent-foreground;
-                    font-size: Tokens.font-small;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
-        }
-
-        Rectangle {
-            height: 1px;
-            background: Palette.foreground.with-alpha(0.08);
-        }
-
-        if root.networks.length == 0 && root.service-ok : VerticalLayout {
-            vertical-stretch: 1;
-            alignment: center;
-            spacing: Tokens.sp-2;
-            Image {
-                source: @image-url("assets/app-icon-gold.png");
-                width: 64px;
-                height: 64px;
-                horizontal-alignment: center;
-            }
-            Text {
-                text: "No networks yet";
-                font-size: Tokens.font-section;
-                font-weight: 600;
-                horizontal-alignment: center;
-                color: Palette.foreground;
-            }
-            SecondaryText {
-                text: "Join a network to get started";
-                font-size: Tokens.font-small;
-                horizontal-alignment: center;
-            }
-            Button {
-                text: "Join a Network…";
-                min-height: Tokens.ctrl-h;
-                min-width: Tokens.btn-min-w;
-                clicked => { root.open-join(); }
-            }
-        }
-        if root.networks.length > 0 : VerticalLayout {
-            vertical-stretch: 1;
-            spacing: Tokens.sp-2;
-            SectionHeader {
-                title: "YOUR NETWORKS";
-                count: root.networks.length;
-            }
-            for net in root.networks : NetworkCard {
-                c-name: net.name;
-                c-nwid: net.nwid;
-                c-address: net.address == "no address yet" ? "" : net.address;
-                c-state-label: net.state-label;
-                c-state-emoji: net.state-emoji;
-                c-state-kind: net.state-kind;
-                c-ready: net.ready;
-                card-clicked => { root.open-details(net.nwid); }
-                ctx-open => { root.open-details(net.nwid); }
-                ctx-copy-address => { root.copy-text(net.address); }
-                ctx-copy-nwid => { root.copy-text(net.nwid); }
-                ctx-disconnect => { root.leave-network(net.nwid); }
-            }
-        }
-
-        Rectangle {
-            height: 1px;
-            background: Palette.foreground.with-alpha(0.08);
-        }
-
-        // Footer: node identity left, app version right.
-        HorizontalLayout {
-            spacing: Tokens.sp-2;
-            Text {
-                text: "Node " + root.node-address;
-                font-size: Tokens.font-secondary;
-                color: Palette.accent-background;
-                vertical-alignment: center;
-            }
-            SecondaryText {
-                text: root.service-state;
-                font-size: Tokens.font-secondary;
-                vertical-alignment: center;
-            }
-            Rectangle { horizontal-stretch: 1; }
-            SecondaryText {
-                text: "v" + root.app-version;
-                font-size: Tokens.font-secondary;
-                vertical-alignment: center;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Join Network dialog (spec §6.3): one field, two buttons, nothing technical.
-// ---------------------------------------------------------------------------
-export component JoinDialog inherits Window {
-    title: "Join a Network";
-    icon: @image-url("assets/app-icon-gold.png");
-    width: Tokens.win-w;
-    height: Tokens.win-join-h;
-
-    in-out property <string> join-input;
-    in-out property <bool> busy: false;
-    in-out property <string> error-text: "";
-
-    callback request-join(string);
-    callback request-close();
-
-    public function focus-input() {
-        joinField.focus();
-    }
-
-    esc := FocusScope {
-        key-pressed(event) => {
-            if (event.text == Key.Escape) {
-                root.request-close();
-                return accept;
-            }
-            reject
-        }
-    }
-
-    VerticalBox {
-        padding: Tokens.sp-4;
-        spacing: Tokens.sp-3;
-
-        Text {
-            text: "Network ID";
-            font-size: Tokens.font-secondary;
-            color: Palette.foreground.with-alpha(0.55);
-        }
-        joinField := LineEdit {
-            placeholder-text: "Enter network ID";
-            text <=> root.join-input;
-            enabled: !root.busy;
-            min-height: Tokens.ctrl-h;
-            accepted => { if (root.join-input != "") { root.request-join(root.join-input); } }
-        }
-        Text {
-            text: root.error-text;
-            visible: root.error-text != "";
-            color: Tokens.error;
-            font-size: Tokens.font-secondary;
-            wrap: word-wrap;
-        }
-
-        HorizontalLayout {
-            alignment: end;
-            spacing: Tokens.sp-2;
-            Button {
-                text: "Cancel";
-                min-height: Tokens.ctrl-h;
-                min-width: Tokens.btn-min-w;
-                clicked => { root.request-close(); }
-            }
-            Button {
-                text: "Join";
-                min-height: Tokens.ctrl-h;
-                min-width: Tokens.btn-min-w;
-                enabled: !root.busy && root.join-input != "";
-                clicked => { root.request-join(root.join-input); }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Main Network window (spec §6.2): the current network at a glance.
-// One primary action (Disconnect); Advanced is the only secondary.
-// ---------------------------------------------------------------------------
-export component NetworkDetailsWindow inherits Window {
-    title: "My Network";
-    icon: @image-url("assets/app-icon-gold.png");
-    width: Tokens.win-w;
-    height: Tokens.win-details-h;
-
+    // Network Details State
+    in-out property <string> d-nwid: "";
     in-out property <string> d-name: "";
     in-out property <string> d-state-emoji: "🟠";
     in-out property <string> d-state-label: "";
@@ -542,119 +345,7 @@ export component NetworkDetailsWindow inherits Window {
     in-out property <string> d-address: "";
     in-out property <bool> d-connected: false;
 
-    callback request-close();
-    callback copy-address(string);
-    callback request-disconnect();
-    callback open-advanced();
-
-    VerticalBox {
-        padding: Tokens.sp-6;
-        spacing: Tokens.sp-3;
-
-        HorizontalLayout {
-            alignment: center;
-            StatusPill {
-                emoji: root.d-state-emoji;
-                label: root.d-state-label;
-                kind: root.d-state-kind;
-            }
-        }
-
-        Text {
-            text: root.d-name;
-            font-size: Tokens.font-title;
-            font-weight: 700;
-            horizontal-alignment: center;
-            color: Palette.foreground;
-        }
-
-        // Grouped sheet: address + connection in one card (§8.3 no cards-in-cards
-        // overly deep — one level of grouping reads cleanly).
-        Rectangle {
-            border-radius: Tokens.radius;
-            background: Palette.alternate-background;
-            border-width: 1px;
-            border-color: Palette.foreground.with-alpha(0.08);
-
-            VerticalLayout {
-                padding: Tokens.sp-4;
-                spacing: Tokens.sp-3;
-
-                VerticalLayout {
-                    spacing: Tokens.sp-1;
-                    SecondaryText {
-                        text: "Your address";
-                        font-size: Tokens.font-secondary;
-                    }
-                    HorizontalLayout {
-                        padding: 0;
-                        spacing: Tokens.sp-2;
-                        Text {
-                            text: root.d-address;
-                            font-size: Tokens.font-emphasis;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        Button {
-                            text: "Copy";
-                            min-height: Tokens.ctrl-h;
-                            min-width: Tokens.btn-sm-w;
-                            clicked => { root.copy-address(root.d-address); }
-                        }
-                    }
-                }
-
-                Rectangle {
-                    height: 1px;
-                    background: Palette.foreground.with-alpha(0.1);
-                }
-
-                VerticalLayout {
-                    spacing: Tokens.sp-1;
-                    SecondaryText {
-                        text: "Connection";
-                        font-size: Tokens.font-secondary;
-                    }
-                    Text {
-                        text: root.d-connected ? "● Connected" : "○ Disconnected";
-                        font-size: Tokens.font-body;
-                        color: root.d-connected ? Tokens.success : Palette.foreground.with-alpha(0.55);
-                    }
-                }
-            }
-        }
-
-        Rectangle { vertical-stretch: 1; }
-
-        HorizontalLayout {
-            spacing: Tokens.sp-2;
-            alignment: end;
-            Button {
-                text: "Advanced…";
-                min-height: Tokens.ctrl-h;
-                min-width: Tokens.btn-min-w;
-                clicked => { root.open-advanced(); }
-            }
-            Button {
-                text: "Disconnect";
-                min-height: Tokens.ctrl-h;
-                min-width: Tokens.btn-min-w;
-                enabled: root.d-connected;
-                clicked => { root.request-disconnect(); }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Advanced Network Details (spec §6.5): read-mostly technical layer.
-// ---------------------------------------------------------------------------
-export component AdvancedWindow inherits Window {
-    title: "Network Details — Advanced";
-    icon: @image-url("assets/app-icon-gold.png");
-    width: Tokens.win-w;
-    height: Tokens.win-advanced-h;
-
+    // Advanced Window State
     in-out property <string> a-name: "";
     in-out property <string> a-nwid: "";
     in-out property <string> a-state-emoji: "🟠";
@@ -670,420 +361,724 @@ export component AdvancedWindow inherits Window {
     in-out property <bool> a-allow-default: false;
     in-out property <bool> a-allow-dns: false;
 
-    callback request-close();
-    callback copy-address(string);
-    callback advanced-flags-changed();
-
-    VerticalBox {
-        padding: Tokens.sp-4;
-        spacing: Tokens.sp-3;
-
-        Text {
-            text: root.a-name;
-            font-size: Tokens.font-title;
-            font-weight: 700;
-        }
-        Text {
-            text: root.a-state-emoji + " " + root.a-state-label;
-            font-size: Tokens.font-small;
-        }
-
-        Rectangle { height: 1px; background: Palette.foreground.with-alpha(0.1); }
-
-        ScrollView {
-            height: 420px;
-            viewport-width: Tokens.win-w - 2 * Tokens.sp-4;
-
-            VerticalBox {
-                spacing: Tokens.sp-2;
-
-                Text { text: "Network ID"; font-size: Tokens.font-caption; color: Palette.foreground.with-alpha(0.55); }
-                Text { text: root.a-nwid; font-size: Tokens.font-small; }
-
-                Text { text: "Your Address"; font-size: Tokens.font-caption; color: Palette.foreground.with-alpha(0.55); }
-                HorizontalLayout {
-                    padding: 0;
-                    Text { text: root.a-address; font-size: Tokens.font-small; vertical-alignment: center; }
-                    Rectangle { horizontal-stretch: 1; }
-                    Button {
-                        text: "Copy";
-                        min-height: Tokens.ctrl-h;
-                        min-width: Tokens.btn-sm-w;
-                        clicked => { root.copy-address(root.a-address); }
-                    }
-                }
-
-                Rectangle { height: Tokens.sp-2; }
-                Text {
-                    text: "CONNECTION";
-                    font-size: Tokens.font-caption;
-                    font-weight: 700;
-                    color: Palette.foreground.with-alpha(0.45);
-                }
-                HorizontalLayout {
-                    padding: 0;
-                    Text { text: "Device"; vertical-alignment: center; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
-                    Text { text: root.a-device; horizontal-stretch: 1; horizontal-alignment: right; font-size: Tokens.font-secondary; }
-                }
-                HorizontalLayout {
-                    padding: 0;
-                    Text { text: "Type"; vertical-alignment: center; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
-                    Text { text: root.a-type; horizontal-stretch: 1; horizontal-alignment: right; font-size: Tokens.font-secondary; }
-                }
-                HorizontalLayout {
-                    padding: 0;
-                    Text { text: "Ethernet"; vertical-alignment: center; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
-                    Text { text: root.a-mac; horizontal-stretch: 1; horizontal-alignment: right; font-size: Tokens.font-secondary; }
-                }
-
-                Rectangle { height: Tokens.sp-2; }
-                Text {
-                    text: "ADVANCED";
-                    font-size: Tokens.font-caption;
-                    font-weight: 700;
-                    color: Palette.foreground.with-alpha(0.45);
-                }
-                Text { text: "Managed Addresses"; font-size: Tokens.font-caption; color: Palette.foreground.with-alpha(0.55); }
-                Text { text: root.a-address == "" ? "—" : root.a-address; font-size: Tokens.font-secondary; }
-                Text { text: "Managed Routes"; font-size: Tokens.font-caption; color: Palette.foreground.with-alpha(0.55); }
-                HorizontalLayout {
-                    padding: 0;
-                    Text { text: root.a-routes; font-size: Tokens.font-secondary; vertical-alignment: center; wrap: word-wrap; }
-                    Rectangle { horizontal-stretch: 1; }
-                    Button {
-                        text: "Copy";
-                        min-height: Tokens.ctrl-h;
-                        min-width: Tokens.btn-sm-w;
-                        clicked => { root.copy-address(root.a-routes); }
-                    }
-                }
-                Text { text: "DNS Configuration"; font-size: Tokens.font-caption; color: Palette.foreground.with-alpha(0.55); }
-                Text { text: root.a-dns; font-size: Tokens.font-secondary; }
-
-                CheckBox {
-                    text: "Network-managed addressing";
-                    checked <=> root.a-allow-managed;
-                    toggled => { root.advanced-flags-changed(); }
-                }
-                CheckBox {
-                    text: "Allow global addresses";
-                    checked <=> root.a-allow-global;
-                    toggled => { root.advanced-flags-changed(); }
-                }
-                CheckBox {
-                    text: "Use network as default route";
-                    checked <=> root.a-allow-default;
-                    toggled => { root.advanced-flags-changed(); }
-                }
-                CheckBox {
-                    text: "Use network DNS";
-                    checked <=> root.a-allow-dns;
-                    toggled => { root.advanced-flags-changed(); }
-                }
-            }
-        }
-
-        HorizontalLayout {
-            alignment: end;
-            Button {
-                text: "Close";
-                min-height: Tokens.ctrl-h;
-                min-width: Tokens.btn-min-w;
-                clicked => { root.request-close(); }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Preferences with side navigation (spec §6.6).
-// Pages: General · Notifications · Advanced · About. (Networks has its own
-// window; the spec's IA is preserved without duplicating it here.)
-// ---------------------------------------------------------------------------
-component NavRow inherits Rectangle {
-    in property <string> icon;
-    in property <string> label;
-    in property <bool> selected;
-    callback activated();
-
-    height: Tokens.nav-height;
-    border-radius: Tokens.radius-sm;
-    background: root.selected ? Palette.alternate-background : (ta.has-hover ? Palette.alternate-background.with-alpha(0.5) : transparent);
-
-    ta := TouchArea {
-        clicked => { root.activated(); }
-    }
-
-    HorizontalLayout {
-        padding-left: Tokens.sp-3;
-        padding-right: Tokens.sp-3;
-        spacing: Tokens.sp-2;
-        Text {
-            text: root.icon;
-            font-size: Tokens.font-body;
-            vertical-alignment: center;
-        }
-        Text {
-            text: root.label;
-            font-size: Tokens.font-small;
-            font-weight: root.selected ? 700 : 400;
-            vertical-alignment: center;
-            color: Palette.foreground;
-        }
-    }
-}
-
-export component PreferencesWindow inherits Window {
-    title: "Preferences";
-    icon: @image-url("assets/app-icon-gold.png");
-    width: Tokens.win-w;
-    height: Tokens.win-prefs-h;
-
-    // 0 General · 1 Notifications · 2 Advanced · 3 Diagnostics · 4 About
-    in-out property <int> current-page: 0;
-
-    in-out property <bool> p-start-with-system;
-    in-out property <bool> p-start-background;
-    in-out property <bool> p-show-tray;
-    in-out property <bool> p-notify-status;
+    // Preferences State
+    in-out property <int> prefs-page: 0;
+    in-out property <bool> p-start-with-system: false;
+    in-out property <bool> p-start-background: false;
+    in-out property <bool> p-show-tray: true;
+    in-out property <bool> p-notify-status: true;
     in-out property <string> adv-endpoint: "…";
     in-out property <string> adv-service: "…";
-    in-out property <string> about-version: "";
     in-out property <string> about-node-id: "";
     in-out property <[PeerInfo]> diag-peers;
 
+    // Callbacks
+    callback open-join();
+    callback close-join();
+    callback request-join(string);
+    callback open-details(string);
+    callback open-advanced();
+    callback back-to-main();
+    callback back-to-details();
+    callback open-prefs();
+    callback open-about();
+    callback retry();
+    callback copy-text(string);
+    callback leave-network(string);
+    callback disconnect-current();
+    callback advanced-flags-changed();
     callback prefs-changed();
-    callback request-close();
 
-    HorizontalLayout {
-        padding: Tokens.sp-3;
+    // Root Key Listener for ESC
+    FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                if (root.show-join-modal) {
+                    root.show-join-modal = false;
+                    return accept;
+                }
+                if (root.current-view == "advanced") {
+                    root.current-view = "details";
+                    return accept;
+                }
+                if (root.current-view != "main") {
+                    root.current-view = "main";
+                    return accept;
+                }
+            }
+            reject
+        }
+    }
+
+    // Main Layout
+    VerticalLayout {
+        padding: Tokens.sp-4;
         spacing: Tokens.sp-3;
 
-        // --- side navigation ---
-        VerticalLayout {
-            width: Tokens.nav-width;
-            spacing: Tokens.sp-1;
-            NavRow { icon: "⚙"; label: "General"; selected: root.current-page == 0; activated => { root.current-page = 0; } }
-            NavRow { icon: "🔔"; label: "Notifications"; selected: root.current-page == 1; activated => { root.current-page = 1; } }
-            NavRow { icon: "🛠"; label: "Advanced"; selected: root.current-page == 2; activated => { root.current-page = 2; } }
-            NavRow { icon: "📊"; label: "Diagnostics"; selected: root.current-page == 3; activated => { root.current-page = 3; } }
-            NavRow { icon: "ℹ"; label: "About"; selected: root.current-page == 4; activated => { root.current-page = 4; } }
-            Rectangle { vertical-stretch: 1; }
+        // Top Navigation & Actions Bar
+        HorizontalLayout {
+            spacing: Tokens.sp-2;
+            min-height: Tokens.ctrl-h;
+
+            if root.current-view == "main" : HorizontalLayout {
+                spacing: Tokens.sp-2;
+                horizontal-stretch: 1;
+                StatusPill {
+                    emoji: root.status-emoji;
+                    label: root.status-line;
+                    kind: root.status-kind;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                if !root.service-ok : Button {
+                    text: "Retry";
+                    min-height: Tokens.ctrl-h;
+                    clicked => { root.retry(); }
+                }
+                Rectangle {
+                    width: Tokens.btn-sm-w;
+                    height: Tokens.ctrl-h;
+                    border-radius: Tokens.radius-sm;
+                    background: join-btn-ta.has-hover
+                        ? Palette.accent-background.brighter(0.15)
+                        : Palette.accent-background;
+
+                    join-btn-ta := TouchArea {
+                        clicked => {
+                            root.join-error-text = "";
+                            root.join-input = "";
+                            root.show-join-modal = true;
+                        }
+                    }
+
+                    Text {
+                        text: "+ Join";
+                        color: Palette.accent-foreground;
+                        font-size: Tokens.font-small;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                // Preferences icon button
+                Rectangle {
+                    width: Tokens.ctrl-h;
+                    height: Tokens.ctrl-h;
+                    border-radius: Tokens.radius-sm;
+                    background: pref-ta.has-hover ? Palette.alternate-background : transparent;
+                    pref-ta := TouchArea {
+                        clicked => { root.current-view = "preferences"; }
+                    }
+                    Text {
+                        text: "⚙";
+                        font-size: Tokens.font-section;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        color: Palette.foreground;
+                    }
+                }
+                // About icon button
+                Rectangle {
+                    width: Tokens.ctrl-h;
+                    height: Tokens.ctrl-h;
+                    border-radius: Tokens.radius-sm;
+                    background: about-ta.has-hover ? Palette.alternate-background : transparent;
+                    about-ta := TouchArea {
+                        clicked => { root.current-view = "about"; }
+                    }
+                    Text {
+                        text: "ℹ";
+                        font-size: Tokens.font-section;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        color: Palette.foreground;
+                    }
+                }
+            }
+
+            if root.current-view != "main" : HorizontalLayout {
+                spacing: Tokens.sp-3;
+                horizontal-stretch: 1;
+                Button {
+                    text: "← Back";
+                    min-height: Tokens.ctrl-h;
+                    min-width: 80px;
+                    clicked => {
+                        if (root.current-view == "advanced") {
+                            root.current-view = "details";
+                        } else {
+                            root.current-view = "main";
+                        }
+                    }
+                }
+                Text {
+                    text: root.current-view == "details" ? root.d-name
+                        : root.current-view == "advanced" ? "Advanced Configuration"
+                        : root.current-view == "preferences" ? "Preferences"
+                        : "About ZGALAXY";
+                    font-size: Tokens.font-section;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    color: Palette.foreground;
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
         }
 
         Rectangle {
-            width: 1px;
-            background: Palette.foreground.with-alpha(0.1);
+            height: 1px;
+            background: Palette.foreground.with-alpha(0.08);
         }
 
-        // --- page content ---
-        VerticalLayout {
+        // ===================================================================
+        // View 1: Main Networks List View
+        // ===================================================================
+        if root.current-view == "main" : VerticalLayout {
+            vertical-stretch: 1;
             spacing: Tokens.sp-3;
 
-            if root.current-page == 0 : VerticalLayout {
-                spacing: Tokens.sp-3;
-                Text {
-                    text: "General";
-                    font-size: Tokens.font-section;
-                    font-weight: 700;
-                }
-                CheckBox {
-                    text: "Start with system";
-                    checked <=> root.p-start-with-system;
-                    toggled => { root.prefs-changed(); }
-                }
-                CheckBox {
-                    text: "Start in background";
-                    checked <=> root.p-start-background;
-                    toggled => { root.prefs-changed(); }
-                }
-                CheckBox {
-                    text: "Show tray icon";
-                    checked <=> root.p-show-tray;
-                    toggled => { root.prefs-changed(); }
-                }
-                Rectangle { vertical-stretch: 1; }
-            }
-
-            if root.current-page == 1 : VerticalLayout {
-                spacing: Tokens.sp-3;
-                Text {
-                    text: "Notifications";
-                    font-size: Tokens.font-section;
-                    font-weight: 700;
-                }
-                CheckBox {
-                    text: "Connection status notifications";
-                    checked <=> root.p-notify-status;
-                    toggled => { root.prefs-changed(); }
-                }
-                Rectangle { vertical-stretch: 1; }
-            }
-
-            if root.current-page == 2 : VerticalLayout {
-                spacing: Tokens.sp-3;
-                Text {
-                    text: "Advanced";
-                    font-size: Tokens.font-section;
-                    font-weight: 700;
-                }
-                HorizontalLayout {
-                    padding: 0;
-                    Text { text: "Daemon endpoint"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); vertical-alignment: center; }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text { text: root.adv-endpoint; font-size: Tokens.font-secondary; vertical-alignment: center; }
-                }
-                HorizontalLayout {
-                    padding: 0;
-                    Text { text: "Service"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); vertical-alignment: center; }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text { text: root.adv-service; font-size: Tokens.font-secondary; vertical-alignment: center; }
-                }
-                Rectangle { vertical-stretch: 1; }
-            }
-
-            if root.current-page == 3 : VerticalLayout {
+            if root.networks.length == 0 && root.service-ok : VerticalLayout {
+                vertical-stretch: 1;
+                alignment: center;
                 spacing: Tokens.sp-2;
+                Image {
+                    source: @image-url("assets/app-icon-gold.png");
+                    width: 64px;
+                    height: 64px;
+                    horizontal-alignment: center;
+                }
                 Text {
-                    text: "Diagnostics";
+                    text: "No networks yet";
                     font-size: Tokens.font-section;
-                    font-weight: 700;
-                }
-                HorizontalLayout {
-                    padding: 0;
-                    Text { text: "Daemon"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); vertical-alignment: center; }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text { text: root.adv-endpoint; font-size: Tokens.font-secondary; vertical-alignment: center; }
-                }
-                HorizontalLayout {
-                    padding: 0;
-                    Text { text: "Service"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); vertical-alignment: center; }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text { text: root.adv-service; font-size: Tokens.font-secondary; vertical-alignment: center; }
-                }
-                HorizontalLayout {
-                    padding: 0;
-                    Text { text: "Node"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); vertical-alignment: center; }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text { text: root.about-node-id; font-size: Tokens.font-secondary; vertical-alignment: center; }
-                }
-                Text {
-                    text: "Peers";
-                    font-size: Tokens.font-body;
                     font-weight: 600;
+                    horizontal-alignment: center;
+                    color: Palette.foreground;
                 }
-                if root.diag-peers.length == 0 : SecondaryText {
-                    text: "No peers connected";
-                    font-size: Tokens.font-secondary;
+                SecondaryText {
+                    text: "Join a network to get started";
+                    font-size: Tokens.font-small;
+                    horizontal-alignment: center;
+                }
+                Button {
+                    text: "Join a Network…";
+                    min-height: Tokens.ctrl-h;
+                    min-width: Tokens.btn-min-w;
+                    clicked => {
+                        root.join-error-text = "";
+                        root.join-input = "";
+                        root.show-join-modal = true;
+                    }
+                }
+            }
+
+            if root.networks.length > 0 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: Tokens.sp-2;
+                SectionHeader {
+                    title: "YOUR NETWORKS";
+                    count: root.networks.length;
                 }
                 ScrollView {
                     vertical-stretch: 1;
                     VerticalLayout {
+                        spacing: Tokens.sp-2;
+                        for net in root.networks : NetworkCard {
+                            c-name: net.name;
+                            c-nwid: net.nwid;
+                            c-address: net.address == "no address yet" ? "" : net.address;
+                            c-state-label: net.state-label;
+                            c-state-emoji: net.state-emoji;
+                            c-state-kind: net.state-kind;
+                            c-ready: net.ready;
+                            card-clicked => { root.open-details(net.nwid); }
+                            ctx-open => { root.open-details(net.nwid); }
+                            ctx-copy-address => { root.copy-text(net.address); }
+                            ctx-copy-nwid => { root.copy-text(net.nwid); }
+                            ctx-disconnect => { root.leave-network(net.nwid); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===================================================================
+        // View 2: Network Details View
+        // ===================================================================
+        if root.current-view == "details" : VerticalLayout {
+            vertical-stretch: 1;
+            padding-top: Tokens.sp-3;
+            spacing: Tokens.sp-4;
+
+            HorizontalLayout {
+                alignment: center;
+                StatusPill {
+                    emoji: root.d-state-emoji;
+                    label: root.d-state-label;
+                    kind: root.d-state-kind;
+                }
+            }
+
+            Text {
+                text: root.d-name;
+                font-size: Tokens.font-title;
+                font-weight: 700;
+                horizontal-alignment: center;
+                color: Palette.foreground;
+            }
+
+            Rectangle {
+                border-radius: Tokens.radius;
+                background: Palette.alternate-background;
+                border-width: 1px;
+                border-color: Palette.foreground.with-alpha(0.08);
+
+                VerticalLayout {
+                    padding: Tokens.sp-4;
+                    spacing: Tokens.sp-3;
+
+                    VerticalLayout {
                         spacing: Tokens.sp-1;
-                        for p[i] in root.diag-peers : HorizontalLayout {
+                        SecondaryText {
+                            text: "Your IP Address";
+                            font-size: Tokens.font-secondary;
+                        }
+                        HorizontalLayout {
                             padding: 0;
                             spacing: Tokens.sp-2;
                             Text {
-                                text: (p.active ? "● " : "○ ") + p.address;
-                                font-size: Tokens.font-secondary;
+                                text: root.d-address != "" ? root.d-address : "Waiting for IP assignment…";
+                                font-size: Tokens.font-emphasis;
                                 vertical-alignment: center;
-                                color: p.active ? Palette.foreground : Palette.foreground.with-alpha(0.5);
                             }
                             Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: "Copy";
+                                min-height: Tokens.ctrl-h;
+                                min-width: Tokens.btn-sm-w;
+                                enabled: root.d-address != "";
+                                clicked => { root.copy-text(root.d-address); }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: Palette.foreground.with-alpha(0.1);
+                    }
+
+                    VerticalLayout {
+                        spacing: Tokens.sp-1;
+                        SecondaryText {
+                            text: "Network ID";
+                            font-size: Tokens.font-secondary;
+                        }
+                        HorizontalLayout {
+                            padding: 0;
+                            spacing: Tokens.sp-2;
                             Text {
-                                text: p.role;
-                                font-size: Tokens.font-caption;
-                                color: Palette.foreground.with-alpha(0.55);
+                                text: root.d-nwid;
+                                font-size: Tokens.font-body;
                                 vertical-alignment: center;
                             }
-                            Text {
-                                text: p.latency;
-                                font-size: Tokens.font-secondary;
-                                vertical-alignment: center;
-                                color: Palette.foreground.with-alpha(0.75);
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: "Copy";
+                                min-height: Tokens.ctrl-h;
+                                min-width: Tokens.btn-sm-w;
+                                clicked => { root.copy-text(root.d-nwid); }
                             }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: Palette.foreground.with-alpha(0.1);
+                    }
+
+                    VerticalLayout {
+                        spacing: Tokens.sp-1;
+                        SecondaryText {
+                            text: "Connection State";
+                            font-size: Tokens.font-secondary;
+                        }
+                        Text {
+                            text: root.d-connected ? "● Connected & Ready" : "○ Waiting for authorization / offline";
+                            font-size: Tokens.font-body;
+                            color: root.d-connected ? Tokens.success : Palette.foreground.with-alpha(0.55);
                         }
                     }
                 }
             }
 
-            if root.current-page == 4 : VerticalLayout {
-                spacing: Tokens.sp-2;
-                Text {
-                    text: "About";
-                    font-size: Tokens.font-section;
-                    font-weight: 700;
+            Rectangle { vertical-stretch: 1; }
+
+            HorizontalLayout {
+                spacing: Tokens.sp-3;
+                alignment: end;
+                Button {
+                    text: "Advanced Settings…";
+                    min-height: Tokens.ctrl-h;
+                    min-width: Tokens.btn-min-w;
+                    clicked => { root.open-advanced(); }
                 }
-                Text { text: "ZGALAXY Desktop Client"; font-size: Tokens.font-body; font-weight: 600; }
-                SecondaryText { text: "Version " + root.about-version; font-size: Tokens.font-secondary; }
-                Text { text: "Node ID: " + root.about-node-id; font-size: Tokens.font-secondary; }
-                SecondaryText { text: "AGPL-3.0-or-later"; font-size: Tokens.font-caption; }
-                Rectangle { vertical-stretch: 1; }
-                HorizontalLayout {
-                    alignment: end;
-                    Button {
-                        text: "Close";
-                        min-height: Tokens.ctrl-h;
-                        min-width: Tokens.btn-min-w;
-                        clicked => { root.request-close(); }
+                Button {
+                    text: "Disconnect";
+                    min-height: Tokens.ctrl-h;
+                    min-width: Tokens.btn-min-w;
+                    clicked => { root.disconnect-current(); }
+                }
+            }
+        }
+
+        // ===================================================================
+        // View 3: Advanced Configuration View
+        // ===================================================================
+        if root.current-view == "advanced" : VerticalLayout {
+            vertical-stretch: 1;
+            spacing: Tokens.sp-2;
+
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    spacing: Tokens.sp-3;
+                    padding-right: Tokens.sp-2;
+
+                    SectionHeader { title: "NETWORK INFO"; count: ""; }
+
+                    HorizontalLayout {
+                        padding: 0;
+                        Text { text: "Network ID"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.a-nwid; font-size: Tokens.font-secondary; }
+                    }
+
+                    HorizontalLayout {
+                        padding: 0;
+                        Text { text: "Device Name"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.a-device != "" ? root.a-device : "zt-dev"; font-size: Tokens.font-secondary; }
+                    }
+
+                    HorizontalLayout {
+                        padding: 0;
+                        Text { text: "MAC Address"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.a-mac; font-size: Tokens.font-secondary; }
+                    }
+
+                    HorizontalLayout {
+                        padding: 0;
+                        Text { text: "Type"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.a-type; font-size: Tokens.font-secondary; }
+                    }
+
+                    SectionHeader { title: "ADDRESSES & ROUTES"; count: ""; }
+
+                    HorizontalLayout {
+                        padding: 0;
+                        Text { text: "Managed IP"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.a-address != "" ? root.a-address : "—"; font-size: Tokens.font-secondary; }
+                    }
+
+                    HorizontalLayout {
+                        padding: 0;
+                        Text { text: "Routes"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.a-routes; font-size: Tokens.font-secondary; }
+                    }
+
+                    SectionHeader { title: "POLICIES & PERMISSIONS"; count: ""; }
+
+                    CheckBox {
+                        text: "Allow Managed IPs";
+                        checked <=> root.a-allow-managed;
+                        toggled => { root.advanced-flags-changed(); }
+                    }
+                    CheckBox {
+                        text: "Allow Global IPs";
+                        checked <=> root.a-allow-global;
+                        toggled => { root.advanced-flags-changed(); }
+                    }
+                    CheckBox {
+                        text: "Allow Default Route Override";
+                        checked <=> root.a-allow-default;
+                        toggled => { root.advanced-flags-changed(); }
+                    }
+                    CheckBox {
+                        text: "Allow DNS Server Configuration";
+                        checked <=> root.a-allow-dns;
+                        toggled => { root.advanced-flags-changed(); }
                     }
                 }
             }
         }
+
+        // ===================================================================
+        // View 4: Preferences View
+        // ===================================================================
+        if root.current-view == "preferences" : HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: Tokens.sp-3;
+
+            // Side tabs
+            VerticalLayout {
+                width: Tokens.nav-width;
+                spacing: Tokens.sp-1;
+                NavRow { icon: "⚙"; label: "General"; selected: root.prefs-page == 0; activated => { root.prefs-page = 0; } }
+                NavRow { icon: "🔔"; label: "Notifications"; selected: root.prefs-page == 1; activated => { root.prefs-page = 1; } }
+                NavRow { icon: "🛠"; label: "Advanced"; selected: root.prefs-page == 2; activated => { root.prefs-page = 2; } }
+                NavRow { icon: "📊"; label: "Diagnostics"; selected: root.prefs-page == 3; activated => { root.prefs-page = 3; } }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            Rectangle {
+                width: 1px;
+                background: Palette.foreground.with-alpha(0.1);
+            }
+
+            // Tab contents
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: Tokens.sp-3;
+
+                if root.prefs-page == 0 : VerticalLayout {
+                    spacing: Tokens.sp-3;
+                    Text { text: "General Settings"; font-size: Tokens.font-section; font-weight: 700; }
+                    CheckBox {
+                        text: "Start with system";
+                        checked <=> root.p-start-with-system;
+                        toggled => { root.prefs-changed(); }
+                    }
+                    CheckBox {
+                        text: "Start minimized in background";
+                        checked <=> root.p-start-background;
+                        toggled => { root.prefs-changed(); }
+                    }
+                    CheckBox {
+                        text: "Show tray icon next to clock";
+                        checked <=> root.p-show-tray;
+                        toggled => { root.prefs-changed(); }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+
+                if root.prefs-page == 1 : VerticalLayout {
+                    spacing: Tokens.sp-3;
+                    Text { text: "Notification Settings"; font-size: Tokens.font-section; font-weight: 700; }
+                    CheckBox {
+                        text: "Show status change notifications";
+                        checked <=> root.p-notify-status;
+                        toggled => { root.prefs-changed(); }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+
+                if root.prefs-page == 2 : VerticalLayout {
+                    spacing: Tokens.sp-3;
+                    Text { text: "Service Details"; font-size: Tokens.font-section; font-weight: 700; }
+                    HorizontalLayout {
+                        Text { text: "Local Daemon"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.adv-endpoint; font-size: Tokens.font-secondary; }
+                    }
+                    HorizontalLayout {
+                        Text { text: "Service Health"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.adv-service; font-size: Tokens.font-secondary; }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+
+                if root.prefs-page == 3 : VerticalLayout {
+                    spacing: Tokens.sp-2;
+                    Text { text: "Connected Peers"; font-size: Tokens.font-section; font-weight: 700; }
+                    if root.diag-peers.length == 0 : SecondaryText {
+                        text: "No active peers";
+                        font-size: Tokens.font-secondary;
+                    }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            spacing: Tokens.sp-1;
+                            for p in root.diag-peers : HorizontalLayout {
+                                Text {
+                                    text: (p.active ? "● " : "○ ") + p.address;
+                                    font-size: Tokens.font-secondary;
+                                    color: p.active ? Palette.foreground : Palette.foreground.with-alpha(0.5);
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                Text { text: p.role; font-size: Tokens.font-caption; color: Palette.foreground.with-alpha(0.55); }
+                                Text { text: "  " + p.latency; font-size: Tokens.font-secondary; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===================================================================
+        // View 5: About View
+        // ===================================================================
+        if root.current-view == "about" : VerticalLayout {
+            vertical-stretch: 1;
+            alignment: center;
+            spacing: Tokens.sp-2;
+
+            Image {
+                source: @image-url("assets/app-icon-gold.png");
+                width: 64px;
+                height: 64px;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: "ZGALAXY";
+                font-size: 26px;
+                font-weight: 800;
+                horizontal-alignment: center;
+            }
+            SecondaryText {
+                text: "Desktop client · v" + root.app-version;
+                font-size: Tokens.font-secondary;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: "Node ID: " + root.about-node-id;
+                font-size: Tokens.font-secondary;
+                horizontal-alignment: center;
+            }
+            SecondaryText {
+                text: "Pure Rust Next-Gen P2P Mesh Virtual Network";
+                font-size: Tokens.font-caption;
+                horizontal-alignment: center;
+            }
+            Rectangle { vertical-stretch: 1; }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: Palette.foreground.with-alpha(0.08);
+        }
+
+        // Footer Bar
+        HorizontalLayout {
+            spacing: Tokens.sp-2;
+            Text {
+                text: "Node " + root.node-address;
+                font-size: Tokens.font-secondary;
+                color: Palette.accent-background;
+                vertical-alignment: center;
+            }
+            SecondaryText {
+                text: "· " + root.service-state;
+                font-size: Tokens.font-secondary;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            SecondaryText {
+                text: "v" + root.app-version;
+                font-size: Tokens.font-secondary;
+                vertical-alignment: center;
+            }
+        }
     }
-}
 
-// ---------------------------------------------------------------------------
-// About window (tray entry point, spec §9.3)
-// ---------------------------------------------------------------------------
-export component AboutWindow inherits Window {
-    title: "About";
-    icon: @image-url("assets/app-icon-gold.png");
-    width: Tokens.win-w;
-    height: Tokens.win-about-h;
+    // =======================================================================
+    // MODAL OVERLAY: Join Network Dialog
+    // =======================================================================
+    if root.show-join-modal : Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #00000088;
 
-    in-out property <string> about-version: "";
-    in-out property <string> about-node-id: "";
+        // Click on dark backdrop to dismiss
+        modal-backdrop-ta := TouchArea {
+            clicked => {
+                root.show-join-modal = false;
+            }
+        }
 
-    callback request-close();
+        // Dialog Card
+        Rectangle {
+            width: Tokens.win-w - 40px;
+            height: 210px;
+            border-radius: Tokens.radius;
+            background: Palette.background;
+            border-width: 1px;
+            border-color: Palette.foreground.with-alpha(0.15);
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000066;
 
-    VerticalBox {
-        padding: Tokens.sp-4;
-        spacing: Tokens.sp-2;
-        alignment: center;
+            VerticalBox {
+                padding: Tokens.sp-4;
+                spacing: Tokens.sp-3;
 
-        Image {
-            source: @image-url("assets/app-icon-gold.png");
-            width: 64px;
-            height: 64px;
-            horizontal-alignment: center;
-        }
-        Text {
-            text: "ZGALAXY";
-            font-size: 26px;
-            font-weight: 800;
-            horizontal-alignment: center;
-        }
-        SecondaryText {
-            text: "Desktop client · v" + root.about-version;
-            font-size: Tokens.font-secondary;
-            horizontal-alignment: center;
-        }
-        Text {
-            text: "Node ID: " + root.about-node-id;
-            font-size: Tokens.font-secondary;
-            horizontal-alignment: center;
-        }
-        SecondaryText {
-            text: "AGPL-3.0-or-later";
-            font-size: Tokens.font-caption;
-            horizontal-alignment: center;
-        }
-        Button {
-            text: "Close";
-            min-height: Tokens.ctrl-h;
-            min-width: Tokens.btn-min-w;
-            clicked => { root.request-close(); }
+                HorizontalLayout {
+                    Text {
+                        text: "Join a Network";
+                        font-size: Tokens.font-section;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Rectangle {
+                        width: 24px;
+                        height: 24px;
+                        border-radius: 12px;
+                        background: close-modal-ta.has-hover ? Palette.alternate-background : transparent;
+                        close-modal-ta := TouchArea {
+                            clicked => { root.show-join-modal = false; }
+                        }
+                        Text {
+                            text: "✕";
+                            font-size: Tokens.font-secondary;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                joinModalField := LineEdit {
+                    placeholder-text: "Enter 16-hex network ID (e.g. ef313fb5c9bc842c)";
+                    text <=> root.join-input;
+                    enabled: !root.join-busy;
+                    min-height: Tokens.ctrl-h;
+                    accepted => {
+                        if (root.join-input != "") {
+                            root.request-join(root.join-input);
+                        }
+                    }
+                }
+
+                if root.join-error-text != "" : Text {
+                    text: root.join-error-text;
+                    color: Tokens.error;
+                    font-size: Tokens.font-secondary;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: Tokens.sp-2;
+                    Button {
+                        text: "Cancel";
+                        min-height: Tokens.ctrl-h;
+                        min-width: Tokens.btn-min-w;
+                        clicked => { root.show-join-modal = false; }
+                    }
+                    Button {
+                        text: "Join Network";
+                        min-height: Tokens.ctrl-h;
+                        min-width: Tokens.btn-min-w;
+                        enabled: !root.join-busy && root.join-input != "";
+                        clicked => {
+                            root.request-join(root.join-input);
+                        }
+                    }
+                }
+            }
         }
     }
 }
