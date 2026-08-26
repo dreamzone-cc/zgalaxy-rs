@@ -171,6 +171,7 @@ impl UdpTransport {
                                     if let Ok(config_val) = serde_json::from_slice::<serde_json::Value>(&packet.payload) {
                                         if let Some(nwid) = config_val.get("nwid").and_then(|v| v.as_str()) {
                                             let authorized = config_val.get("authorized").and_then(|v| v.as_bool()).unwrap_or(false);
+                                            let name_opt = config_val.get("name").and_then(|v| v.as_str());
                                             let ips: Vec<String> = config_val.get("ipAssignments")
                                                 .and_then(|v| v.as_array())
                                                 .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
@@ -179,12 +180,18 @@ impl UdpTransport {
                                             let nm_guard = network_manager_lock.read().await;
                                             if let Some(ref nm) = *nm_guard {
                                                 if let Some(mut net) = nm.get(nwid).await {
+                                                    if let Some(name) = name_opt {
+                                                        if !name.trim().is_empty() {
+                                                            net.name = name.trim().to_string();
+                                                        }
+                                                    }
                                                     net.status = if authorized { crate::network::NetworkStatus::Ok } else { crate::network::NetworkStatus::AccessDenied };
                                                     if !ips.is_empty() {
                                                         net.assigned_addresses = ips;
                                                     }
+                                                    let updated_name = net.name.clone();
                                                     nm.update_network(net).await;
-                                                    info!("[ZGALAXY CLIENT NETWORK] Updated network {} (authorized: {})", nwid, authorized);
+                                                    info!("[ZGALAXY CLIENT NETWORK] Updated network {} (name: {}, authorized: {})", nwid, updated_name, authorized);
                                                 }
                                             }
                                         }

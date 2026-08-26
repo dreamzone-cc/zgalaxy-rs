@@ -520,3 +520,45 @@ async fn test_matrix_membership_token_lifecycle() {
         .unwrap();
     assert!(controller.issue_membership_token(&nwid, "a1b2c3d4e5").await.is_none());
 }
+
+// ============================================================================
+// 10. Network Rename & Metadata Propagation Matrix
+// ============================================================================
+
+#[tokio::test]
+async fn test_matrix_network_rename_propagation() {
+    let temp_dir = tempdir().unwrap();
+    let id = Identity::generate();
+    let controller = EmbeddedController::new(id.clone(), temp_dir.path().to_path_buf());
+    controller.init().await.unwrap();
+
+    // 1) Create a network with initial name
+    let net = controller
+        .save_network(serde_json::json!({ "name": "InitialOfficeNet" }))
+        .await
+        .unwrap();
+    assert_eq!(net.name, "InitialOfficeNet");
+    let nwid = net.id.clone();
+
+    // 2) Partial update from ZTNET renaming the network
+    let renamed = controller
+        .save_network(serde_json::json!({ "id": nwid.clone(), "name": "GlobalGamingLAN" }))
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "GlobalGamingLAN");
+    assert_eq!(renamed.id, nwid);
+
+    // 3) Verify network manager receives the renamed network
+    let nm = NetworkManager::new();
+    let mut local_net = nm.join(&nwid).await.unwrap();
+    assert_eq!(local_net.name, format!("ZT-{}", nwid));
+
+    // Simulate NetworkConfig arrival with updated name
+    local_net.name = renamed.name.clone();
+    local_net.status = zgalaxy_rs::network::NetworkStatus::Ok;
+    nm.update_network(local_net).await;
+
+    let retrieved = nm.get(&nwid).await.unwrap();
+    assert_eq!(retrieved.name, "GlobalGamingLAN");
+}
+

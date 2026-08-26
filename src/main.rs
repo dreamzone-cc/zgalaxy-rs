@@ -529,6 +529,7 @@ async fn main() -> Result<()> {
                                         let authorized = config.get("authorized")
                                             .and_then(|v| v.as_bool())
                                             .unwrap_or(false);
+                                        let name_opt = config.get("name").and_then(|v| v.as_str());
                                         let ips: Vec<String> = config
                                             .get("ipAssignments")
                                             .and_then(|v| v.as_array())
@@ -539,6 +540,11 @@ async fn main() -> Result<()> {
                                             })
                                             .unwrap_or_default();
                                         if let Some(mut net) = nm_for_events.get(&nwid).await {
+                                            if let Some(name) = name_opt {
+                                                if !name.trim().is_empty() {
+                                                    net.name = name.trim().to_string();
+                                                }
+                                            }
                                             net.membership_token = config
                                                 .get("membershipToken")
                                                 .and_then(|v| v.as_str())
@@ -551,8 +557,9 @@ async fn main() -> Result<()> {
                                             if !ips.is_empty() {
                                                 net.assigned_addresses = ips;
                                             }
+                                            let updated_name = net.name.clone();
                                             nm_for_events.update_network(net.clone()).await;
-                                            info!("[ZGALAXY QUIC] Network {} updated (authorized: {})", nwid, authorized);
+                                            info!("[ZGALAXY QUIC] Network {} updated (name: {}, authorized: {})", nwid, updated_name, authorized);
 
                                             // Apply managed address + routes to the host
                                             // adapter once per network (idempotent set).
