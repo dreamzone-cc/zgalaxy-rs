@@ -255,6 +255,26 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Spawn Dynamic Sync Provider Background Worker if configured
+    if let Some(sync_cfg) = local_config.sync_provider.clone() {
+        if sync_cfg.enabled {
+            let sync_client = zgalaxy_rs::SyncProviderClient::new(sync_cfg.clone());
+            let sync_working_dir = working_dir.clone();
+            let sync_identity = identity.clone();
+            let sync_pm = peer_manager.clone();
+            tokio::spawn(async move {
+                info!("[ZGALAXY SYNC] Starting background sync worker for {}", sync_cfg.server_url);
+                let interval = std::time::Duration::from_secs(sync_cfg.sync_interval_minutes.max(1) * 60);
+                loop {
+                    if let Err(e) = sync_client.execute_sync(&sync_working_dir, &sync_identity, Some(&sync_pm)).await {
+                        warn!("[ZGALAXY SYNC WORKER] Sync attempt failed: {:?}", e);
+                    }
+                    tokio::time::sleep(interval).await;
+                }
+            });
+        }
+    }
+
     // Transport selection: "quic" (primary, per architecture constraint) or
     // "udp" (legacy path, kept until the QUIC data plane is feature-complete).
     let transport_mode = local_config

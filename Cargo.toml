@@ -35,6 +35,7 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 # Network & Protocol
 hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
 etherparse = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # QUIC Transport (primary transport layer — replaces raw UDP)
 quinn = "0.11"

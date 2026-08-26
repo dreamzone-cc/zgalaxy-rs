@@ -28,6 +28,7 @@ pub mod peer;
 pub mod quic;
 pub mod resolver;
 pub mod route_manager;
+pub mod sync_provider;
 pub mod transport;
 pub mod tun;
 pub mod world;
@@ -44,6 +45,7 @@ pub use nat::NatTraversalEngine;
 pub use route_manager::RouteManager;
 pub use transport::UdpTransport;
 pub use l2_switch::L2Switch;
+pub use sync_provider::{SyncProviderClient, SyncProviderConfig, SyncSummary, SyncStatus};
 
 pub const DEFAULT_PORT: u16 = 9993;
 pub const DEFAULT_CONTROL_PORT: u16 = 9993;

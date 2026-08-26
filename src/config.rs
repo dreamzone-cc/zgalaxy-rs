@@ -20,6 +20,8 @@ pub struct LocalConfig {
     #[serde(default)]
     pub auto_join_networks: Vec<String>,
     #[serde(default)]
+    pub sync_provider: Option<crate::sync_provider::SyncProviderConfig>,
+    #[serde(default)]
     pub physical: HashMap<String, Value>,
     #[serde(default)]
     pub settings: HashMap<String, Value>,
@@ -41,6 +43,7 @@ impl Default for LocalConfig {
             interface_blacklist: Vec::new(),
             interface_whitelist: Vec::new(),
             auto_join_networks: Vec::new(),
+            sync_provider: None,
             physical: HashMap::new(),
             settings: HashMap::new(),
         }
