@@ -155,6 +155,13 @@ fn main() {
     main_w.set_p_start_background(config.start_in_background);
     main_w.set_p_show_tray(config.show_tray_icon);
     main_w.set_p_notify_status(config.notify_status);
+    main_w.set_sync_domain(config.sync_domain.clone().into());
+    main_w.set_sync_token(config.sync_token.clone().into());
+    if !config.sync_domain.is_empty() && !config.sync_token.is_empty() {
+        main_w.set_sync_status_label("Configured (Ready to sync)".into());
+        main_w.set_sync_status_emoji("🟢".into());
+        main_w.set_sync_status_kind("success".into());
+    }
 
     let client = Arc::new(DaemonClient::from_env());
     main_w.set_adv_endpoint(client.endpoint().into());
@@ -318,23 +325,25 @@ fn main() {
         app::commands::update_flags(Arc::clone(&client_flags), nwid, body, Some(Arc::clone(&adv_flag)));
     });
 
-    let cfg_store = Arc::new(Mutex::new(config));
+    let cfg_store = Arc::new(Mutex::new(config.clone()));
     let pw = main_w.as_weak();
     let cfg_ref = Arc::clone(&cfg_store);
     main_w.on_prefs_changed(move || {
         let Some(p) = pw.upgrade() else { return };
-        let c = Config {
-            start_with_system: p.get_p_start_with_system(),
-            start_in_background: p.get_p_start_background(),
-            show_tray_icon: p.get_p_show_tray(),
-            notify_status: p.get_p_notify_status(),
-        };
-        c.save();
-        platform::set_autostart(c.start_with_system);
-        *cfg_ref.lock().unwrap() = c;
+        let mut cur = cfg_ref.lock().unwrap().clone();
+        cur.start_with_system = p.get_p_start_with_system();
+        cur.start_in_background = p.get_p_start_background();
+        cur.show_tray_icon = p.get_p_show_tray();
+        cur.notify_status = p.get_p_notify_status();
+        cur.sync_domain = p.get_sync_domain().trim().to_string();
+        cur.sync_token = p.get_sync_token().trim().to_string();
+        cur.save();
+        platform::set_autostart(cur.start_with_system);
+        *cfg_ref.lock().unwrap() = cur;
     });
 
     let mw_sync = main_w.as_weak();
+    let cfg_sync_ref = Arc::clone(&cfg_store);
     main_w.on_sync_now(move |domain, token| {
         let domain = domain.trim().to_string();
         let token = token.trim().to_string();
@@ -349,6 +358,13 @@ fn main() {
             ui.set_sync_status_label("Connecting & verifying token…".into());
             ui.set_sync_status_emoji("🟡".into());
             ui.set_sync_status_kind("warning".into());
+
+            // Save configured sync domain & token
+            let mut cur = cfg_sync_ref.lock().unwrap().clone();
+            cur.sync_domain = domain.clone();
+            cur.sync_token = token.clone();
+            cur.save();
+            *cfg_sync_ref.lock().unwrap() = cur;
         }
 
         let mw_cb = mw_sync.clone();
@@ -399,6 +415,7 @@ fn main() {
     });
 
     let mw_remove_sync = main_w.as_weak();
+    let cfg_remove_ref = Arc::clone(&cfg_store);
     main_w.on_remove_sync_provider(move || {
         if let Some(ui) = mw_remove_sync.upgrade() {
             ui.set_sync_domain("".into());
@@ -408,6 +425,12 @@ fn main() {
             ui.set_sync_status_kind("neutral".into());
             ui.set_sync_last_time("Never".into());
             ui.set_sync_topology_info("1 Planet · 0 Moons".into());
+
+            let mut cur = cfg_remove_ref.lock().unwrap().clone();
+            cur.sync_domain.clear();
+            cur.sync_token.clear();
+            cur.save();
+            *cfg_remove_ref.lock().unwrap() = cur;
         }
     });
 
