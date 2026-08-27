@@ -546,12 +546,14 @@ export component MainWindow inherits Window {
             if root.networks.length == 0 && root.service-ok : VerticalLayout {
                 vertical-stretch: 1;
                 alignment: center;
-                spacing: Tokens.sp-2;
-                Image {
-                    source: @image-url("assets/app-icon-gold.png");
-                    width: 64px;
-                    height: 64px;
-                    horizontal-alignment: center;
+                spacing: Tokens.sp-3;
+                HorizontalLayout {
+                    alignment: center;
+                    Image {
+                        source: @image-url("assets/app-icon-gold.png");
+                        width: 64px;
+                        height: 64px;
+                    }
                 }
                 Text {
                     text: "No networks yet";
@@ -565,14 +567,17 @@ export component MainWindow inherits Window {
                     font-size: Tokens.font-small;
                     horizontal-alignment: center;
                 }
-                Button {
-                    text: "Join a Network…";
-                    min-height: Tokens.ctrl-h;
-                    min-width: Tokens.btn-min-w;
-                    clicked => {
-                        root.join-error-text = "";
-                        root.join-input = "";
-                        root.show-join-modal = true;
+                HorizontalLayout {
+                    alignment: center;
+                    Button {
+                        text: "Join a Network…";
+                        min-height: Tokens.ctrl-h;
+                        min-width: Tokens.btn-min-w;
+                        clicked => {
+                            root.join-error-text = "";
+                            root.join-input = "";
+                            root.show-join-modal = true;
+                        }
                     }
                 }
             }
@@ -1166,35 +1171,52 @@ export component MainWindow inherits Window {
         if root.current-view == "about" : VerticalLayout {
             vertical-stretch: 1;
             alignment: center;
-            spacing: Tokens.sp-2;
+            spacing: Tokens.sp-3;
+            padding: Tokens.sp-4;
 
-            Image {
-                source: @image-url("assets/app-icon-gold.png");
-                width: 64px;
-                height: 64px;
-                horizontal-alignment: center;
+            Rectangle { vertical-stretch: 1; }
+
+            HorizontalLayout {
+                alignment: center;
+                Image {
+                    source: @image-url("assets/app-icon-gold.png");
+                    width: 72px;
+                    height: 72px;
+                }
             }
+
             Text {
                 text: "ZGALAXY";
                 font-size: 26px;
                 font-weight: 800;
                 horizontal-alignment: center;
+                color: Palette.foreground;
             }
+
             SecondaryText {
-                text: "Desktop client · v" + root.app-version;
-                font-size: Tokens.font-secondary;
+                text: "Desktop Client · v" + root.app-version;
+                font-size: Tokens.font-body;
                 horizontal-alignment: center;
             }
-            Text {
-                text: "Node ID: " + root.about-node-id;
-                font-size: Tokens.font-secondary;
-                horizontal-alignment: center;
+
+            if root.about-node-id != "" : HorizontalLayout {
+                alignment: center;
+                spacing: Tokens.sp-2;
+                Text {
+                    text: "Node ID: " + root.about-node-id;
+                    font-size: Tokens.font-secondary;
+                    horizontal-alignment: center;
+                    color: Tokens.galaxy-gold;
+                }
             }
+
             SecondaryText {
                 text: "Pure Rust Next-Gen P2P Mesh Virtual Network";
-                font-size: Tokens.font-caption;
+                font-size: Tokens.font-secondary;
                 horizontal-alignment: center;
+                color: Palette.foreground.with-alpha(0.55);
             }
+
             Rectangle { vertical-stretch: 1; }
         }
 
