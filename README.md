@@ -29,6 +29,7 @@
 * 📜 **100% Sovereign Open Source (AGPL-3.0):** Clean-room implementation free from commercial BSL source-available licensing restrictions.
 * 🛡️ **Guaranteed Memory Safety:** Zero segmentation faults, zero buffer overflows, zero memory leaks—powered by Rust's ownership model and the Tokio asynchronous runtime.
 * ⚡ **Zero-Restart In-Memory Dynamic IP Relinking:** Background async DNS monitoring detects IP drift on domain roots (`dz.dreamzone.cc`) and updates socket routes in memory with **zero packet drops and zero service restarts**.
+* 🖥️ **Sovereign Slint Desktop GUI Client (`zgalaxy-ui`):** 100% Rust GUI with native system tray integration, fixed non-resizable aspect ratio (`580px × 640px`), and seamless **ZGALAXY Engine Sync**.
 * 🎛️ **Embedded ZeroTier Controller:** Complete native replacement for `nonfree/controller`, featuring full `FileDB` persistence (`controller.d/`), automatic 6-digit network generation, and IP assignment pools.
 * 🔗 **100% External Contract Compatibility:** Seamless drop-in compatibility with **ZTNET**, `zerotier-cli`, and orchestrators on the standard port `9993` with `X-ZT1-Auth` authentication.
 * 🚀 **P2P NAT Traversal & Hole Punching:** High-speed STUN/Rendezvous state machine with stateful keep-alive heartbeats for seamless traversal of symmetric and cone NATs.
@@ -38,6 +39,7 @@
 
 ## 🏗️ Architecture Overview
 
+### Core Daemon & Embedded Controller (`src/`)
 ```
 src/
 ├── lib.rs                  # Module exports and protocol constants
@@ -53,10 +55,25 @@ src/
 ├── packet.rs               # Canonical 28-byte wire protocol packet encoder/decoder
 ├── world.rs                # Binary Planet/Moon loader and generator
 ├── resolver.rs             # Native in-memory Async DNS & Dynamic IP watcher
+├── sync_provider.rs        # ZGALAXY Engine dynamic topology sync provider
 ├── tun.rs                  # Virtual TUN/TAP network interface manager
 ├── peer.rs                 # Peer connection state machine, latency & path discovery
 ├── network.rs              # Network join/leave and IP assignment manager
 └── cli.rs                  # Multi-subcommand CLI and idtool key generator
+```
+
+### Sovereign Desktop Client GUI (`zgalaxy-ui/`)
+```
+zgalaxy-ui/
+├── src/
+│   ├── main.rs             # Slint event loop, system tray handler & single-window presenter
+│   ├── app/                # Application state machine, commands & tray integration
+│   ├── network/client.rs   # Local daemon REST client (Status, Networks, Peers)
+│   ├── storage/config.rs   # Persistent settings (sync_domain, sync_token, autostart)
+│   └── platform/           # Platform hooks (Linux autostart, Windows / macOS)
+└── ui/
+    ├── app.slint           # Unified single-window UI (Fixed 580x640px geometry)
+    └── styles/palette.slint# Obsidian Black & Galaxy Gold UI styling
 ```
 
 ---
@@ -114,6 +131,24 @@ cargo build --release
 
 # Run daemon
 sudo ./target/release/zgalaxy-rs
+```
+
+---
+
+## 🖥️ Sovereign Desktop Client GUI (`zgalaxy-ui`)
+
+The repository includes `zgalaxy-ui`, a standalone native desktop interface written with the [Slint](https://slint.dev) GUI framework:
+
+* **Fixed Aspect Ratio & Tailored Dimensions:** Rendered with a locked, non-resizable geometry of **580px × 640px**, ensuring zero distortion across Wayland, X11, Windows, and macOS.
+* **Direct ZGALAXY Engine Sync Landing:** Opening Preferences (`⚙`) lands immediately on the **`ZGALAXY Engine Sync`** screen, enabling one-click token verification, continuous topology updates, and live Planet/Moon tracking.
+* **Cryptographic Attestation & Device Binding:** Sends `X-Node-ID` and `X-Device-Fingerprint` during handshake verification to lock single-device access tokens and prevent credential sharing.
+* **System Tray Integration:** Runs seamlessly in the background with system tray status emojis, auto-start options, and a bottom-aligned system info button (`ℹ`).
+
+```bash
+# Build and run the desktop client GUI
+cd zgalaxy-ui
+cargo build --release
+./target/release/zgalaxy-ui
 ```
 
 ---
