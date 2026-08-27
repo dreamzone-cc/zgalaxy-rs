@@ -648,10 +648,10 @@ export component MainWindow inherits Window {
                     spacing: Tokens.sp-3;
 
                     // Primary IPv4 or general IP
-                    VerticalLayout {
+                    if root.d-ipv4 != "" || (root.d-ipv6-6plane == "" && root.d-ipv6-rfc4193 == "" && root.d-ipv6-other == "") : VerticalLayout {
                         spacing: Tokens.sp-1;
                         SecondaryText {
-                            text: root.d-ipv6-6plane != "" || root.d-ipv6-rfc4193 != "" ? "IPv4 Address" : "Managed IP Address";
+                            text: "IPv4 Address";
                             font-size: Tokens.font-secondary;
                         }
                         HorizontalLayout {

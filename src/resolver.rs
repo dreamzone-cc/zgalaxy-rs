@@ -386,7 +386,19 @@ impl DynamicDnsResolver {
             bail!("No valid IP addresses found for hostname '{}'", host);
         }
 
-        Ok(addrs)
+        // Happy Eyeballs RFC 8305: sort IPv6 addresses first, followed by IPv4
+        let mut sorted = Vec::with_capacity(addrs.len());
+        let mut v4s = Vec::new();
+        for a in addrs {
+            if a.is_ipv6() {
+                sorted.push(a);
+            } else {
+                v4s.push(a);
+            }
+        }
+        sorted.extend(v4s);
+
+        Ok(sorted)
     }
 
     /// Sanity validation for resolved IP addresses.

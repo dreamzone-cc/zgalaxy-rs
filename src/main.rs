@@ -305,12 +305,26 @@ async fn main() -> Result<()> {
     let mut quic_started = false;
 
     if transport_mode == "quic" {
-        let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], local_config.port));
-        match zgalaxy_rs::quic::QuicTransport::bind(
-                        bind_addr,
-                        identity.address.to_string(),
-                        identity.to_public_string(),
-                    ) {
+        let bind_addr_v6 = std::net::SocketAddr::from(([0u8; 16], local_config.port));
+        let bind_addr_v4 = std::net::SocketAddr::from(([0, 0, 0, 0], local_config.port));
+        let quic_res = zgalaxy_rs::quic::QuicTransport::bind(
+            bind_addr_v6,
+            identity.address.to_string(),
+            identity.to_public_string(),
+        ).or_else(|e_v6| {
+            tracing::info!(
+                "[ZGALAXY QUIC] IPv6 bind on [::]:{} unavailable ({:?}), falling back to IPv4 0.0.0.0:{}",
+                local_config.port,
+                e_v6,
+                local_config.port
+            );
+            zgalaxy_rs::quic::QuicTransport::bind(
+                bind_addr_v4,
+                identity.address.to_string(),
+                identity.to_public_string(),
+            )
+        });
+        match quic_res {
             Ok(quic) => {
                 quic_started = true;
                 let quic = Arc::new(quic);

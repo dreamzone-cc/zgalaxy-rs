@@ -127,6 +127,7 @@ impl PeerManager {
         if let Some(path) = peer.paths.iter_mut().find(|p| p.address == path_str) {
             path.last_receive = now;
             path.latency_ms = latency_ms;
+            path.active = true;
         } else {
             peer.paths.push(PeerPath {
                 address: path_str,
@@ -139,6 +140,38 @@ impl PeerManager {
                 expired: false,
                 fixed: false,
             });
+        }
+
+        // Re-evaluate preferred path with Happy Eyeballs RFC 8305 semantics:
+        // 1. Prefer responsive IPv6 paths when latency is healthy.
+        // 2. Fall back seamlessly to active IPv4 path if IPv6 is unreachable/inactive.
+        let mut best_idx = 0;
+        let mut best_score = i64::MIN;
+        for (i, p) in peer.paths.iter().enumerate() {
+            let is_v6 = p.address.contains(':');
+            let is_alive = p.active && (now.saturating_sub(p.last_receive) < 60);
+            let lat = if p.latency_ms >= 0 { p.latency_ms } else { 999 };
+            let mut score: i64 = 0;
+            if is_alive {
+                score += 10000;
+            }
+            if is_v6 && is_alive {
+                score += 2000; // IPv6 preference boost when alive
+            }
+            score -= lat as i64; // lower latency is better
+            if score > best_score {
+                best_score = score;
+                best_idx = i;
+            }
+        }
+
+        for (i, p) in peer.paths.iter_mut().enumerate() {
+            p.preferred = i == best_idx;
+        }
+
+        if let Some(best) = peer.paths.get(best_idx) {
+            peer.physical_address = Some(best.address.clone());
+            peer.latency_ms = best.latency_ms;
         }
     }
 
