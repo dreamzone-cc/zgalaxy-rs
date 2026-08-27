@@ -112,6 +112,10 @@ impl DaemonClient {
         &self.base
     }
 
+    pub fn get_status(&self) -> Option<serde_json::Value> {
+        self.get("/status")
+    }
+
     pub fn post_network(&self, nwid: &str) {
         let _ = self.post_json(&format!("/network/{}", nwid), &serde_json::json!({}));
     }

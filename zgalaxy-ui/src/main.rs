@@ -340,6 +340,7 @@ fn main() {
 
     let mw_sync = main_w.as_weak();
     let cfg_sync_ref = Arc::clone(&cfg_store);
+    let client_sync = Arc::clone(&client);
     main_w.on_sync_now(move |domain, token| {
         let domain = domain.trim().to_string();
         let token = token.trim().to_string();
@@ -364,6 +365,7 @@ fn main() {
         }
 
         let mw_cb = mw_sync.clone();
+        let client_call = Arc::clone(&client_sync);
         std::thread::spawn(move || {
             let base_url = if domain.starts_with("http://") || domain.starts_with("https://") {
                 domain.clone()
@@ -372,10 +374,18 @@ fn main() {
             };
             let manifest_url = format!("{}/api/v1/sync/manifest", base_url.trim_end_matches('/'));
 
-            let resp = ureq::get(&manifest_url)
+            let node_id = client_call.get_status().as_ref().and_then(|s| s.get("address")).and_then(|v| v.as_str()).map(|x| x.to_string()).unwrap_or_default();
+            let mut req = ureq::get(&manifest_url)
                 .set("X-ZGALAXY-Signature", &token)
-                .timeout(std::time::Duration::from_secs(10))
-                .call();
+                .timeout(std::time::Duration::from_secs(10));
+
+            if !node_id.is_empty() {
+                let dev_fp = format!("ui_client_{}", node_id);
+                req = req.set("X-Node-ID", &node_id)
+                    .set("X-Device-Fingerprint", &dev_fp);
+            }
+
+            let resp = req.call();
 
             let (label, emoji, kind, topology, now_str) = match resp {
                 Ok(response) => {
