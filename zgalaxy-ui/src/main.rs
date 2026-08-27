@@ -80,15 +80,14 @@ fn fill_details(ui: &MainWindow, snap: &[serde_json::Value], nwid: &str) {
     let addr = n
         .get("assignedAddresses")
         .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
     ui.set_d_nwid(s(n, "id").into());
     ui.set_d_name(s(n, "name").into());
     ui.set_d_state_emoji(state.emoji().into());
     ui.set_d_state_label(state.label().into());
     ui.set_d_state_kind(state.kind().into());
-    ui.set_d_address(addr.into());
+    ui.set_d_address(if addr.is_empty() { "—".into() } else { addr.into() });
     ui.set_d_connected(state == NetworkState::Connected);
 }
 
@@ -100,9 +99,8 @@ fn fill_advanced(ui: &MainWindow, snap: &[serde_json::Value], nwid: &str) {
     let addr = n
         .get("assignedAddresses")
         .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
     let routes = n
         .get("routes")
         .and_then(|v| v.as_array())

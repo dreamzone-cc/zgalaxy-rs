@@ -581,7 +581,7 @@ async fn main() -> Result<()> {
                                             nm_for_events.update_network(net.clone()).await;
                                             info!("[ZGALAXY QUIC] Network {} updated (name: {}, authorized: {})", nwid, updated_name, authorized);
 
-                                            // Apply managed address + routes to the host
+                                            // Apply managed address + routes + MTU to the host
                                             // adapter once per network (idempotent set).
                                             // Gated by the user-facing network flags:
                                             // allowManaged gates everything; a
@@ -592,30 +592,49 @@ async fn main() -> Result<()> {
                                                 && !net.assigned_addresses.is_empty()
                                                 && applied_networks.insert(nwid.clone())
                                             {
-                                                let ip = &net.assigned_addresses[0];
-                                                // Prefer the managed route that contains
-                                                // the assigned IP; fall back to /24.
-                                                let cidr = net
-                                                    .routes
-                                                    .iter()
-                                                    .find(|r| r.via.is_none())
-                                                    .map(|r| r.target.clone())
-                                                    .unwrap_or_else(|| format!("{}/24", ip));
-                                                tun_for_events
-                                                    .assign_address(&cidr, Some(&net.mac))
-                                                    .await;
+                                                // 1. Configure interface MTU
+                                                if net.mtu > 0 {
+                                                    let _ = zgalaxy_rs::route_manager::RouteManager::set_mtu(
+                                                        &tun_for_events.name,
+                                                        net.mtu,
+                                                    );
+                                                }
+
+                                                // 2. Assign all IPv4 and IPv6 addresses
+                                                for ip in &net.assigned_addresses {
+                                                    let is_v6 = ip.contains(':');
+                                                    let cidr = if ip.contains('/') {
+                                                        ip.clone()
+                                                    } else {
+                                                        // Prefer the managed route matching this IP family
+                                                        net.routes
+                                                            .iter()
+                                                            .find(|r| r.via.is_none() && (if is_v6 { r.target.contains(':') } else { !r.target.contains(':') }))
+                                                            .map(|r| r.target.clone())
+                                                            .unwrap_or_else(|| {
+                                                                if is_v6 {
+                                                                    format!("{}/128", ip)
+                                                                } else {
+                                                                    format!("{}/24", ip)
+                                                                }
+                                                            })
+                                                    };
+                                                    tun_for_events
+                                                        .assign_address(&cidr, Some(&net.mac))
+                                                        .await;
+                                                }
+
+                                                // 3. Add all network managed routes
                                                 for route in &net.routes {
-                                                    if route.target != cidr {
-                                                        let is_default = route.target == "0.0.0.0/0"
-                                                            || route.target == "::/0";
-                                                        if is_default && !net.allow_default {
-                                                            continue;
-                                                        }
-                                                        let _ = zgalaxy_rs::route_manager::RouteManager::add_route(
-                                                            &tun_for_events.name,
-                                                            &route.target,
-                                                        );
+                                                    let is_default = route.target == "0.0.0.0/0"
+                                                        || route.target == "::/0";
+                                                    if is_default && !net.allow_default {
+                                                        continue;
                                                     }
+                                                    let _ = zgalaxy_rs::route_manager::RouteManager::add_route(
+                                                        &tun_for_events.name,
+                                                        &route.target,
+                                                    );
                                                 }
                                             }
                                         }

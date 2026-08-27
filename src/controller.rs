@@ -406,14 +406,10 @@ impl EmbeddedController {
         record.revision += 1;
         if record.authorized {
             record.last_authorized_time = now;
-            // Auto-assign IP if pool is configured, no IPs are assigned, and
-            // automatic assignment has not been disabled for this member.
-            if record.ip_assignments.is_empty() && !record.no_auto_assign_ips {
-                if let Some(net) = self.get_network(nwid).await {
-                    if let Some(free_ip) = self.next_free_ip(nwid, &net.ip_assignment_pools).await {
-                        record.ip_assignments.push(free_ip);
-                    }
-                }
+            // Auto-assign IPv4/IPv6 if pool/mode is configured and automatic
+            // assignment has not been disabled for this member.
+            if !record.no_auto_assign_ips {
+                self.auto_assign_ips_for_member(nwid, member_id, &mut record.ip_assignments).await;
             }
         } else {
             record.last_deauthorized_time = now;
@@ -460,11 +456,7 @@ impl EmbeddedController {
 
         let mut ip_assignments = Vec::new();
         if auto_auth {
-            if let Some(ref n) = net {
-                if let Some(free_ip) = self.next_free_ip(nwid, &n.ip_assignment_pools).await {
-                    ip_assignments.push(free_ip);
-                }
-            }
+            self.auto_assign_ips_for_member(nwid, member_id, &mut ip_assignments).await;
         }
 
         let record = MemberRecord {
@@ -524,6 +516,75 @@ impl EmbeddedController {
                 member.clock = now;
                 if !loopback {
                     member.physical_address = Some(physical_address.to_string());
+                }
+            }
+        }
+    }
+
+    /// Compute deterministic 6PLANE IPv6 address for a member in a network.
+    pub fn compute_6plane_ip(nwid: &str, member_id: &str) -> Option<String> {
+        if nwid.len() != 16 || member_id.len() != 10 {
+            return None;
+        }
+        let hex_str = format!(
+            "fc{}:{}:{}:{}:{}00::1",
+            &nwid[10..12],
+            &nwid[12..16],
+            &member_id[0..4],
+            &member_id[4..8],
+            &member_id[8..10]
+        );
+        hex_str.parse::<std::net::Ipv6Addr>().ok().map(|ip| ip.to_string())
+    }
+
+    /// Compute deterministic RFC4193 IPv6 address for a member in a network.
+    pub fn compute_rfc4193_ip(nwid: &str, member_id: &str) -> Option<String> {
+        if nwid.len() != 16 || member_id.len() != 10 {
+            return None;
+        }
+        let hex_str = format!(
+            "fd{}:{}:{}:{}:{}{}:{}:{}:1",
+            &nwid[0..2],
+            &nwid[2..6],
+            &nwid[6..10],
+            &nwid[10..14],
+            &nwid[14..16],
+            &member_id[0..2],
+            &member_id[2..6],
+            &member_id[6..10]
+        );
+        hex_str.parse::<std::net::Ipv6Addr>().ok().map(|ip| ip.to_string())
+    }
+
+    /// Assign auto IPv4 and IPv6 addresses for an authorized member.
+    pub async fn auto_assign_ips_for_member(&self, nwid: &str, member_id: &str, current_ips: &mut Vec<String>) {
+        let Some(net) = self.get_network(nwid).await else { return };
+
+        // 1. IPv4 auto-assignment if member has no IPv4 assigned
+        let has_v4 = current_ips.iter().any(|ip| !ip.contains(':'));
+        if !has_v4 {
+            if let Some(free_ip) = self.next_free_ip(nwid, &net.ip_assignment_pools).await {
+                current_ips.push(free_ip);
+            }
+        }
+
+        // 2. 6PLANE IPv6 auto-assignment
+        let is_6plane = net.v6_assign_mode.get("6plane").and_then(|v| v.as_bool()).unwrap_or(false)
+            || (net.v6_assign_mode.get("6plane").is_some() && net.v6_assign_mode.get("rfc4193").and_then(|v| v.as_bool()) == Some(false));
+        if is_6plane {
+            if let Some(v6_6plane) = Self::compute_6plane_ip(nwid, member_id) {
+                if !current_ips.contains(&v6_6plane) {
+                    current_ips.push(v6_6plane);
+                }
+            }
+        }
+
+        // 3. RFC4193 IPv6 auto-assignment
+        let is_rfc4193 = net.v6_assign_mode.get("rfc4193").and_then(|v| v.as_bool()).unwrap_or(false);
+        if is_rfc4193 {
+            if let Some(v6_rfc4193) = Self::compute_rfc4193_ip(nwid, member_id) {
+                if !current_ips.contains(&v6_rfc4193) {
+                    current_ips.push(v6_rfc4193);
                 }
             }
         }
@@ -818,6 +879,55 @@ mod tests {
         let suffix2 = &net2.nwid[10..];
         // Must not be sequential 000001 and 000002
         assert!(!(suffix1 == "000001" && suffix2 == "000002"), "Network IDs must be randomly generated, not sequential counters");
+
+        let _ = std::fs::remove_dir_all(controller.db_path.parent().unwrap());
+    }
+
+    /// Test deterministic 6PLANE and RFC4193 IPv6 calculation and auto-assignment.
+    #[tokio::test]
+    async fn test_ipv6_6plane_and_rfc4193_auto_assignment() {
+        let controller = test_controller();
+        let _ = controller.init().await;
+
+        // Test 6PLANE mode
+        let net_6plane = controller
+            .save_network(json!({
+                "name": "6PlaneNet",
+                "v6AssignMode": { "6plane": true },
+                "ipAssignmentPools": [{"ipRangeStart": "10.147.17.10", "ipRangeEnd": "10.147.17.50"}]
+            }))
+            .await
+            .unwrap();
+        let nwid_6p = net_6plane.nwid;
+
+        let member_6p = controller
+            .save_member(&nwid_6p, "069ae38092", json!({ "authorized": true }))
+            .await
+            .unwrap();
+        assert!(member_6p.authorized);
+        // Must contain both IPv4 and 6PLANE IPv6
+        assert!(member_6p.ip_assignments.iter().any(|ip| ip.starts_with("10.147.17.")));
+        assert!(member_6p.ip_assignments.iter().any(|ip| ip.starts_with("fc")));
+
+        // Test RFC4193 mode
+        let net_rfc = controller
+            .save_network(json!({
+                "name": "RFC4193Net",
+                "v6AssignMode": { "rfc4193": true },
+                "ipAssignmentPools": [{"ipRangeStart": "10.200.1.10", "ipRangeEnd": "10.200.1.50"}]
+            }))
+            .await
+            .unwrap();
+        let nwid_rfc = net_rfc.nwid;
+
+        let member_rfc = controller
+            .save_member(&nwid_rfc, "069ae38092", json!({ "authorized": true }))
+            .await
+            .unwrap();
+        assert!(member_rfc.authorized);
+        // Must contain both IPv4 and RFC4193 IPv6 (starts with fd)
+        assert!(member_rfc.ip_assignments.iter().any(|ip| ip.starts_with("10.200.1.")));
+        assert!(member_rfc.ip_assignments.iter().any(|ip| ip.starts_with("fd")));
 
         let _ = std::fs::remove_dir_all(controller.db_path.parent().unwrap());
     }
