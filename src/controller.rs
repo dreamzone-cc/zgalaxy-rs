@@ -575,9 +575,8 @@ impl EmbeddedController {
             }
         }
 
-        // 2. 6PLANE IPv6 auto-assignment
-        let is_6plane = net.v6_assign_mode.get("6plane").and_then(|v| v.as_bool()).unwrap_or(false)
-            || (net.v6_assign_mode.get("6plane").is_some() && net.v6_assign_mode.get("rfc4193").and_then(|v| v.as_bool()) == Some(false));
+        // 2. 6PLANE IPv6 auto-assignment (ZeroTier canonical /80)
+        let is_6plane = net.v6_assign_mode.get("6plane").and_then(|v| v.as_bool()).unwrap_or(false);
         if is_6plane {
             if let Some(v6_6plane) = Self::compute_6plane_ip(nwid, member_id) {
                 if !current_ips.contains(&v6_6plane) {
@@ -586,12 +585,29 @@ impl EmbeddedController {
             }
         }
 
-        // 3. RFC4193 IPv6 auto-assignment
+        // 3. RFC4193 IPv6 auto-assignment (ZeroTier canonical /128)
         let is_rfc4193 = net.v6_assign_mode.get("rfc4193").and_then(|v| v.as_bool()).unwrap_or(false);
         if is_rfc4193 {
             if let Some(v6_rfc4193) = Self::compute_rfc4193_ip(nwid, member_id) {
                 if !current_ips.contains(&v6_rfc4193) {
                     current_ips.push(v6_rfc4193);
+                }
+            }
+        }
+
+        // 4. Custom IPv6 Range auto-assignment (v6AssignMode: { "zt": true })
+        let is_zt_v6 = net.v6_assign_mode.get("zt").and_then(|v| v.as_bool()).unwrap_or(false);
+        if is_zt_v6 {
+            let has_custom_v6 = current_ips.iter().any(|ip| {
+                ip.contains(':')
+                    && !ip.starts_with("fc")
+                    && !ip.starts_with("FC")
+                    && !ip.starts_with("fd")
+                    && !ip.starts_with("FD")
+            });
+            if !has_custom_v6 {
+                if let Some(free_v6) = self.next_free_ipv6(nwid, &net.ip_assignment_pools).await {
+                    current_ips.push(free_v6);
                 }
             }
         }
@@ -624,6 +640,38 @@ impl EmbeddedController {
             for candidate in start_u32..=end_u32 {
                 if !used.contains(&candidate) {
                     return Some(Ipv4Addr::from(candidate).to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Find the next free IPv6 address within custom IPv6 assignment pools.
+    async fn next_free_ipv6(&self, nwid: &str, pools: &[IpAssignmentPool]) -> Option<String> {
+        let members = self.members.read().await;
+        let used: HashSet<u128> = members
+            .get(nwid)
+            .map(|m| {
+                m.values()
+                    .flat_map(|r| r.ip_assignments.iter())
+                    .filter_map(|ip| ip.parse::<std::net::Ipv6Addr>().ok().map(u128::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        drop(members);
+
+        for pool in pools {
+            let start = pool.ip_range_start.parse::<std::net::Ipv6Addr>().ok();
+            let end = pool.ip_range_end.parse::<std::net::Ipv6Addr>().ok();
+            let (Some(start), Some(end)) = (start, end) else { continue };
+            let (start_u128, end_u128) = (u128::from(start), u128::from(end));
+            if end_u128 < start_u128 {
+                continue;
+            }
+            let limit = std::cmp::min(end_u128, start_u128.saturating_add(65535));
+            for candidate in start_u128..=limit {
+                if !used.contains(&candidate) {
+                    return Some(std::net::Ipv6Addr::from(candidate).to_string());
                 }
             }
         }
@@ -935,6 +983,14 @@ mod tests {
         // Must contain both IPv4 and RFC4193 IPv6 (starts with fd)
         assert!(member_rfc.ip_assignments.iter().any(|ip| ip.starts_with("10.200.1.")));
         assert!(member_rfc.ip_assignments.iter().any(|ip| ip.starts_with("fd")));
+
+        // Exact Canonical ZeroTier Vector Verification
+        let user_nwid = "ef313fb5c9f6817a";
+        let user_member = "5b07896437";
+        let calc_rfc = EmbeddedController::compute_rfc4193_ip(user_nwid, user_member).unwrap();
+        let calc_6p = EmbeddedController::compute_6plane_ip(user_nwid, user_member).unwrap();
+        assert_eq!(calc_rfc, "fdef:313f:b5c9:f681:7a99:935b:789:6437");
+        assert_eq!(calc_6p, "fc26:c7be:cf5b:789:6437::1");
 
         let _ = std::fs::remove_dir_all(controller.db_path.parent().unwrap());
     }
