@@ -1170,51 +1170,56 @@ export component MainWindow inherits Window {
         // ===================================================================
         if root.current-view == "about" : VerticalLayout {
             vertical-stretch: 1;
-            alignment: center;
-            spacing: Tokens.sp-3;
             padding: Tokens.sp-4;
 
             Rectangle { vertical-stretch: 1; }
 
             HorizontalLayout {
                 alignment: center;
-                Image {
-                    source: @image-url("assets/app-icon-gold.png");
-                    width: 72px;
-                    height: 72px;
+                VerticalLayout {
+                    spacing: Tokens.sp-3;
+                    alignment: center;
+
+                    HorizontalLayout {
+                        alignment: center;
+                        Image {
+                            source: @image-url("assets/app-icon-gold.png");
+                            width: 88px;
+                            height: 88px;
+                        }
+                    }
+
+                    Text {
+                        text: "ZGALAXY";
+                        font-size: 28px;
+                        font-weight: 800;
+                        horizontal-alignment: center;
+                        color: Palette.foreground;
+                    }
+
+                    SecondaryText {
+                        text: "Desktop Client · v" + root.app-version;
+                        font-size: Tokens.font-body;
+                        horizontal-alignment: center;
+                    }
+
+                    if root.about-node-id != "" : HorizontalLayout {
+                        alignment: center;
+                        Text {
+                            text: "Node ID: " + root.about-node-id;
+                            font-size: Tokens.font-secondary;
+                            horizontal-alignment: center;
+                            color: Tokens.galaxy-gold;
+                        }
+                    }
+
+                    SecondaryText {
+                        text: "Pure Rust Next-Gen P2P Mesh Virtual Network";
+                        font-size: Tokens.font-secondary;
+                        horizontal-alignment: center;
+                        color: Palette.foreground.with-alpha(0.55);
+                    }
                 }
-            }
-
-            Text {
-                text: "ZGALAXY";
-                font-size: 26px;
-                font-weight: 800;
-                horizontal-alignment: center;
-                color: Palette.foreground;
-            }
-
-            SecondaryText {
-                text: "Desktop Client · v" + root.app-version;
-                font-size: Tokens.font-body;
-                horizontal-alignment: center;
-            }
-
-            if root.about-node-id != "" : HorizontalLayout {
-                alignment: center;
-                spacing: Tokens.sp-2;
-                Text {
-                    text: "Node ID: " + root.about-node-id;
-                    font-size: Tokens.font-secondary;
-                    horizontal-alignment: center;
-                    color: Tokens.galaxy-gold;
-                }
-            }
-
-            SecondaryText {
-                text: "Pure Rust Next-Gen P2P Mesh Virtual Network";
-                font-size: Tokens.font-secondary;
-                horizontal-alignment: center;
-                color: Palette.foreground.with-alpha(0.55);
             }
 
             Rectangle { vertical-stretch: 1; }
