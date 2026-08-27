@@ -493,7 +493,7 @@ async fn main() -> Result<()> {
                                         match ctrl_for_events.register_join_request(&nwid, &member, None).await {
                                             Ok(_) => {
                                                 if let Some(net) = ctrl_for_events.get_network(&nwid).await {
-                                                    let member_rec = ctrl_for_events.get_member(&nwid, &member).await;
+                                                    let member_rec = ctrl_for_events.get_effective_member(&nwid, &member).await;
                                                     let authorized = member_rec.as_ref().map(|m| m.authorized).unwrap_or(false);
                                                     let ips = member_rec.map(|m| m.ip_assignments).unwrap_or_default();
 

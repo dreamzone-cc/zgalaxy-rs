@@ -372,7 +372,7 @@ async fn get_controller_member(
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    if let Some(member) = state.controller.get_member(&nwid, &member_id).await {
+    if let Some(member) = state.controller.get_effective_member(&nwid, &member_id).await {
         return Ok(Json(serde_json::to_value(member).unwrap_or_default()));
     }
     Err(StatusCode::NOT_FOUND)

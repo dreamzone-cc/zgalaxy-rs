@@ -39,6 +39,7 @@ export global Tokens {
     out property <color> success: #1a7f37;
     out property <color> warning: #b8860b;
     out property <color> error: #c62828;
+    out property <color> galaxy-gold: #d4af37;
     // window dimensions
     out property <length> win-w: 580px;
     out property <length> win-main-h: 640px;
@@ -345,6 +346,10 @@ export component MainWindow inherits Window {
     in-out property <string> d-state-label: "";
     in-out property <string> d-state-kind: "warning";
     in-out property <string> d-address: "";
+    in-out property <string> d-ipv4: "";
+    in-out property <string> d-ipv6-6plane: "";
+    in-out property <string> d-ipv6-rfc4193: "";
+    in-out property <string> d-ipv6-other: "";
     in-out property <bool> d-connected: false;
 
     // Advanced Window State
@@ -353,6 +358,10 @@ export component MainWindow inherits Window {
     in-out property <string> a-state-emoji: "🟠";
     in-out property <string> a-state-label: "";
     in-out property <string> a-address: "";
+    in-out property <string> a-ipv4: "";
+    in-out property <string> a-ipv6-6plane: "";
+    in-out property <string> a-ipv6-rfc4193: "";
+    in-out property <string> a-ipv6-other: "";
     in-out property <string> a-device: "";
     in-out property <string> a-mac: "";
     in-out property <string> a-mtu: "2800";
@@ -633,17 +642,18 @@ export component MainWindow inherits Window {
                     padding: Tokens.sp-4;
                     spacing: Tokens.sp-3;
 
+                    // Primary IPv4 or general IP
                     VerticalLayout {
                         spacing: Tokens.sp-1;
                         SecondaryText {
-                            text: "Your IP Address";
+                            text: root.d-ipv6-6plane != "" || root.d-ipv6-rfc4193 != "" ? "IPv4 Address" : "Managed IP Address";
                             font-size: Tokens.font-secondary;
                         }
                         HorizontalLayout {
                             padding: 0;
                             spacing: Tokens.sp-2;
                             Text {
-                                text: root.d-address != "" ? root.d-address : "Waiting for IP assignment…";
+                                text: root.d-ipv4 != "" ? root.d-ipv4 : (root.d-address != "" ? root.d-address : "Waiting for IP assignment…");
                                 font-size: Tokens.font-emphasis;
                                 vertical-alignment: center;
                             }
@@ -652,8 +662,98 @@ export component MainWindow inherits Window {
                                 text: "Copy";
                                 min-height: Tokens.ctrl-h;
                                 min-width: Tokens.btn-sm-w;
-                                enabled: root.d-address != "";
-                                clicked => { root.copy-text(root.d-address); }
+                                enabled: root.d-ipv4 != "" || root.d-address != "";
+                                clicked => { root.copy-text(root.d-ipv4 != "" ? root.d-ipv4 : root.d-address); }
+                            }
+                        }
+                    }
+
+                    // ZGALAXY 6PLANE IPv6
+                    if root.d-ipv6-6plane != "" : VerticalLayout {
+                        spacing: Tokens.sp-1;
+                        Rectangle {
+                            height: 1px;
+                            background: Palette.foreground.with-alpha(0.1);
+                        }
+                        SecondaryText {
+                            text: "ZGALAXY 6PLANE (IPv6 /80 Routable)";
+                            font-size: Tokens.font-secondary;
+                        }
+                        HorizontalLayout {
+                            padding: 0;
+                            spacing: Tokens.sp-2;
+                            Text {
+                                text: root.d-ipv6-6plane;
+                                font-size: Tokens.font-body;
+                                color: Tokens.galaxy-gold;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: "Copy";
+                                min-height: Tokens.ctrl-h;
+                                min-width: Tokens.btn-sm-w;
+                                clicked => { root.copy-text(root.d-ipv6-6plane); }
+                            }
+                        }
+                    }
+
+                    // ZGALAXY RFC4193 IPv6
+                    if root.d-ipv6-rfc4193 != "" : VerticalLayout {
+                        spacing: Tokens.sp-1;
+                        Rectangle {
+                            height: 1px;
+                            background: Palette.foreground.with-alpha(0.1);
+                        }
+                        SecondaryText {
+                            text: "ZGALAXY RFC4193 (IPv6 /128)";
+                            font-size: Tokens.font-secondary;
+                        }
+                        HorizontalLayout {
+                            padding: 0;
+                            spacing: Tokens.sp-2;
+                            Text {
+                                text: root.d-ipv6-rfc4193;
+                                font-size: Tokens.font-body;
+                                color: Tokens.galaxy-gold;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: "Copy";
+                                min-height: Tokens.ctrl-h;
+                                min-width: Tokens.btn-sm-w;
+                                clicked => { root.copy-text(root.d-ipv6-rfc4193); }
+                            }
+                        }
+                    }
+
+                    // ZGALAXY Custom IPv6
+                    if root.d-ipv6-other != "" : VerticalLayout {
+                        spacing: Tokens.sp-1;
+                        Rectangle {
+                            height: 1px;
+                            background: Palette.foreground.with-alpha(0.1);
+                        }
+                        SecondaryText {
+                            text: "ZGALAXY Custom IPv6";
+                            font-size: Tokens.font-secondary;
+                        }
+                        HorizontalLayout {
+                            padding: 0;
+                            spacing: Tokens.sp-2;
+                            Text {
+                                text: root.d-ipv6-other;
+                                font-size: Tokens.font-body;
+                                color: Tokens.galaxy-gold;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: "Copy";
+                                min-height: Tokens.ctrl-h;
+                                min-width: Tokens.btn-sm-w;
+                                clicked => { root.copy-text(root.d-ipv6-other); }
                             }
                         }
                     }
@@ -753,7 +853,7 @@ export component MainWindow inherits Window {
                         padding: 0;
                         Text { text: "Device Name"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
                         Rectangle { horizontal-stretch: 1; }
-                        Text { text: root.a-device != "" ? root.a-device : "zt-dev"; font-size: Tokens.font-secondary; }
+                        Text { text: root.a-device != "" ? root.a-device : "zgalaxy-dev"; font-size: Tokens.font-secondary; }
                     }
 
                     HorizontalLayout {
@@ -774,21 +874,42 @@ export component MainWindow inherits Window {
 
                     HorizontalLayout {
                         padding: 0;
-                        Text { text: "Managed IP (v4/v6)"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Text { text: "IPv4 Address"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
                         Rectangle { horizontal-stretch: 1; }
-                        Text { text: root.a-address != "" ? root.a-address : "—"; font-size: Tokens.font-secondary; }
+                        Text { text: root.a-ipv4 != "" ? root.a-ipv4 : (root.a-address != "" ? root.a-address : "—"); font-size: Tokens.font-secondary; }
+                    }
+
+                    if root.a-ipv6-6plane != "" : HorizontalLayout {
+                        padding: 0;
+                        Text { text: "ZGALAXY 6PLANE (/80)"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.a-ipv6-6plane; font-size: Tokens.font-secondary; color: Tokens.galaxy-gold; }
+                    }
+
+                    if root.a-ipv6-rfc4193 != "" : HorizontalLayout {
+                        padding: 0;
+                        Text { text: "ZGALAXY RFC4193 (/128)"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.a-ipv6-rfc4193; font-size: Tokens.font-secondary; color: Tokens.galaxy-gold; }
+                    }
+
+                    if root.a-ipv6-other != "" : HorizontalLayout {
+                        padding: 0;
+                        Text { text: "ZGALAXY Custom IPv6"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.a-ipv6-other; font-size: Tokens.font-secondary; color: Tokens.galaxy-gold; }
                     }
 
                     HorizontalLayout {
                         padding: 0;
-                        Text { text: "MTU"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Text { text: "Network MTU"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
                         Rectangle { horizontal-stretch: 1; }
                         Text { text: root.a-mtu; font-size: Tokens.font-secondary; }
                     }
 
                     HorizontalLayout {
                         padding: 0;
-                        Text { text: "Routes"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Text { text: "Managed Routes"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
                         Rectangle { horizontal-stretch: 1; }
                         Text { text: root.a-routes; font-size: Tokens.font-secondary; }
                     }
@@ -796,7 +917,7 @@ export component MainWindow inherits Window {
                     SectionHeader { title: "POLICIES & PERMISSIONS"; count: ""; }
 
                     CheckBox {
-                        text: "Allow Managed IPs";
+                        text: "Allow Managed IPs (IPv4 & IPv6)";
                         checked <=> root.a-allow-managed;
                         toggled => { root.advanced-flags-changed(); }
                     }
@@ -1010,7 +1131,7 @@ export component MainWindow inherits Window {
                     spacing: Tokens.sp-2;
                     Text { text: "Connected Peers"; font-size: Tokens.font-section; font-weight: 700; }
                     SecondaryText {
-                        text: "Real-time ZeroTier direct peer links and round-trip latencies.";
+                        text: "Real-time ZGALAXY mesh direct peer links and round-trip latencies.";
                         font-size: Tokens.font-secondary;
                         wrap: word-wrap;
                     }

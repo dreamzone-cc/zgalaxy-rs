@@ -72,22 +72,67 @@ fn peer_infos(peers: &[serde_json::Value]) -> Vec<PeerInfo> {
         .collect()
 }
 
+struct CategorizedIps {
+    ipv4: String,
+    ipv6_6plane: String,
+    ipv6_rfc4193: String,
+    ipv6_other: String,
+    all_joined: String,
+}
+
+fn categorize_ips(n: &serde_json::Value) -> CategorizedIps {
+    let mut ipv4 = String::new();
+    let mut ipv6_6plane = String::new();
+    let mut ipv6_rfc4193 = String::new();
+    let mut ipv6_other = String::new();
+    let mut all = Vec::new();
+
+    if let Some(arr) = n.get("assignedAddresses").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(ip) = v.as_str() {
+                all.push(ip.to_string());
+                if !ip.contains(':') {
+                    if ipv4.is_empty() {
+                        ipv4 = ip.to_string();
+                    }
+                } else if ip.starts_with("fc") || ip.starts_with("FC") {
+                    ipv6_6plane = ip.to_string();
+                } else if ip.starts_with("fd") || ip.starts_with("FD") {
+                    ipv6_rfc4193 = ip.to_string();
+                } else if ipv6_other.is_empty() {
+                    ipv6_other = ip.to_string();
+                }
+            }
+        }
+    }
+
+    let all_joined = all.join(", ");
+    CategorizedIps {
+        ipv4,
+        ipv6_6plane,
+        ipv6_rfc4193,
+        ipv6_other,
+        all_joined,
+    }
+}
+
 fn fill_details(ui: &MainWindow, snap: &[serde_json::Value], nwid: &str) {
     let clean = nwid.trim().to_lowercase();
     let found = snap.iter().find(|n| s(n, "id").eq_ignore_ascii_case(&clean));
     let Some(n) = found else { return };
     let state = net_state(n);
-    let addr = n
-        .get("assignedAddresses")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
-        .unwrap_or_default();
+    let cats = categorize_ips(n);
+
     ui.set_d_nwid(s(n, "id").into());
     ui.set_d_name(s(n, "name").into());
     ui.set_d_state_emoji(state.emoji().into());
     ui.set_d_state_label(state.label().into());
     ui.set_d_state_kind(state.kind().into());
-    ui.set_d_address(if addr.is_empty() { "—".into() } else { addr.into() });
+    ui.set_d_address(if cats.all_joined.is_empty() { "—".into() } else { cats.all_joined.into() });
+    ui.set_d_ipv4(cats.ipv4.into());
+    ui.set_d_ipv6_6plane(cats.ipv6_6plane.into());
+    ui.set_d_ipv6_rfc4193(cats.ipv6_rfc4193.into());
+    ui.set_d_ipv6_other(cats.ipv6_other.into());
     ui.set_d_connected(state == NetworkState::Connected);
 }
 
@@ -96,11 +141,8 @@ fn fill_advanced(ui: &MainWindow, snap: &[serde_json::Value], nwid: &str) {
     let found = snap.iter().find(|n| s(n, "id").eq_ignore_ascii_case(&clean));
     let Some(n) = found else { return };
     let state = net_state(n);
-    let addr = n
-        .get("assignedAddresses")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
-        .unwrap_or_default();
+    let cats = categorize_ips(n);
+
     let routes = n
         .get("routes")
         .and_then(|v| v.as_array())
@@ -122,7 +164,11 @@ fn fill_advanced(ui: &MainWindow, snap: &[serde_json::Value], nwid: &str) {
     ui.set_a_nwid(s(n, "id").into());
     ui.set_a_state_emoji(state.emoji().into());
     ui.set_a_state_label(state.label().into());
-    ui.set_a_address(if addr.is_empty() { "—".into() } else { addr.into() });
+    ui.set_a_address(if cats.all_joined.is_empty() { "—".into() } else { cats.all_joined.into() });
+    ui.set_a_ipv4(cats.ipv4.into());
+    ui.set_a_ipv6_6plane(cats.ipv6_6plane.into());
+    ui.set_a_ipv6_rfc4193(cats.ipv6_rfc4193.into());
+    ui.set_a_ipv6_other(cats.ipv6_other.into());
     ui.set_a_device(if s(n, "portDeviceName").is_empty() { "—".into() } else { s(n, "portDeviceName").into() });
     ui.set_a_mac(if s(n, "mac").is_empty() { "—".into() } else { s(n, "mac").into() });
     ui.set_a_mtu(format!("{}", mtu_val).into());

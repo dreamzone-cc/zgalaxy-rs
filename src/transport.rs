@@ -141,7 +141,7 @@ impl UdpTransport {
                                             let _ = ctrl.register_join_request(&nwid_hex, &member_id, None).await;
 
                                             if let Some(net) = ctrl.get_network(&nwid_hex).await {
-                                                let member_opt = ctrl.get_member(&nwid_hex, &member_id).await;
+                                                let member_opt = ctrl.get_effective_member(&nwid_hex, &member_id).await;
                                                 let is_auth = member_opt.as_ref().map(|m| m.authorized).unwrap_or(false);
                                                 let ips = member_opt.map(|m| m.ip_assignments).unwrap_or_default();
 

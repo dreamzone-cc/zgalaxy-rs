@@ -366,6 +366,15 @@ impl EmbeddedController {
         members.get(nwid).and_then(|m| m.get(member_id)).cloned()
     }
 
+    /// Get member details with effective dynamic IPv4 and IPv6 assignments applied.
+    pub async fn get_effective_member(&self, nwid: &str, member_id: &str) -> Option<MemberRecord> {
+        let mut record = self.get_member(nwid, member_id).await?;
+        if record.authorized && !record.no_auto_assign_ips {
+            self.auto_assign_ips_for_member(nwid, member_id, &mut record.ip_assignments).await;
+        }
+        Some(record)
+    }
+
     /// Authorize, deauthorize, or update a network member.
     ///
     /// Compatibility note: ZTNET posts PARTIAL member payloads (e.g. only
