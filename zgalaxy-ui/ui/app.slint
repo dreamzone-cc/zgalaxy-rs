@@ -40,8 +40,8 @@ export global Tokens {
     out property <color> warning: #b8860b;
     out property <color> error: #c62828;
     // window dimensions
-    out property <length> win-w: 480px;
-    out property <length> win-main-h: 580px;
+    out property <length> win-w: 520px;
+    out property <length> win-main-h: 620px;
 }
 
 export struct NetworkInfo {
@@ -314,8 +314,10 @@ export component MainWindow inherits Window {
         : root.current-view == "preferences" ? "ZGALAXY — Preferences"
         : "ZGALAXY — About";
     icon: @image-url("assets/app-icon-gold.png");
-    width: Tokens.win-w;
-    height: Tokens.win-main-h;
+    min-width: Tokens.win-w;
+    max-width: Tokens.win-w;
+    min-height: Tokens.win-main-h;
+    max-height: Tokens.win-main-h;
 
     // View Routing: "main" | "details" | "advanced" | "preferences" | "about"
     in-out property <string> current-view: "main";
@@ -837,9 +839,9 @@ export component MainWindow inherits Window {
             VerticalLayout {
                 width: Tokens.nav-width;
                 spacing: Tokens.sp-1;
-                NavRow { icon: "⚙"; label: "General"; selected: root.prefs-page == 0; activated => { root.prefs-page = 0; } }
-                NavRow { icon: "🔔"; label: "Notifications"; selected: root.prefs-page == 1; activated => { root.prefs-page = 1; } }
-                NavRow { icon: "🌐"; label: "ZGALAXY Sync"; selected: root.prefs-page == 2; activated => { root.prefs-page = 2; } }
+                NavRow { icon: "🌐"; label: "Engine Sync"; selected: root.prefs-page == 0; activated => { root.prefs-page = 0; } }
+                NavRow { icon: "⚙"; label: "General"; selected: root.prefs-page == 1; activated => { root.prefs-page = 1; } }
+                NavRow { icon: "🔔"; label: "Notifications"; selected: root.prefs-page == 2; activated => { root.prefs-page = 2; } }
                 NavRow { icon: "🛠"; label: "Advanced"; selected: root.prefs-page == 3; activated => { root.prefs-page = 3; } }
                 NavRow { icon: "📊"; label: "Diagnostics"; selected: root.prefs-page == 4; activated => { root.prefs-page = 4; } }
                 Rectangle { vertical-stretch: 1; }
@@ -855,49 +857,18 @@ export component MainWindow inherits Window {
                 horizontal-stretch: 1;
                 spacing: Tokens.sp-3;
 
+                // Tab 0: ZGALAXY Engine Sync
                 if root.prefs-page == 0 : VerticalLayout {
                     spacing: Tokens.sp-3;
-                    Text { text: "General Settings"; font-size: Tokens.font-section; font-weight: 700; }
-                    CheckBox {
-                        text: "Start with system";
-                        checked <=> root.p-start-with-system;
-                        toggled => { root.prefs-changed(); }
-                    }
-                    CheckBox {
-                        text: "Start minimized in background";
-                        checked <=> root.p-start-background;
-                        toggled => { root.prefs-changed(); }
-                    }
-                    CheckBox {
-                        text: "Show tray icon next to clock";
-                        checked <=> root.p-show-tray;
-                        toggled => { root.prefs-changed(); }
-                    }
-                    Rectangle { vertical-stretch: 1; }
-                }
-
-                if root.prefs-page == 1 : VerticalLayout {
-                    spacing: Tokens.sp-3;
-                    Text { text: "Notification Settings"; font-size: Tokens.font-section; font-weight: 700; }
-                    CheckBox {
-                        text: "Show status change notifications";
-                        checked <=> root.p-notify-status;
-                        toggled => { root.prefs-changed(); }
-                    }
-                    Rectangle { vertical-stretch: 1; }
-                }
-
-                if root.prefs-page == 2 : VerticalLayout {
-                    spacing: Tokens.sp-3;
-                    Text { text: "ZGALAXY Cloud Synchronization"; font-size: Tokens.font-section; font-weight: 700; }
-                    SecondaryText { text: "Connect to a ZGALAXY provider to dynamically discover and synchronize Planets and Moons."; font-size: Tokens.font-secondary; }
+                    Text { text: "ZGALAXY Engine Sync"; font-size: Tokens.font-section; font-weight: 700; }
+                    SecondaryText { text: "Connect to a sovereign ZGALAXY Engine to dynamically discover, validate, and atomically synchronize Planet and Moon topology."; font-size: Tokens.font-secondary; }
 
                     VerticalLayout {
                         spacing: Tokens.sp-1;
                         Text { text: "Service Domain / URL"; font-size: Tokens.font-small; font-weight: 600; }
                         LineEdit {
                             text <=> root.sync-domain;
-                            placeholder-text: "dz.dreamzone.cc or http://192.168.1.161:3000";
+                            placeholder-text: "dz.dreamzone.cc or http://192.168.1.171:3000";
                             font-size: Tokens.font-body;
                         }
                     }
@@ -956,6 +927,41 @@ export component MainWindow inherits Window {
                     }
                 }
 
+                // Tab 1: General Settings
+                if root.prefs-page == 1 : VerticalLayout {
+                    spacing: Tokens.sp-3;
+                    Text { text: "General Settings"; font-size: Tokens.font-section; font-weight: 700; }
+                    CheckBox {
+                        text: "Start with system";
+                        checked <=> root.p-start-with-system;
+                        toggled => { root.prefs-changed(); }
+                    }
+                    CheckBox {
+                        text: "Start minimized in background";
+                        checked <=> root.p-start-background;
+                        toggled => { root.prefs-changed(); }
+                    }
+                    CheckBox {
+                        text: "Show tray icon next to clock";
+                        checked <=> root.p-show-tray;
+                        toggled => { root.prefs-changed(); }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+
+                // Tab 2: Notification Settings
+                if root.prefs-page == 2 : VerticalLayout {
+                    spacing: Tokens.sp-3;
+                    Text { text: "Notification Settings"; font-size: Tokens.font-section; font-weight: 700; }
+                    CheckBox {
+                        text: "Show status change notifications";
+                        checked <=> root.p-notify-status;
+                        toggled => { root.prefs-changed(); }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+
+                // Tab 3: Advanced Service Details
                 if root.prefs-page == 3 : VerticalLayout {
                     spacing: Tokens.sp-3;
                     Text { text: "Service Details"; font-size: Tokens.font-section; font-weight: 700; }
@@ -972,6 +978,7 @@ export component MainWindow inherits Window {
                     Rectangle { vertical-stretch: 1; }
                 }
 
+                // Tab 4: Diagnostics
                 if root.prefs-page == 4 : VerticalLayout {
                     spacing: Tokens.sp-2;
                     Text { text: "Connected Peers"; font-size: Tokens.font-section; font-weight: 700; }
