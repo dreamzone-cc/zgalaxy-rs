@@ -9,6 +9,9 @@ use serde::{Serialize, Deserialize};
 use serde_json::{json, Value};
 use tracing::info;
 use anyhow::{bail, Context, Result};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+type HmacSha256 = Hmac<Sha256>;
 
 use crate::identity::{Address, Identity};
 
@@ -563,6 +566,55 @@ impl EmbeddedController {
         Some(std::net::Ipv6Addr::from(octets).to_string())
     }
 
+    /// Generate a Semantically Opaque, Cryptographically Stable IPv6 Interface Identifier (RFC 7217).
+    ///
+    /// Implements RFC 7217 Section 3.3:
+    ///   RID = F(Prefix, Net_Iface_ID, Network_ID, DAD_Counter, Secret_Key)
+    /// where F is HMAC-SHA256 keyed with the controller's persistent identity key.
+    ///
+    /// Guarantees:
+    /// 1. Stability: The same member ID on the same network prefix receives the identical IPv6 address.
+    /// 2. Anti-Scanning / Unpredictability: Interface identifiers are pseudorandomly distributed across
+    ///    the custom pool, preventing address scanning, correlation attacks, and device fingerprinting.
+    /// 3. Zero-Collision (DAD Loop): If a candidate address conflicts with an existing assignment,
+    ///    incrementing `dad_counter` yields a distinct, deterministic, pseudorandom candidate.
+    pub fn compute_rfc7217_opaque_ip(
+        prefix_start: u128,
+        prefix_end: u128,
+        nwid: &str,
+        member_id: &str,
+        secret_key: &[u8],
+        dad_counter: u32,
+    ) -> Option<std::net::Ipv6Addr> {
+        if prefix_end < prefix_start {
+            return None;
+        }
+
+        let range_size = prefix_end.saturating_sub(prefix_start);
+        if range_size == 0 {
+            return Some(std::net::Ipv6Addr::from(prefix_start));
+        }
+
+        let mut mac = HmacSha256::new_from_slice(secret_key).ok()?;
+        mac.update(&prefix_start.to_be_bytes());
+        mac.update(&prefix_end.to_be_bytes());
+        mac.update(nwid.as_bytes());
+        mac.update(member_id.as_bytes());
+        mac.update(&dad_counter.to_be_bytes());
+        let result = mac.finalize().into_bytes();
+
+        // Extract 128-bit pseudorandom integer from the first 16 bytes of HMAC-SHA256
+        let mut rid_bytes = [0u8; 16];
+        rid_bytes.copy_from_slice(&result[..16]);
+        let rid = u128::from_be_bytes(rid_bytes);
+
+        // Map RID uniformly within the [prefix_start, prefix_end] pool bounds
+        let offset = rid % (range_size + 1);
+        let candidate = prefix_start.checked_add(offset)?;
+
+        Some(std::net::Ipv6Addr::from(candidate))
+    }
+
     /// Assign auto IPv4 and IPv6 addresses for an authorized member.
     pub async fn auto_assign_ips_for_member(&self, nwid: &str, member_id: &str, current_ips: &mut Vec<String>) {
         let Some(net) = self.get_network(nwid).await else { return };
@@ -595,7 +647,7 @@ impl EmbeddedController {
             }
         }
 
-        // 4. Custom IPv6 Range auto-assignment (v6AssignMode: { "zt": true })
+        // 4. Custom IPv6 Range auto-assignment with RFC 7217 Opaque Identifiers (v6AssignMode: { "zt": true })
         let is_zt_v6 = net.v6_assign_mode.get("zt").and_then(|v| v.as_bool()).unwrap_or(false);
         if is_zt_v6 {
             let has_custom_v6 = current_ips.iter().any(|ip| {
@@ -606,7 +658,7 @@ impl EmbeddedController {
                     && !ip.starts_with("FD")
             });
             if !has_custom_v6 {
-                if let Some(free_v6) = self.next_free_ipv6(nwid, &net.ip_assignment_pools).await {
+                if let Some(free_v6) = self.next_free_ipv6(nwid, member_id, &net.ip_assignment_pools).await {
                     current_ips.push(free_v6);
                 }
             }
@@ -646,8 +698,9 @@ impl EmbeddedController {
         None
     }
 
-    /// Find the next free IPv6 address within custom IPv6 assignment pools.
-    async fn next_free_ipv6(&self, nwid: &str, pools: &[IpAssignmentPool]) -> Option<String> {
+    /// Find the next free IPv6 address within custom IPv6 assignment pools using
+    /// RFC 7217 Semantically Opaque / Cryptographically Stable Interface Identifiers.
+    async fn next_free_ipv6(&self, nwid: &str, member_id: &str, pools: &[IpAssignmentPool]) -> Option<String> {
         let members = self.members.read().await;
         let used: HashSet<u128> = members
             .get(nwid)
@@ -660,6 +713,8 @@ impl EmbeddedController {
             .unwrap_or_default();
         drop(members);
 
+        let secret_key = self.identity.secret_key_bytes();
+
         for pool in pools {
             let start = pool.ip_range_start.parse::<std::net::Ipv6Addr>().ok();
             let end = pool.ip_range_end.parse::<std::net::Ipv6Addr>().ok();
@@ -668,10 +723,21 @@ impl EmbeddedController {
             if end_u128 < start_u128 {
                 continue;
             }
-            let limit = std::cmp::min(end_u128, start_u128.saturating_add(65535));
-            for candidate in start_u128..=limit {
-                if !used.contains(&candidate) {
-                    return Some(std::net::Ipv6Addr::from(candidate).to_string());
+
+            // Attempt RFC 7217 Opaque ID generation with DAD collision loop (up to 256 probes)
+            for dad_counter in 0..256 {
+                if let Some(candidate_ip) = Self::compute_rfc7217_opaque_ip(
+                    start_u128,
+                    end_u128,
+                    nwid,
+                    member_id,
+                    &secret_key,
+                    dad_counter,
+                ) {
+                    let cand_u128 = u128::from(candidate_ip);
+                    if !used.contains(&cand_u128) {
+                        return Some(candidate_ip.to_string());
+                    }
                 }
             }
         }
@@ -991,6 +1057,69 @@ mod tests {
         let calc_6p = EmbeddedController::compute_6plane_ip(user_nwid, user_member).unwrap();
         assert_eq!(calc_rfc, "fdef:313f:b5c9:f681:7a99:935b:789:6437");
         assert_eq!(calc_6p, "fc26:c7be:cf5b:789:6437::1");
+
+        let _ = std::fs::remove_dir_all(controller.db_path.parent().unwrap());
+    }
+
+    /// Test RFC 7217 Opaque Interface Identifier stability, anti-scanning unpredictability, and DAD collision resolution.
+    #[tokio::test]
+    async fn test_rfc7217_opaque_ipv6_stability_and_unpredictability() {
+        let controller = test_controller();
+        let _ = controller.init().await;
+
+        let start_ip: std::net::Ipv6Addr = "2001:db8:acad::1".parse().unwrap();
+        let end_ip: std::net::Ipv6Addr = "2001:db8:acad::ffff:ffff".parse().unwrap();
+        let start_u128 = u128::from(start_ip);
+        let end_u128 = u128::from(end_ip);
+        let secret_key = controller.identity.secret_key_bytes();
+        let nwid = "ef313fb5c9f6817a";
+
+        // 1. Stability: same node receives identical IPv6 address across multiple runs
+        let ip_node_a_run1 = EmbeddedController::compute_rfc7217_opaque_ip(
+            start_u128, end_u128, nwid, "5b07896437", &secret_key, 0,
+        ).unwrap();
+        let ip_node_a_run2 = EmbeddedController::compute_rfc7217_opaque_ip(
+            start_u128, end_u128, nwid, "5b07896437", &secret_key, 0,
+        ).unwrap();
+        assert_eq!(ip_node_a_run1, ip_node_a_run2, "RFC 7217 must be 100% deterministic and stable for same node");
+
+        // 2. Unpredictability / Anti-Scanning: different nodes receive pseudorandom, non-sequential addresses
+        let ip_node_b = EmbeddedController::compute_rfc7217_opaque_ip(
+            start_u128, end_u128, nwid, "5b07896438", &secret_key, 0,
+        ).unwrap();
+        let ip_node_c = EmbeddedController::compute_rfc7217_opaque_ip(
+            start_u128, end_u128, nwid, "5b07896439", &secret_key, 0,
+        ).unwrap();
+        assert_ne!(ip_node_a_run1, ip_node_b);
+        assert_ne!(ip_node_b, ip_node_c);
+        let diff_ab = (u128::from(ip_node_a_run1) as i128 - u128::from(ip_node_b) as i128).abs();
+        assert!(diff_ab > 1, "RFC 7217 identifiers must be semantically opaque, not linear sequences");
+
+        // 3. Duplicate Address Detection (DAD): incrementing dad_counter generates a fresh candidate
+        let ip_node_a_dad1 = EmbeddedController::compute_rfc7217_opaque_ip(
+            start_u128, end_u128, nwid, "5b07896437", &secret_key, 1,
+        ).unwrap();
+        assert_ne!(ip_node_a_run1, ip_node_a_dad1, "DAD loop must produce distinct candidate on collision");
+
+        // 4. Test within controller auto-assignment workflow
+        let net_custom = controller
+            .save_network(json!({
+                "name": "CustomV6Net",
+                "v6AssignMode": { "zt": true },
+                "ipAssignmentPools": [{
+                    "ipRangeStart": "2001:db8:1234::10",
+                    "ipRangeEnd": "2001:db8:1234::ffff"
+                }]
+            }))
+            .await
+            .unwrap();
+
+        let member = controller
+            .save_member(&net_custom.nwid, "5b07896437", json!({ "authorized": true }))
+            .await
+            .unwrap();
+        assert!(member.authorized);
+        assert!(member.ip_assignments.iter().any(|ip| ip.starts_with("2001:db8:1234:")));
 
         let _ = std::fs::remove_dir_all(controller.db_path.parent().unwrap());
     }

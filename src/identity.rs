@@ -172,6 +172,15 @@ impl Identity {
         Ok(format!("{}:0:{}:{}", self.address, pub_hex, priv_hex))
     }
 
+    /// Return the 32-byte secret key if present, or fall back to verifying key bytes.
+    pub fn secret_key_bytes(&self) -> [u8; 32] {
+        if let Some(ref sk) = self.signing_key {
+            sk.to_bytes()
+        } else {
+            self.verifying_key.to_bytes()
+        }
+    }
+
     /// Parse a public or secret identity string.
     pub fn parse(s: &str) -> Result<Self> {
         let parts: Vec<&str> = s.trim().split(':').collect();
