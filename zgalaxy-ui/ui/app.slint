@@ -490,23 +490,6 @@ export component MainWindow inherits Window {
                         color: Palette.foreground;
                     }
                 }
-                // About icon button
-                Rectangle {
-                    width: Tokens.ctrl-h;
-                    height: Tokens.ctrl-h;
-                    border-radius: Tokens.radius-sm;
-                    background: about-ta.has-hover ? Palette.alternate-background : transparent;
-                    about-ta := TouchArea {
-                        clicked => { root.current-view = "about"; }
-                    }
-                    Text {
-                        text: "ℹ";
-                        font-size: Tokens.font-section;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        color: Palette.foreground;
-                    }
-                }
             }
 
             if root.current-view != "main" : HorizontalLayout {
@@ -1110,6 +1093,23 @@ export component MainWindow inherits Window {
                 text: "v" + root.app-version;
                 font-size: Tokens.font-secondary;
                 vertical-alignment: center;
+            }
+            // About/Info icon button in Footer
+            Rectangle {
+                width: 22px;
+                height: 22px;
+                border-radius: 11px;
+                background: about-footer-ta.has-hover ? Palette.alternate-background : transparent;
+                about-footer-ta := TouchArea {
+                    clicked => { root.current-view = "about"; }
+                }
+                Text {
+                    text: "ℹ";
+                    font-size: Tokens.font-small;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    color: Palette.foreground.with-alpha(0.65);
+                }
             }
         }
     }
