@@ -28,7 +28,7 @@ export global Tokens {
     out property <length> radius-sm: 6px;
     out property <length> card-height: 64px;
     out property <length> nav-height: 36px;
-    out property <length> nav-width: 140px;
+    out property <length> nav-width: 150px;
     out property <length> pill-height: 28px;
     out property <length> accent-bar: 3px;
     // control geometry
@@ -40,8 +40,8 @@ export global Tokens {
     out property <color> warning: #b8860b;
     out property <color> error: #c62828;
     // window dimensions
-    out property <length> win-w: 520px;
-    out property <length> win-main-h: 620px;
+    out property <length> win-w: 580px;
+    out property <length> win-main-h: 640px;
 }
 
 export struct NetworkInfo {
@@ -861,10 +861,14 @@ export component MainWindow inherits Window {
                 if root.prefs-page == 0 : VerticalLayout {
                     spacing: Tokens.sp-3;
                     Text { text: "ZGALAXY Engine Sync"; font-size: Tokens.font-section; font-weight: 700; }
-                    SecondaryText { text: "Connect to a sovereign ZGALAXY Engine to dynamically discover, validate, and atomically synchronize Planet and Moon topology."; font-size: Tokens.font-secondary; }
+                    SecondaryText {
+                        text: "Connect to a sovereign ZGALAXY Engine to dynamically discover, validate, and atomically synchronize Planet and Moon topology.";
+                        font-size: Tokens.font-secondary;
+                        wrap: word-wrap;
+                    }
 
                     VerticalLayout {
-                        spacing: Tokens.sp-1;
+                        spacing: 4px;
                         Text { text: "Service Domain / URL"; font-size: Tokens.font-small; font-weight: 600; }
                         LineEdit {
                             text <=> root.sync-domain;
@@ -874,7 +878,7 @@ export component MainWindow inherits Window {
                     }
 
                     VerticalLayout {
-                        spacing: Tokens.sp-1;
+                        spacing: 4px;
                         Text { text: "Access Token / Signature"; font-size: Tokens.font-small; font-weight: 600; }
                         LineEdit {
                             text <=> root.sync-token;
@@ -884,28 +888,36 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    HorizontalLayout {
+                    Rectangle {
+                        height: 1px;
+                        background: Palette.foreground.with-alpha(0.08);
+                    }
+
+                    VerticalLayout {
                         spacing: Tokens.sp-2;
-                        Text { text: "Status:"; font-size: Tokens.font-secondary; font-weight: 600; vertical-alignment: center; }
-                        Text {
-                            text: root.sync-status-emoji + " " + root.sync-status-label;
-                            font-size: Tokens.font-secondary;
-                            color: root.sync-status-kind == "success" ? Tokens.success : root.sync-status-kind == "error" ? Tokens.error : Palette.foreground.with-alpha(0.7);
-                            vertical-alignment: center;
+                        HorizontalLayout {
+                            spacing: Tokens.sp-2;
+                            Text { text: "Status:"; font-size: Tokens.font-secondary; font-weight: 600; vertical-alignment: center; }
+                            Text {
+                                text: root.sync-status-emoji + " " + root.sync-status-label;
+                                font-size: Tokens.font-secondary;
+                                color: root.sync-status-kind == "success" ? Tokens.success : root.sync-status-kind == "error" ? Tokens.error : Palette.foreground.with-alpha(0.7);
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
                         }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
 
-                    HorizontalLayout {
-                        Text { text: "Active Topology:"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
-                        Rectangle { horizontal-stretch: 1; }
-                        Text { text: root.sync-topology-info; font-size: Tokens.font-secondary; }
-                    }
+                        HorizontalLayout {
+                            Text { text: "Active Topology:"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text { text: root.sync-topology-info; font-size: Tokens.font-secondary; font-weight: 600; }
+                        }
 
-                    HorizontalLayout {
-                        Text { text: "Last Sync:"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
-                        Rectangle { horizontal-stretch: 1; }
-                        Text { text: root.sync-last-time; font-size: Tokens.font-secondary; }
+                        HorizontalLayout {
+                            Text { text: "Last Sync:"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text { text: root.sync-last-time; font-size: Tokens.font-secondary; }
+                        }
                     }
 
                     Rectangle { vertical-stretch: 1; }
@@ -921,7 +933,7 @@ export component MainWindow inherits Window {
                         Button {
                             text: root.sync-busy ? "Syncing…" : "Sync Now";
                             min-height: Tokens.ctrl-h;
-                            min-width: 90px;
+                            min-width: 100px;
                             clicked => { root.sync-now(root.sync-domain, root.sync-token); }
                         }
                     }
@@ -931,6 +943,14 @@ export component MainWindow inherits Window {
                 if root.prefs-page == 1 : VerticalLayout {
                     spacing: Tokens.sp-3;
                     Text { text: "General Settings"; font-size: Tokens.font-section; font-weight: 700; }
+                    SecondaryText {
+                        text: "Manage desktop startup, system tray integration, and background execution.";
+                        font-size: Tokens.font-secondary;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle { height: 4px; }
+
                     CheckBox {
                         text: "Start with system";
                         checked <=> root.p-start-with-system;
@@ -953,6 +973,14 @@ export component MainWindow inherits Window {
                 if root.prefs-page == 2 : VerticalLayout {
                     spacing: Tokens.sp-3;
                     Text { text: "Notification Settings"; font-size: Tokens.font-section; font-weight: 700; }
+                    SecondaryText {
+                        text: "Configure desktop notifications for network status and peer discovery events.";
+                        font-size: Tokens.font-secondary;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle { height: 4px; }
+
                     CheckBox {
                         text: "Show status change notifications";
                         checked <=> root.p-notify-status;
@@ -965,15 +993,23 @@ export component MainWindow inherits Window {
                 if root.prefs-page == 3 : VerticalLayout {
                     spacing: Tokens.sp-3;
                     Text { text: "Service Details"; font-size: Tokens.font-section; font-weight: 700; }
+                    SecondaryText {
+                        text: "Runtime communication socket and local daemon health status.";
+                        font-size: Tokens.font-secondary;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle { height: 4px; }
+
                     HorizontalLayout {
-                        Text { text: "Local Daemon"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Text { text: "Local Daemon Socket:"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
                         Rectangle { horizontal-stretch: 1; }
-                        Text { text: root.adv-endpoint; font-size: Tokens.font-secondary; }
+                        Text { text: root.adv-endpoint; font-size: Tokens.font-secondary; font-weight: 600; }
                     }
                     HorizontalLayout {
-                        Text { text: "Service Health"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Text { text: "Service Health Status:"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
                         Rectangle { horizontal-stretch: 1; }
-                        Text { text: root.adv-service; font-size: Tokens.font-secondary; }
+                        Text { text: root.adv-service; font-size: Tokens.font-secondary; font-weight: 600; }
                     }
                     Rectangle { vertical-stretch: 1; }
                 }
@@ -982,8 +1018,14 @@ export component MainWindow inherits Window {
                 if root.prefs-page == 4 : VerticalLayout {
                     spacing: Tokens.sp-2;
                     Text { text: "Connected Peers"; font-size: Tokens.font-section; font-weight: 700; }
+                    SecondaryText {
+                        text: "Real-time ZeroTier direct peer links and round-trip latencies.";
+                        font-size: Tokens.font-secondary;
+                        wrap: word-wrap;
+                    }
+
                     if root.diag-peers.length == 0 : SecondaryText {
-                        text: "No active peers";
+                        text: "No active peers discovered";
                         font-size: Tokens.font-secondary;
                     }
                     ScrollView {
