@@ -8,6 +8,8 @@ use tracing::{info, debug};
 
 use crate::identity::Address;
 use crate::peer::{PeerManager, PeerRole};
+use crate::quic::QuicTransport;
+use crate::quic::control::ControlMessage;
 use crate::transport::UdpTransport;
 
 #[derive(Debug, Clone)]
@@ -25,6 +27,7 @@ pub struct NatTraversalEngine {
     path_candidates: Arc<RwLock<HashMap<Address, Vec<NatPathCandidate>>>>,
     keepalive_interval: Duration,
     transport: Arc<RwLock<Option<Arc<UdpTransport>>>>,
+    quic_transport: Arc<RwLock<Option<Arc<QuicTransport>>>>,
 }
 
 impl NatTraversalEngine {
@@ -34,10 +37,17 @@ impl NatTraversalEngine {
             path_candidates: Arc::new(RwLock::new(HashMap::new())),
             keepalive_interval: Duration::from_secs(25), // 25s keepalive for stateful NAT firewalls
             transport: Arc::new(RwLock::new(None)),
+            quic_transport: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Attach the active UDP transport to enable transmitting real keepalive probes
+    /// Attach the active QUIC transport to enable transmitting native QUIC probes
+    pub async fn set_quic_transport(&self, quic: Arc<QuicTransport>) {
+        let mut guard = self.quic_transport.write().await;
+        *guard = Some(quic);
+    }
+
+    /// Attach the active UDP transport to enable transmitting real keepalive probes (legacy)
     pub async fn set_transport(&self, transport: Arc<UdpTransport>) {
         let mut guard = self.transport.write().await;
         *guard = Some(transport);
@@ -78,13 +88,27 @@ impl NatTraversalEngine {
 
     async fn send_keepalives(&self) {
         let peers = self.peer_manager.list_peers().await;
+        let quic_opt = self.quic_transport.read().await.clone();
         let transport_opt = self.transport.read().await.clone();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
 
         for peer in peers {
             for path in peer.paths {
-                debug!("[ZGALAXY NAT KEEPALIVE] Probing path {} for peer {}", path.address, peer.address);
-                if let (Some(ref tp), Some(sock_addr)) = (&transport_opt, parse_path_addr(&path.address)) {
-                    let _ = tp.send_echo(sock_addr).await;
+                if let Some(sock_addr) = parse_path_addr(&path.address) {
+                    debug!("[ZGALAXY NAT KEEPALIVE] Probing path {} for peer {}", path.address, peer.address);
+                    if let Some(ref quic) = quic_opt {
+                        let ping = ControlMessage::Ping {
+                            nonce: rand::random::<u64>(),
+                            sent_ms: now,
+                        };
+                        let _ = quic.send_control(sock_addr, &ping).await;
+                    } else if let Some(ref tp) = transport_opt {
+                        let _ = tp.send_echo(sock_addr).await;
+                    }
                 }
             }
         }

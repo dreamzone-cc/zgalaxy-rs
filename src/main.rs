@@ -275,13 +275,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Transport selection: "quic" (primary, per architecture constraint) or
-    // "udp" (legacy path, kept until the QUIC data plane is feature-complete).
+    // Transport selection: "quic" (primary mandatory protocol) or
+    // "udp" (legacy fallback path).
     let transport_mode = local_config
         .settings
         .get("transportMode")
         .and_then(|v| v.as_str())
-        .unwrap_or("udp")
+        .unwrap_or("quic")
         .to_ascii_lowercase();
 
     // QUIC datagrams cannot exceed ~1200 bytes on the wire; a larger adapter
@@ -328,6 +328,9 @@ async fn main() -> Result<()> {
             Ok(quic) => {
                 quic_started = true;
                 let quic = Arc::new(quic);
+                nat_engine.set_quic_transport(Arc::clone(&quic)).await;
+                nat_engine.clone().start_worker();
+
                 let (quic_events_tx, mut quic_events_rx) = mpsc::channel(1024);
 
                 let quic_runner = Arc::clone(&quic);
