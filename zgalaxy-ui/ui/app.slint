@@ -355,6 +355,7 @@ export component MainWindow inherits Window {
     in-out property <string> a-address: "";
     in-out property <string> a-device: "";
     in-out property <string> a-mac: "";
+    in-out property <string> a-mtu: "2800";
     in-out property <string> a-type: "";
     in-out property <string> a-routes: "—";
     in-out property <string> a-dns: "—";
@@ -773,9 +774,16 @@ export component MainWindow inherits Window {
 
                     HorizontalLayout {
                         padding: 0;
-                        Text { text: "Managed IP"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Text { text: "Managed IP (v4/v6)"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
                         Rectangle { horizontal-stretch: 1; }
                         Text { text: root.a-address != "" ? root.a-address : "—"; font-size: Tokens.font-secondary; }
+                    }
+
+                    HorizontalLayout {
+                        padding: 0;
+                        Text { text: "MTU"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.a-mtu; font-size: Tokens.font-secondary; }
                     }
 
                     HorizontalLayout {

@@ -116,6 +116,7 @@ fn fill_advanced(ui: &MainWindow, snap: &[serde_json::Value], nwid: &str) {
         .and_then(|d| d.get("domain"))
         .and_then(|dom| dom.as_str())
         .unwrap_or("");
+    let mtu_val = n.get("mtu").and_then(|v| v.as_u64()).unwrap_or(2800);
     let gb = |k: &str| n.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
     ui.set_a_name(s(n, "name").into());
     ui.set_a_nwid(s(n, "id").into());
@@ -124,6 +125,7 @@ fn fill_advanced(ui: &MainWindow, snap: &[serde_json::Value], nwid: &str) {
     ui.set_a_address(if addr.is_empty() { "—".into() } else { addr.into() });
     ui.set_a_device(if s(n, "portDeviceName").is_empty() { "—".into() } else { s(n, "portDeviceName").into() });
     ui.set_a_mac(if s(n, "mac").is_empty() { "—".into() } else { s(n, "mac").into() });
+    ui.set_a_mtu(format!("{}", mtu_val).into());
     ui.set_a_type(s(n, "type").into());
     ui.set_a_routes(if routes.is_empty() { "—".into() } else { routes.into() });
     ui.set_a_dns(if dns.is_empty() { "—".into() } else { dns.into() });
