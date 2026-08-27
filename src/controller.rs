@@ -521,39 +521,37 @@ impl EmbeddedController {
         }
     }
 
-    /// Compute deterministic 6PLANE IPv6 address for a member in a network.
+    /// Compute deterministic 6PLANE IPv6 address for a member in a network (ZeroTier One canonical RFC).
     pub fn compute_6plane_ip(nwid: &str, member_id: &str) -> Option<String> {
-        if nwid.len() != 16 || member_id.len() != 10 {
-            return None;
-        }
-        let hex_str = format!(
-            "fc{}:{}:{}:{}:{}00::1",
-            &nwid[10..12],
-            &nwid[12..16],
-            &member_id[0..4],
-            &member_id[4..8],
-            &member_id[8..10]
-        );
-        hex_str.parse::<std::net::Ipv6Addr>().ok().map(|ip| ip.to_string())
+        let nwid_u64 = u64::from_str_radix(nwid, 16).ok()?;
+        let member_u64 = u64::from_str_radix(member_id, 16).ok()?;
+        let folded = ((nwid_u64 ^ (nwid_u64 >> 32)) as u32).to_be_bytes();
+        let mem_bytes = member_u64.to_be_bytes();
+
+        let mut octets = [0u8; 16];
+        octets[0] = 0xfc;
+        octets[1..5].copy_from_slice(&folded);
+        octets[5..10].copy_from_slice(&mem_bytes[3..8]);
+        octets[15] = 0x01;
+
+        Some(std::net::Ipv6Addr::from(octets).to_string())
     }
 
-    /// Compute deterministic RFC4193 IPv6 address for a member in a network.
+    /// Compute deterministic RFC4193 IPv6 address for a member in a network (ZeroTier One canonical RFC).
     pub fn compute_rfc4193_ip(nwid: &str, member_id: &str) -> Option<String> {
-        if nwid.len() != 16 || member_id.len() != 10 {
-            return None;
-        }
-        let hex_str = format!(
-            "fd{}:{}:{}:{}:{}{}:{}:{}:1",
-            &nwid[0..2],
-            &nwid[2..6],
-            &nwid[6..10],
-            &nwid[10..14],
-            &nwid[14..16],
-            &member_id[0..2],
-            &member_id[2..6],
-            &member_id[6..10]
-        );
-        hex_str.parse::<std::net::Ipv6Addr>().ok().map(|ip| ip.to_string())
+        let nwid_u64 = u64::from_str_radix(nwid, 16).ok()?;
+        let member_u64 = u64::from_str_radix(member_id, 16).ok()?;
+        let nwid_bytes = nwid_u64.to_be_bytes();
+        let mem_bytes = member_u64.to_be_bytes();
+
+        let mut octets = [0u8; 16];
+        octets[0] = 0xfd;
+        octets[1..9].copy_from_slice(&nwid_bytes);
+        octets[9] = 0x99;
+        octets[10] = 0x93;
+        octets[11..16].copy_from_slice(&mem_bytes[3..8]);
+
+        Some(std::net::Ipv6Addr::from(octets).to_string())
     }
 
     /// Assign auto IPv4 and IPv6 addresses for an authorized member.
