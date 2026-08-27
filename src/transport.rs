@@ -38,11 +38,20 @@ impl UdpTransport {
         resolver: Arc<DynamicDnsResolver>,
     ) -> Result<Self> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        let socket = UdpSocket::bind(addr)
-            .await
-            .with_context(|| format!("Failed to bind UDP socket on {}", addr))?;
-
-        info!("[ZGALAXY UDP TRANSPORT] Bound high-performance UDP router on {}", addr);
+        let socket = match UdpSocket::bind(addr).await {
+            Ok(s) => {
+                info!("[ZGALAXY UDP TRANSPORT] Bound high-performance UDP router on {}", addr);
+                s
+            }
+            Err(_) => {
+                let ephem_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+                let s = UdpSocket::bind(ephem_addr)
+                    .await
+                    .with_context(|| "Failed to bind client UDP socket".to_string())?;
+                info!("[ZGALAXY UDP TRANSPORT] Bound client UDP bridge on {}", s.local_addr()?);
+                s
+            }
+        };
 
         Ok(UdpTransport {
             socket: Arc::new(socket),

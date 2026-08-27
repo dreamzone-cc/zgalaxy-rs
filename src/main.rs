@@ -302,8 +302,6 @@ async fn main() -> Result<()> {
     let tun_arc = Arc::new(tun_device);
     tun_arc.start_packet_loop(tun_inbound_rx, tun_outbound_tx);
 
-    let mut quic_started = false;
-
     if transport_mode == "quic" {
         let bind_addr_v6 = std::net::SocketAddr::from(([0u8; 16], local_config.port));
         let bind_addr_v4 = std::net::SocketAddr::from(([0, 0, 0, 0], local_config.port));
@@ -326,7 +324,6 @@ async fn main() -> Result<()> {
         });
         match quic_res {
             Ok(quic) => {
-                quic_started = true;
                 let quic = Arc::new(quic);
                 nat_engine.set_quic_transport(Arc::clone(&quic)).await;
                 nat_engine.clone().start_worker();
@@ -979,8 +976,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    if transport_mode != "quic" || !quic_started {
-    nat_engine.clone().start_worker();
+    // Wire interoperability & ZeroTier / ZTNET UDP controller bridge:
+    // Starts UdpTransport so the client can query and register with standard
+    // ZeroTier UDP wire controllers (such as ZTNET on port 9993/9994) in parallel with QUIC.
     if let Ok(transport) = UdpTransport::bind(local_config.port, identity.clone(), peer_manager.clone(), resolver.clone()).await {
         let transport_arc = Arc::new(transport);
         transport_arc.set_controller(controller.clone()).await;
@@ -988,21 +986,21 @@ async fn main() -> Result<()> {
         transport_arc.start_rx_loop(tun_inbound_tx);
         nat_engine.set_transport(transport_arc.clone()).await;
 
-        // Relay host outbound frames captured from TUN into UDP wire transport
+        // Relay host outbound frames captured from TUN into UDP wire transport if not taken
         let tp_for_outbound = transport_arc.clone();
         if let Some(mut tun_outbound_rx) = tun_outbound_rx.take() {
-        tokio::spawn(async move {
-            while let Some(frame) = tun_outbound_rx.recv().await {
-                let _ = tp_for_outbound.broadcast_frame(frame).await;
-            }
-        });
+            tokio::spawn(async move {
+                while let Some(frame) = tun_outbound_rx.recv().await {
+                    let _ = tp_for_outbound.broadcast_frame(frame).await;
+                }
+            });
         }
 
         // Instant network join trigger task
         let tp_for_instant = transport_arc.clone();
         spawn_watched("instant-udp-join-trigger", async move {
             while let Some(nwid) = join_rx.recv().await {
-                info!("[ZGALAXY INSTANT JOIN] Dispatched NetworkConfigRequest immediately for {}", nwid);
+                info!("[ZGALAXY INSTANT JOIN] Dispatched UDP NetworkConfigRequest immediately for {}", nwid);
                 let _ = tp_for_instant.send_network_config_request(&nwid).await;
             }
         });
@@ -1023,7 +1021,6 @@ async fn main() -> Result<()> {
     } else {
         warn!("[ZGALAXY UDP] Could not bind UDP port {}, running in client API mode.", local_config.port);
     }
-    } // end legacy UDP transport block
 
     // Auto-join configured networks from networks.d/
     for nwid in &local_config.auto_join_networks {
