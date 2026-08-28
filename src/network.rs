@@ -262,21 +262,7 @@ impl NetworkManager {
         Ok(cloned)
     }
 
-    pub async fn update_network(&self, mut net: Network) {
-        if net.status == NetworkStatus::Ok {
-            if let Some(ref node) = *self.node_address.read().await {
-                if let Some(v6_6p) = crate::controller::EmbeddedController::compute_6plane_ip(&net.nwid, node) {
-                    if !net.assigned_addresses.contains(&v6_6p) {
-                        net.assigned_addresses.push(v6_6p);
-                    }
-                }
-                if let Some(v6_rfc) = crate::controller::EmbeddedController::compute_rfc4193_ip(&net.nwid, node) {
-                    if !net.assigned_addresses.contains(&v6_rfc) {
-                        net.assigned_addresses.push(v6_rfc);
-                    }
-                }
-            }
-        }
+    pub async fn update_network(&self, net: Network) {
         let mut networks = self.networks.write().await;
         networks.insert(net.nwid.clone(), net.clone());
         drop(networks);
