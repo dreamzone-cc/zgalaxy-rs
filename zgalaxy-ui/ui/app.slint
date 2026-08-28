@@ -352,11 +352,14 @@ export component MainWindow inherits Window {
     in-out property <string> d-ipv6-6plane: "";
     in-out property <string> d-ipv6-rfc4193: "";
     in-out property <string> d-ipv6-other: "";
+    in-out property <string> d-role: "Joined Member (Client Mode)";
     in-out property <bool> d-connected: false;
 
     // Advanced Window State
     in-out property <string> a-name: "";
     in-out property <string> a-nwid: "";
+    in-out property <string> a-role: "Joined Member (Client Mode)";
+    in-out property <string> a-controller: "";
     in-out property <string> a-state-emoji: "🟠";
     in-out property <string> a-state-label: "";
     in-out property <string> a-address: "";
@@ -809,6 +812,24 @@ export component MainWindow inherits Window {
                     VerticalLayout {
                         spacing: Tokens.sp-1;
                         SecondaryText {
+                            text: "Network Role & Authority";
+                            font-size: Tokens.font-secondary;
+                        }
+                        Text {
+                            text: root.d-role;
+                            font-size: Tokens.font-body;
+                            color: root.d-role == "Network Owner (Controller)" ? Tokens.galaxy-gold : Palette.foreground;
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: Palette.foreground.with-alpha(0.1);
+                    }
+
+                    VerticalLayout {
+                        spacing: Tokens.sp-1;
+                        SecondaryText {
                             text: "Connection State";
                             font-size: Tokens.font-secondary;
                         }
@@ -876,6 +897,20 @@ export component MainWindow inherits Window {
                         Text { text: "Network ID"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
                         Rectangle { horizontal-stretch: 1; }
                         Text { text: root.a-nwid; font-size: Tokens.font-secondary; }
+                    }
+
+                    HorizontalLayout {
+                        padding: 0;
+                        Text { text: "Network Role"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.a-role; font-size: Tokens.font-secondary; color: root.a-role == "Network Owner (Controller)" ? Tokens.galaxy-gold : Palette.foreground; }
+                    }
+
+                    HorizontalLayout {
+                        padding: 0;
+                        Text { text: "Network Controller"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.a-controller; font-size: Tokens.font-secondary; }
                     }
 
                     HorizontalLayout {

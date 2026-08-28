@@ -132,8 +132,17 @@ fn fill_details(ui: &MainWindow, snap: &[serde_json::Value], nwid: &str) {
     let state = net_state(n);
     let cats = categorize_ips(n);
 
+    let my_node = ui.get_node_address().to_string().trim().to_lowercase();
+    let is_owner = clean.len() >= 10 && !my_node.is_empty() && clean.starts_with(&my_node);
+    let role = if is_owner {
+        "Network Owner (Controller)"
+    } else {
+        "Joined Member (Client Mode)"
+    };
+
     ui.set_d_nwid(s(n, "id").into());
     ui.set_d_name(s(n, "name").into());
+    ui.set_d_role(role.into());
     ui.set_d_state_emoji(state.emoji().into());
     ui.set_d_state_label(state.label().into());
     ui.set_d_state_kind(state.kind().into());
@@ -151,6 +160,15 @@ fn fill_advanced(ui: &MainWindow, snap: &[serde_json::Value], nwid: &str) {
     let Some(n) = found else { return };
     let state = net_state(n);
     let cats = categorize_ips(n);
+
+    let my_node = ui.get_node_address().to_string().trim().to_lowercase();
+    let is_owner = clean.len() >= 10 && !my_node.is_empty() && clean.starts_with(&my_node);
+    let role = if is_owner {
+        "Network Owner (Controller)"
+    } else {
+        "Joined Member (Client Mode)"
+    };
+    let controller_id = if clean.len() >= 10 { &clean[..10] } else { "—" };
 
     let routes = n
         .get("routes")
@@ -171,6 +189,8 @@ fn fill_advanced(ui: &MainWindow, snap: &[serde_json::Value], nwid: &str) {
     let gb = |k: &str| n.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
     ui.set_a_name(s(n, "name").into());
     ui.set_a_nwid(s(n, "id").into());
+    ui.set_a_role(role.into());
+    ui.set_a_controller(controller_id.into());
     ui.set_a_state_emoji(state.emoji().into());
     ui.set_a_state_label(state.label().into());
     ui.set_a_address(if cats.all_joined.is_empty() { "—".into() } else { cats.all_joined.into() });
