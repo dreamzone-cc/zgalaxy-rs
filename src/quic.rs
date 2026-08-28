@@ -255,7 +255,7 @@ impl QuicTransport {
             let events = events_tx.clone();
             tokio::spawn(async move {
                 if let Err(e) = this.handle_incoming(incoming, events).await {
-                    warn!("[ZGALAXY QUIC] inbound connection failed: {}", e);
+                    warn!("[ZGALAXY QUIC] inbound connection failed: {:#}", e);
                 }
             });
         }

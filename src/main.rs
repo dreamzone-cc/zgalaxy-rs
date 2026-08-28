@@ -954,8 +954,8 @@ async fn main() -> Result<()> {
                                 Err((target, e)) => {
                                     failed += 1;
                                     let nwid0 = nets.first().map(|n| n.nwid.clone()).unwrap_or_default();
-                                    tracing::debug!(
-                                        "[ZGALAXY QUIC] config request to {} for {} failed: {}",
+                                    warn!(
+                                        "[ZGALAXY QUIC SYNC] request to {} for {} failed: {:#}",
                                         target,
                                         nwid0,
                                         e

@@ -105,6 +105,7 @@ pub struct Identity {
     pub address: Address,
     pub verifying_key: VerifyingKey,
     pub signing_key: Option<SigningKey>,
+    pub raw_public_key: Vec<u8>,
 }
 
 impl Identity {
@@ -130,6 +131,7 @@ impl Identity {
                         address,
                         verifying_key,
                         signing_key: Some(signing_key),
+                        raw_public_key: pub_bytes.to_vec(),
                     };
                 }
             }
@@ -157,7 +159,11 @@ impl Identity {
 
     /// Serialize public identity string: `<address>:0:<pubkey_hex>`
     pub fn to_public_string(&self) -> String {
-        let pub_hex = hex::encode(self.verifying_key.to_bytes());
+        let pub_hex = if !self.raw_public_key.is_empty() {
+            hex::encode(&self.raw_public_key)
+        } else {
+            hex::encode(self.verifying_key.to_bytes())
+        };
         format!("{}:0:{}", self.address, pub_hex)
     }
 
@@ -167,7 +173,11 @@ impl Identity {
             Some(sk) => sk,
             None => bail!("Secret key is not present in this identity"),
         };
-        let pub_hex = hex::encode(self.verifying_key.to_bytes());
+        let pub_hex = if !self.raw_public_key.is_empty() {
+            hex::encode(&self.raw_public_key)
+        } else {
+            hex::encode(self.verifying_key.to_bytes())
+        };
         let priv_hex = hex::encode(signing_key.to_bytes());
         Ok(format!("{}:0:{}:{}", self.address, pub_hex, priv_hex))
     }
@@ -278,6 +288,7 @@ impl Identity {
             address,
             verifying_key,
             signing_key,
+            raw_public_key: pub_bytes,
         })
     }
 }
@@ -308,5 +319,21 @@ mod tests {
         let sig = id.sign(msg).unwrap();
         assert!(parsed_pub.verify(msg, &sig));
         assert!(!parsed_pub.verify(b"Corrupt Message", &sig));
+    }
+
+    #[test]
+    fn test_64byte_canonical_zerotier_identity_preservation_and_proof_verification() {
+        // Canonical 64-byte ZeroTier identity string (128 hex chars public key)
+        let canonical_pub = "5b07896437:0:7fca064174f0ab4cdffe89e77fb8a4ae32de94f663c95f6e4dcdd26ae266f5682d07195bf70e8e2ac0cf69c721c31ae2d51a4df2e233ea24907a57901ac0572e";
+        let id = Identity::parse(canonical_pub).unwrap();
+        assert_eq!(id.address.to_string(), "5b07896437");
+        assert_eq!(id.raw_public_key.len(), 64);
+
+        // Crucial test: to_public_string() MUST preserve all 64 bytes (128 hex chars), not truncate to 32 bytes!
+        let exported = id.to_public_string();
+        assert_eq!(exported, canonical_pub, "Exported public identity string must preserve the full 64-byte key");
+
+        let reloaded = Identity::parse(&exported).unwrap();
+        assert_eq!(reloaded.address.to_string(), "5b07896437");
     }
 }
