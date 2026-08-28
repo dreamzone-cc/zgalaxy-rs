@@ -23,6 +23,7 @@ pub struct AppState {
     pub peer_manager: PeerManager,
     pub network_manager: NetworkManager,
     pub controller: EmbeddedController,
+    pub controller_enabled: bool,
     pub resolver: Arc<DynamicDnsResolver>,
     /// CIDRs / plain IPs allowed to reach the management API.
     /// Loopback is always allowed. (local.conf allowManagementFrom)
@@ -149,8 +150,8 @@ async fn get_controller_status(
     }
 
     Ok(Json(json!({
-        "controller": true,
-        "apiVersion": 1,
+        "controller": state.controller_enabled,
+        "apiVersion": if state.controller_enabled { 1 } else { 0 },
         "clock": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -311,6 +312,9 @@ async fn list_controller_networks(
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    if !state.controller_enabled {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let list = state.controller.list_networks().await;
     Ok(Json(list))
 }
@@ -322,6 +326,9 @@ async fn create_controller_network(
 ) -> Result<impl IntoResponse, StatusCode> {
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
+    }
+    if !state.controller_enabled {
+        return Err(StatusCode::FORBIDDEN);
     }
 
     match state.controller.save_network(payload).await {
@@ -341,6 +348,9 @@ async fn get_controller_network(
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    if !state.controller_enabled {
+        return Err(StatusCode::FORBIDDEN);
+    }
     if let Some(net) = state.controller.get_network(&nwid).await {
         return Ok(Json(serde_json::to_value(net).unwrap_or_default()));
     }
@@ -355,6 +365,9 @@ async fn update_controller_network(
 ) -> Result<impl IntoResponse, StatusCode> {
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
+    }
+    if !state.controller_enabled {
+        return Err(StatusCode::FORBIDDEN);
     }
     if !nwid.contains("______") {
         payload["id"] = json!(nwid);
@@ -375,6 +388,9 @@ async fn delete_controller_network(
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    if !state.controller_enabled {
+        return Err(StatusCode::FORBIDDEN);
+    }
     match state.controller.delete_network(&nwid).await {
         Ok(true) => Ok(Json(json!({ "id": nwid, "deleted": true }))),
         _ => Err(StatusCode::NOT_FOUND),
@@ -389,6 +405,9 @@ async fn list_controller_members(
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    if !state.controller_enabled {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let map = state.controller.list_members(&nwid).await;
     Ok(Json(json!(map)))
 }
@@ -400,6 +419,9 @@ async fn get_controller_member(
 ) -> Result<impl IntoResponse, StatusCode> {
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
+    }
+    if !state.controller_enabled {
+        return Err(StatusCode::FORBIDDEN);
     }
     if let Some(member) = state.controller.get_effective_member(&nwid, &member_id).await {
         return Ok(Json(serde_json::to_value(member).unwrap_or_default()));
@@ -416,6 +438,9 @@ async fn update_controller_member(
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    if !state.controller_enabled {
+        return Err(StatusCode::FORBIDDEN);
+    }
     match state.controller.save_member(&nwid, &member_id, payload).await {
         Ok(member) => Ok(Json(serde_json::to_value(member).unwrap_or_default())),
         Err(_) => Err(StatusCode::BAD_REQUEST),
@@ -429,6 +454,9 @@ async fn delete_controller_member(
 ) -> Result<impl IntoResponse, StatusCode> {
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
+    }
+    if !state.controller_enabled {
+        return Err(StatusCode::FORBIDDEN);
     }
     match state.controller.delete_member(&nwid, &member_id).await {
         Ok(true) => Ok(Json(json!({ "id": member_id, "deleted": true }))),

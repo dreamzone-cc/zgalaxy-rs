@@ -14,6 +14,8 @@ pub struct LocalConfig {
     #[serde(default = "default_management_from")]
     pub allow_management_from: Vec<String>,
     #[serde(default)]
+    pub controller_enabled: bool,
+    #[serde(default)]
     pub interface_blacklist: Vec<String>,
     #[serde(default)]
     pub interface_whitelist: Vec<String>,
@@ -40,6 +42,7 @@ impl Default for LocalConfig {
         LocalConfig {
             port: 9993,
             allow_management_from: vec!["127.0.0.1".to_string(), "::1".to_string()],
+            controller_enabled: false,
             interface_blacklist: Vec::new(),
             interface_whitelist: Vec::new(),
             auto_join_networks: Vec::new(),
@@ -63,6 +66,20 @@ impl LocalConfig {
                     info!("[ZGALAXY CONFIG] Loaded local.conf from {:?}", conf_file);
                 }
             }
+        }
+
+        // Canonical ZeroTier settings.controller or settings.allowController
+        if let Some(ctrl) = cfg.settings.get("controller").or_else(|| cfg.settings.get("allowController")).and_then(|v| v.as_bool()) {
+            cfg.controller_enabled = ctrl;
+        }
+
+        // Environment variables: ZGALAXY_CONTROLLER=1, ZGALAXY_MODE=controller, ZEROTIER_CONTROLLER=1
+        if let Ok(env_ctrl) = std::env::var("ZGALAXY_CONTROLLER") {
+            cfg.controller_enabled = env_ctrl == "1" || env_ctrl.eq_ignore_ascii_case("true");
+        } else if let Ok(env_mode) = std::env::var("ZGALAXY_MODE") {
+            cfg.controller_enabled = env_mode.eq_ignore_ascii_case("controller");
+        } else if let Ok(env_zt_ctrl) = std::env::var("ZEROTIER_CONTROLLER") {
+            cfg.controller_enabled = env_zt_ctrl == "1" || env_zt_ctrl.eq_ignore_ascii_case("true");
         }
 
         // Canonical ZeroTier local.conf carries the port under

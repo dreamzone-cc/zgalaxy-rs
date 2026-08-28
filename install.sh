@@ -12,6 +12,25 @@ fi
 BIN_DEST="/usr/local/bin/zgalaxy-rs"
 SERVICE_DEST="/etc/systemd/system/zgalaxy-client.service"
 
+MODE="client"
+INSTALL_DESKTOP=true
+
+for arg in "$@"; do
+  case "$arg" in
+    --controller|--mode=controller|-C)
+      MODE="controller"
+      ;;
+    --client|--mode=client)
+      MODE="client"
+      ;;
+    --headless|--no-desktop)
+      INSTALL_DESKTOP=false
+      ;;
+    *)
+      ;;
+  esac
+done
+
 log() { echo "[ZGALAXY-RS] $*"; }
 
 ensure_cargo() {
@@ -39,15 +58,50 @@ build_and_install() {
   ln -sf "$BIN_DEST" /usr/local/bin/zgalaxy-idtool
 
   mkdir -p /var/lib/zerotier-one
+
+  if [ "$MODE" = "controller" ]; then
+    log "Configuring local.conf for Controller Mode (ZTNet)..."
+    cat <<'EOF' > /var/lib/zerotier-one/local.conf
+{
+  "settings": {
+    "controller": true,
+    "allowManagementFrom": ["127.0.0.1", "::1"]
+  }
+}
+EOF
+  fi
 }
 
 setup_service() {
   if [ -d /run/systemd/system ]; then
-    log "Registering and starting systemd service..."
-    install -m 0644 zgalaxy-client.service "$SERVICE_DEST"
+    log "Registering and starting systemd service (Mode: ${MODE})..."
+    local EXEC_CMD="/usr/local/bin/zgalaxy-rs"
+    if [ "$MODE" = "controller" ]; then
+      EXEC_CMD="/usr/local/bin/zgalaxy-rs --controller"
+    fi
+
+    cat <<EOF > "$SERVICE_DEST"
+[Unit]
+Description=ZGALAXY Sovereign ZeroTier Client Daemon (Rust) - ${MODE} Mode
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${EXEC_CMD}
+Restart=always
+RestartSec=3
+User=root
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
     systemctl daemon-reload
     systemctl enable --now zgalaxy-client.service
-    log "Service active and running ✓"
+    log "Service active and running (${MODE} mode) ✓"
   fi
 }
 
@@ -99,6 +153,8 @@ install_desktop() {
 
 build_and_install
 setup_service
-install_desktop
+if [ "$INSTALL_DESKTOP" = "true" ] && [ "$MODE" = "client" ]; then
+  install_desktop
+fi
 
-log "Installation complete! Check status with: zgalaxy-cli status"
+log "Installation complete! Mode: ${MODE}. Check status with: zgalaxy-cli status"

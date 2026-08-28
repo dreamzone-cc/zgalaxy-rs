@@ -243,6 +243,7 @@ async fn test_matrix_rest_api_auth_and_contract_invariance() {
         peer_manager,
         network_manager,
         controller,
+        controller_enabled: true,
         resolver,
         join_trigger: None,
     };
@@ -314,6 +315,7 @@ async fn test_matrix_network_settings_update_via_post_body() {
         peer_manager,
         network_manager,
         controller,
+        controller_enabled: true,
         resolver,
         join_trigger: None,
     };

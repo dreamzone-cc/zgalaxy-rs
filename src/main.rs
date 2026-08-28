@@ -45,13 +45,20 @@ async fn main() -> Result<()> {
     let bin_name = argv0.rsplit('/').next().unwrap_or(&argv0).to_string();
     let mut cli_args: Vec<String> = std::env::args().skip(1).collect();
 
-    // ZeroTier daemon flags: -d (fork to background) and -p<port> (port
-    // override with highest precedence, e.g. `zerotier-one -p9994 -d`).
+    // ZeroTier daemon flags: -d (fork to background), -p<port> (port override),
+    // and -C / --controller / --client (controller vs client mode).
     let mut daemonize = false;
     let mut port_override: Option<u16> = None;
+    let mut controller_cli_override: Option<bool> = None;
     cli_args.retain(|a| {
         if a == "-d" {
             daemonize = true;
+            false
+        } else if a == "-C" || a == "--controller" || a == "--mode=controller" {
+            controller_cli_override = Some(true);
+            false
+        } else if a == "--client" || a == "--mode=client" {
+            controller_cli_override = Some(false);
             false
         } else if a.starts_with("-p")
             && a.len() > 2
@@ -67,13 +74,20 @@ async fn main() -> Result<()> {
     if daemonize {
         // Re-spawn without -d in a new process group (detached, stdio null)
         // and exit — matching the ZeroTier `-d` daemonize contract that the
-        // ZGALAXY container entrypoint relies on. The port flag must be
-        // re-passed to the child: it was consumed from argv above.
+        // ZGALAXY container entrypoint relies on. The port and mode flags must be
+        // re-passed to the child: they were consumed from argv above.
         use std::os::unix::process::CommandExt;
         let exe = std::env::current_exe().context("cannot resolve own executable")?;
         let mut child_args = cli_args.clone();
         if let Some(p) = port_override {
             child_args.push(format!("-p{}", p));
+        }
+        if let Some(ctrl) = controller_cli_override {
+            if ctrl {
+                child_args.push("--controller".to_string());
+            } else {
+                child_args.push("--client".to_string());
+            }
         }
         std::process::Command::new(exe)
             .args(&child_args)
@@ -208,6 +222,17 @@ async fn main() -> Result<()> {
         .await;
     let _ = network_manager.load_from_disk(&working_dir).await;
 
+    // Apply CLI controller mode override if present
+    if let Some(ctrl) = controller_cli_override {
+        local_config.controller_enabled = ctrl;
+    }
+
+    if local_config.controller_enabled {
+        info!("[ZGALAXY MODE] Running in CONTROLLER Mode (ZTNet & Controller Management Active)");
+    } else {
+        info!("[ZGALAXY MODE] Running in CLIENT Mode (Standard Default)");
+    }
+
     // Resolve domain dynamically (Separation of Dynamic Config from Core Build)
     let domain_file = working_dir.join("domain");
     let fallback_domain_file = PathBuf::from("./config/domain");
@@ -235,7 +260,10 @@ async fn main() -> Result<()> {
 
     // Initialize Embedded Controller (Pure Rust, FileDB compatible with ZeroTier controller.d/)
     let controller = EmbeddedController::new(identity.clone(), working_dir.clone());
-    let _ = controller.init().await;
+    if local_config.controller_enabled {
+        let _ = controller.init().await;
+        info!("[ZGALAXY CONTROLLER] Embedded controller database initialized under {:?}", working_dir.join("controller.d"));
+    }
 
     // Start Local REST API Controller Plane on the same port as the UDP
     // transport (ZeroTier binds its control plane and wire socket together).
@@ -248,6 +276,7 @@ async fn main() -> Result<()> {
         peer_manager: peer_manager.clone(),
         network_manager: network_manager.clone(),
         controller: controller.clone(),
+        controller_enabled: local_config.controller_enabled,
         resolver: resolver.clone(),
         join_trigger: Some(join_tx),
     };
@@ -349,6 +378,7 @@ async fn main() -> Result<()> {
                 let peers_for_events = peer_manager.clone();
                 let identity_for_events = identity.clone();
                 let l2_for_events = Arc::clone(&l2_shared);
+                let is_controller_node = local_config.controller_enabled;
                 tokio::spawn(async move {
                     while let Some(event) = quic_events_rx.recv().await {
                         use zgalaxy_rs::quic::QuicEvent;
@@ -496,6 +526,10 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     ControlMessage::NetworkConfigRequest { nwid, token } => {
+                                        if !is_controller_node {
+                                            warn!("[ZGALAXY QUIC] Inbound config request from {} for {} ignored: node is in Client Mode", remote, nwid);
+                                            continue;
+                                        }
                                         // Act as controller for networks owned by this node.
                                         // The member id MUST be the announced node address —
                                         // anything else cannot map to a member record.
