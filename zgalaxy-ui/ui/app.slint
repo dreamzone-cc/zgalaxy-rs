@@ -322,7 +322,6 @@ export component MainWindow inherits Window {
 
     // View Routing: "main" | "details" | "advanced" | "preferences" | "about"
     in-out property <string> current-view: "main";
-    in-out property <bool> show-join-modal: false;
 
     // Node & Service State
     in-out property <string> node-address: "…";
@@ -334,7 +333,10 @@ export component MainWindow inherits Window {
     in-out property <[NetworkInfo]> networks;
     in-out property <string> app-version: "";
 
-    // Join Modal State
+    // Modal State
+    in-out property <bool> show-join-modal: false;
+    in-out property <bool> show-delete-modal: false;
+    in-out property <bool> delete-busy: false;
     in-out property <string> join-input: "";
     in-out property <bool> join-busy: false;
     in-out property <string> join-error-text: "";
@@ -408,6 +410,9 @@ export component MainWindow inherits Window {
     callback copy-text(string);
     callback leave-network(string);
     callback disconnect-current();
+    callback connect-current();
+    callback open-delete-confirm();
+    callback confirm-delete-current();
     callback advanced-flags-changed();
     callback prefs-changed();
     callback sync-now(string, string);
@@ -419,6 +424,10 @@ export component MainWindow inherits Window {
             if (event.text == Key.Escape) {
                 if (root.show-join-modal) {
                     root.show-join-modal = false;
+                    return accept;
+                }
+                if (root.show-delete-modal) {
+                    root.show-delete-modal = false;
                     return accept;
                 }
                 if (root.current-view == "advanced") {
@@ -804,9 +813,11 @@ export component MainWindow inherits Window {
                             font-size: Tokens.font-secondary;
                         }
                         Text {
-                            text: root.d-connected ? "● Connected & Ready" : "○ Waiting for authorization / offline";
+                            text: root.d-state-label == "Disconnected" ? "○ Disconnected / Offline"
+                                : root.d-connected ? "● Connected & Ready"
+                                : "○ Connecting / Waiting for authorization";
                             font-size: Tokens.font-body;
-                            color: root.d-connected ? Tokens.success : Palette.foreground.with-alpha(0.55);
+                            color: root.d-connected ? Tokens.success : root.d-state-label == "Disconnected" ? Palette.foreground.with-alpha(0.4) : Tokens.warning;
                         }
                     }
                 }
@@ -815,19 +826,32 @@ export component MainWindow inherits Window {
             Rectangle { vertical-stretch: 1; }
 
             HorizontalLayout {
-                spacing: Tokens.sp-3;
+                spacing: Tokens.sp-2;
                 alignment: end;
+                Button {
+                    text: "Delete Network";
+                    min-height: Tokens.ctrl-h;
+                    min-width: Tokens.btn-min-w;
+                    clicked => { root.open-delete-confirm(); }
+                }
+                Rectangle { horizontal-stretch: 1; }
                 Button {
                     text: "Advanced Settings…";
                     min-height: Tokens.ctrl-h;
                     min-width: Tokens.btn-min-w;
                     clicked => { root.open-advanced(); }
                 }
-                Button {
+                if root.d-connected || root.d-state-label != "Disconnected" : Button {
                     text: "Disconnect";
                     min-height: Tokens.ctrl-h;
                     min-width: Tokens.btn-min-w;
                     clicked => { root.disconnect-current(); }
+                }
+                if !root.d-connected && root.d-state-label == "Disconnected" : Button {
+                    text: "Connect";
+                    min-height: Tokens.ctrl-h;
+                    min-width: Tokens.btn-min-w;
+                    clicked => { root.connect-current(); }
                 }
             }
         }
@@ -1362,6 +1386,108 @@ export component MainWindow inherits Window {
                         enabled: !root.join-busy && root.join-input != "";
                         clicked => {
                             root.request-join(root.join-input);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // =======================================================================
+    // MODAL OVERLAY: Delete Network Confirmation Dialog
+    // =======================================================================
+    if root.show-delete-modal : Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #00000088;
+
+        // Click on dark backdrop to dismiss
+        del-modal-backdrop-ta := TouchArea {
+            clicked => {
+                if (!root.delete-busy) {
+                    root.show-delete-modal = false;
+                }
+            }
+        }
+
+        // Dialog Card
+        Rectangle {
+            width: Tokens.win-w - 40px;
+            height: 220px;
+            border-radius: Tokens.radius;
+            background: Palette.background;
+            border-width: 1px;
+            border-color: Palette.foreground.with-alpha(0.15);
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000066;
+
+            VerticalBox {
+                padding: Tokens.sp-4;
+                spacing: Tokens.sp-3;
+
+                HorizontalLayout {
+                    Text {
+                        text: "Delete Network";
+                        font-size: Tokens.font-section;
+                        font-weight: 700;
+                        color: Tokens.error;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Rectangle {
+                        width: 24px;
+                        height: 24px;
+                        border-radius: 12px;
+                        background: close-del-modal-ta.has-hover ? Palette.alternate-background : transparent;
+                        close-del-modal-ta := TouchArea {
+                            clicked => {
+                                if (!root.delete-busy) {
+                                    root.show-delete-modal = false;
+                                }
+                            }
+                        }
+                        Text {
+                            text: "✕";
+                            font-size: Tokens.font-secondary;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Are you sure you want to delete network '" + root.d-name + "' (" + root.d-nwid + ") from this client?";
+                    font-size: Tokens.font-body;
+                    font-weight: 600;
+                    color: Palette.foreground;
+                    wrap: word-wrap;
+                }
+
+                SecondaryText {
+                    text: "If currently connected, the network will be automatically disconnected first, interface routes will be released, and the network will be permanently removed.";
+                    font-size: Tokens.font-secondary;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: Tokens.sp-2;
+                    Button {
+                        text: "Cancel";
+                        min-height: Tokens.ctrl-h;
+                        min-width: Tokens.btn-min-w;
+                        enabled: !root.delete-busy;
+                        clicked => { root.show-delete-modal = false; }
+                    }
+                    Button {
+                        text: "Delete Network";
+                        min-height: Tokens.ctrl-h;
+                        min-width: Tokens.btn-min-w;
+                        enabled: !root.delete-busy;
+                        clicked => {
+                            root.confirm-delete-current();
                         }
                     }
                 }

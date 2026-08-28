@@ -137,6 +137,98 @@ impl RouteManager {
 
         Ok(())
     }
+
+    /// Remove IP address (IPv4 or IPv6 with CIDR) from the virtual network interface.
+    pub fn remove_interface_ip(device_name: &str, ip_with_cidr: &str) -> Result<()> {
+        info!("[ZGALAXY ROUTE MANAGER] Removing IP {} from interface {}", ip_with_cidr, device_name);
+        let _is_v6 = ip_with_cidr.contains(':');
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = Command::new("ip")
+                .args(["addr", "del", ip_with_cidr, "dev", device_name])
+                .status();
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let parts: Vec<&str> = ip_with_cidr.split('/').collect();
+            let ip = parts[0];
+            if _is_v6 {
+                let _ = Command::new("netsh")
+                    .args(["interface", "ipv6", "delete", "address", device_name, ip])
+                    .status();
+            } else {
+                let _ = Command::new("netsh")
+                    .args(["interface", "ipv4", "delete", "address", device_name, ip])
+                    .status();
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let parts: Vec<&str> = ip_with_cidr.split('/').collect();
+            let ip = parts[0];
+            if _is_v6 {
+                let _ = Command::new("ifconfig")
+                    .args([device_name, "inet6", ip_with_cidr, "delete"])
+                    .status();
+            } else {
+                let _ = Command::new("ifconfig")
+                    .args([device_name, "inet", ip, "delete"])
+                    .status();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove a managed network route (IPv4 or IPv6) through the virtual interface.
+    pub fn remove_route(device_name: &str, target_subnet: &str) -> Result<()> {
+        info!("[ZGALAXY ROUTE MANAGER] Removing route {} via interface {}", target_subnet, device_name);
+        let is_v6 = target_subnet.contains(':');
+
+        #[cfg(target_os = "linux")]
+        {
+            if is_v6 {
+                let _ = Command::new("ip")
+                    .args(["-6", "route", "del", target_subnet, "dev", device_name])
+                    .status();
+            } else {
+                let _ = Command::new("ip")
+                    .args(["route", "del", target_subnet, "dev", device_name])
+                    .status();
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if is_v6 {
+                let _ = Command::new("netsh")
+                    .args(["interface", "ipv6", "delete", "route", target_subnet, device_name])
+                    .status();
+            } else {
+                let _ = Command::new("route")
+                    .args(["delete", target_subnet])
+                    .status();
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if is_v6 {
+                let _ = Command::new("route")
+                    .args(["delete", "-inet6", target_subnet, "-interface", device_name])
+                    .status();
+            } else {
+                let _ = Command::new("route")
+                    .args(["delete", "-net", target_subnet, "-interface", device_name])
+                    .status();
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl RouteManager {

@@ -207,15 +207,32 @@ async fn join_network(
         return Err(StatusCode::UNAUTHORIZED);
     }
     let clean = nwid.to_lowercase();
+    let settings = match body {
+        Ok(Json(v)) => crate::network::NetworkSettingsUpdate::from_json(&v),
+        Err(_) => crate::network::NetworkSettingsUpdate::default(),
+    };
+
+    // If request explicitly asks to disconnect (connected: false),
+    // update status and cleanly tear down routes and interface IPs.
+    if settings.connected == Some(false) {
+        if let Some(disc_net) = state.network_manager.disconnect(&clean).await {
+            for ip in &disc_net.assigned_addresses {
+                let _ = crate::route_manager::RouteManager::remove_interface_ip(&disc_net.port_device_name, ip);
+                let _ = crate::route_manager::RouteManager::remove_interface_ip("zgalaxy0", ip);
+            }
+            for r in &disc_net.routes {
+                let _ = crate::route_manager::RouteManager::remove_route(&disc_net.port_device_name, &r.target);
+                let _ = crate::route_manager::RouteManager::remove_route("zgalaxy0", &r.target);
+            }
+            return Ok(Json(network_to_zt_json(&disc_net)));
+        }
+    }
+
     match state.network_manager.join(&clean).await {
         Ok(net) => {
             if let Some(ref tx) = state.join_trigger {
                 let _ = tx.send(clean.clone());
             }
-            let settings = match body {
-                Ok(Json(v)) => crate::network::NetworkSettingsUpdate::from_json(&v),
-                Err(_) => crate::network::NetworkSettingsUpdate::default(),
-            };
             if !settings.is_empty() {
                 if let Some(updated) =
                     state.network_manager.update_settings(&clean, settings).await
@@ -237,9 +254,21 @@ async fn leave_network(
     if !check_auth(&headers, &state.auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    match state.network_manager.leave(&nwid.to_lowercase()).await {
-        Ok(true) => Ok(Json(json!({ "result": true }))),
-        Ok(false) => Ok(Json(json!({ "result": false }))),
+    let clean = nwid.to_lowercase();
+    match state.network_manager.leave(&clean).await {
+        Ok(Some(net)) => {
+            // Automatic pre-disconnect guard: clean up interface routes and IPs
+            for ip in &net.assigned_addresses {
+                let _ = crate::route_manager::RouteManager::remove_interface_ip(&net.port_device_name, ip);
+                let _ = crate::route_manager::RouteManager::remove_interface_ip("zgalaxy0", ip);
+            }
+            for r in &net.routes {
+                let _ = crate::route_manager::RouteManager::remove_route(&net.port_device_name, &r.target);
+                let _ = crate::route_manager::RouteManager::remove_route("zgalaxy0", &r.target);
+            }
+            Ok(Json(json!({ "result": true })))
+        }
+        Ok(None) => Ok(Json(json!({ "result": false }))),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -496,12 +525,14 @@ fn network_to_zt_json(net: &crate::network::Network) -> serde_json::Value {
         crate::network::NetworkStatus::NotFound => "NOT_FOUND",
         crate::network::NetworkStatus::PortError => "PORT_ERROR",
         crate::network::NetworkStatus::RequestingConfiguration => "REQUESTING_CONFIGURATION",
+        crate::network::NetworkStatus::Disconnected => "DISCONNECTED",
     };
     json!({
         "id": net.nwid,
         "nwid": net.nwid,
         "name": net.name,
         "status": status,
+        "connected": net.connected,
         "type": net.type_name,
         "mac": net.mac,
         "mtu": net.mtu,

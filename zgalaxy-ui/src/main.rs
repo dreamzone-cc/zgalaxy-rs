@@ -332,11 +332,39 @@ fn main() {
     let c = Arc::clone(&client);
     let disc_flag = Arc::clone(&poll_now);
     let sel_disc = Arc::clone(&selected_nwid);
-    let mw_disc = main_w.as_weak();
     main_w.on_disconnect_current(move || {
         if let Some(nwid) = sel_disc.lock().unwrap().clone() {
-            app::commands::leave(Arc::clone(&c), nwid, Some(Arc::clone(&disc_flag)));
-            if let Some(ui) = mw_disc.upgrade() {
+            let body = serde_json::json!({ "connected": false });
+            app::commands::update_flags(Arc::clone(&c), nwid, body, Some(Arc::clone(&disc_flag)));
+        }
+    });
+
+    let c = Arc::clone(&client);
+    let conn_flag = Arc::clone(&poll_now);
+    let sel_conn = Arc::clone(&selected_nwid);
+    main_w.on_connect_current(move || {
+        if let Some(nwid) = sel_conn.lock().unwrap().clone() {
+            let body = serde_json::json!({ "connected": true });
+            app::commands::update_flags(Arc::clone(&c), nwid, body, Some(Arc::clone(&conn_flag)));
+        }
+    });
+
+    let mw_del_conf = main_w.as_weak();
+    main_w.on_open_delete_confirm(move || {
+        if let Some(ui) = mw_del_conf.upgrade() {
+            ui.set_show_delete_modal(true);
+        }
+    });
+
+    let c = Arc::clone(&client);
+    let del_flag = Arc::clone(&poll_now);
+    let sel_del = Arc::clone(&selected_nwid);
+    let mw_del = main_w.as_weak();
+    main_w.on_confirm_delete_current(move || {
+        if let Some(nwid) = sel_del.lock().unwrap().clone() {
+            app::commands::leave(Arc::clone(&c), nwid, Some(Arc::clone(&del_flag)));
+            if let Some(ui) = mw_del.upgrade() {
+                ui.set_show_delete_modal(false);
                 ui.set_current_view("main".into());
             }
         }

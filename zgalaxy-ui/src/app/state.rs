@@ -18,7 +18,7 @@ impl NetworkState {
             "OK" => NetworkState::Connected,
             "ACCESS_DENIED" => NetworkState::WaitingApproval,
             "NOT_FOUND" | "PORT_ERROR" => NetworkState::Problem,
-            "" => NetworkState::Disconnected,
+            "DISCONNECTED" | "OFFLINE" | "" => NetworkState::Disconnected,
             _ => NetworkState::Connecting,
         }
     }

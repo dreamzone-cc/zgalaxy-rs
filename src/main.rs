@@ -198,12 +198,15 @@ async fn main() -> Result<()> {
         token
     };
 
-    // Initialize State Managers
     let peer_manager = PeerManager::new();
     let network_manager = NetworkManager::new();
     network_manager
         .set_node_address(identity.address.to_string())
         .await;
+    network_manager
+        .set_working_dir(working_dir.clone())
+        .await;
+    let _ = network_manager.load_from_disk(&working_dir).await;
 
     // Resolve domain dynamically (Separation of Dynamic Config from Core Build)
     let domain_file = working_dir.join("domain");
@@ -873,8 +876,11 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
-                        // Add active paths of the controllers for all joined networks
+                        // Add active paths of the controllers for connected networks
                         for net in &nets {
+                            if !net.connected {
+                                continue;
+                            }
                             let ctrl_str = if net.nwid.len() >= 10 { &net.nwid[..10] } else { "" };
                             if let Ok(ctrl_addr) = zgalaxy_rs::identity::Address::from_str(ctrl_str) {
                                 if let Some(peer) = peers_for_sync.get_peer(&ctrl_addr).await {
@@ -906,6 +912,9 @@ async fn main() -> Result<()> {
                         // timeout (was: sequential 5s-per-dead-target stall).
                         let mut jobs = Vec::new();
                         for net in &nets {
+                            if !net.connected {
+                                continue;
+                            }
                             for target in &targets {
                                 let msg =
                                     zgalaxy_rs::quic::control::ControlMessage::NetworkConfigRequest {
@@ -1014,7 +1023,9 @@ async fn main() -> Result<()> {
                 interval.tick().await;
                 let nets = nm_for_sync.list().await;
                 for net in nets {
-                    let _ = tp_for_sync.send_network_config_request(&net.nwid).await;
+                    if net.connected {
+                        let _ = tp_for_sync.send_network_config_request(&net.nwid).await;
+                    }
                 }
             }
         });
@@ -1022,10 +1033,12 @@ async fn main() -> Result<()> {
         warn!("[ZGALAXY UDP] Could not bind UDP port {}, running in client API mode.", local_config.port);
     }
 
-    // Auto-join configured networks from networks.d/
+    // Auto-join configured networks from local.conf if not already loaded from networks.d/
     for nwid in &local_config.auto_join_networks {
-        info!("[ZGALAXY AUTO-JOIN] Joining persistent network {}", nwid);
-        let _ = network_manager.join(nwid).await;
+        if network_manager.get(nwid).await.is_none() {
+            info!("[ZGALAXY AUTO-JOIN] Joining persistent network from local.conf: {}", nwid);
+            let _ = network_manager.join(nwid).await;
+        }
     }
 
     info!("ZGALAXY Client Daemon is fully active, listening, and serving.");

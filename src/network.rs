@@ -11,6 +11,7 @@ pub enum NetworkStatus {
     NotFound,
     PortError,
     RequestingConfiguration,
+    Disconnected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +44,10 @@ pub struct Network {
     pub allow_default: bool,
     #[serde(default)]
     pub allow_dns: bool,
+    /// Persistent connection intent: true if user desires active connection (auto-reconnect on boot),
+    /// false if user explicitly disconnected.
+    #[serde(default = "default_true")]
+    pub connected: bool,
 }
 
 fn default_true() -> bool {
@@ -51,7 +56,7 @@ fn default_true() -> bool {
 
 /// Partial update of user-controllable network flags (ZeroTier local-service
 /// semantics: absent keys are left untouched). Keys are ZeroTier-style
-/// camelCase (allowManaged, allowGlobal, allowDefault, allowDNS).
+/// camelCase (allowManaged, allowGlobal, allowDefault, allowDNS, connected).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkSettingsUpdate {
@@ -63,6 +68,8 @@ pub struct NetworkSettingsUpdate {
     pub allow_default: Option<bool>,
     #[serde(default, rename = "allowDNS")]
     pub allow_dns: Option<bool>,
+    #[serde(default)]
+    pub connected: Option<bool>,
 }
 
 impl NetworkSettingsUpdate {
@@ -75,6 +82,7 @@ impl NetworkSettingsUpdate {
             && self.allow_global.is_none()
             && self.allow_default.is_none()
             && self.allow_dns.is_none()
+            && self.connected.is_none()
     }
 }
 
@@ -85,6 +93,8 @@ pub struct NetworkManager {
     /// This node's ZGALAXY address — mixed into per-network MAC derivation so
     /// every node in a network gets a distinct, stable MAC.
     node_address: Arc<RwLock<Option<String>>>,
+    /// Working directory for persistent network storage in `networks.d/`
+    working_dir: Arc<RwLock<Option<std::path::PathBuf>>>,
 }
 
 impl NetworkManager {
@@ -92,12 +102,122 @@ impl NetworkManager {
         NetworkManager {
             networks: Arc::new(RwLock::new(HashMap::new())),
             node_address: Arc::new(RwLock::new(None)),
+            working_dir: Arc::new(RwLock::new(None)),
         }
     }
 
     /// Teach the manager its own node address (called once at daemon start).
     pub async fn set_node_address(&self, address: String) {
         *self.node_address.write().await = Some(address);
+    }
+
+    /// Set working directory for network persistence in `networks.d/`.
+    pub async fn set_working_dir(&self, path: std::path::PathBuf) {
+        *self.working_dir.write().await = Some(path);
+    }
+
+    /// Load all persisted networks from `networks.d/` directory.
+    pub async fn load_from_disk(&self, working_dir: &std::path::Path) -> Result<usize> {
+        self.set_working_dir(working_dir.to_path_buf()).await;
+        let networks_dir = working_dir.join("networks.d");
+        if !networks_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut entries = tokio::fs::read_dir(&networks_dir).await?;
+        let node = self.node_address.read().await.clone().unwrap_or_default();
+        let mut paths = Vec::new();
+
+        while let Some(entry) = entries.next_entry().await? {
+            paths.push(entry.path());
+        }
+
+        // 1. Process all .json files first
+        for path in &paths {
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Ok(content) = tokio::fs::read_to_string(path).await {
+                    if let Ok(mut net) = serde_json::from_str::<Network>(&content) {
+                        if net.connected {
+                            net.status = NetworkStatus::RequestingConfiguration;
+                        } else {
+                            net.status = NetworkStatus::Disconnected;
+                        }
+                        if net.mac.is_empty() {
+                            net.mac = Self::derive_mac(&net.nwid, &node);
+                        }
+                        let mut nets = self.networks.write().await;
+                        nets.insert(net.nwid.clone(), net);
+                    }
+                }
+            }
+        }
+
+        // 2. Process legacy .conf files for any networks not already loaded from .json
+        for path in &paths {
+            if path.extension().and_then(|e| e.to_str()) == Some("conf") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    let clean = stem.trim().to_lowercase();
+                    if clean.len() == 16 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+                        let mut nets = self.networks.write().await;
+                        if !nets.contains_key(&clean) {
+                            let net = Network {
+                                nwid: clean.clone(),
+                                name: format!("ZT-{}", clean),
+                                status: NetworkStatus::RequestingConfiguration,
+                                type_name: "PRIVATE".to_string(),
+                                mac: Self::derive_mac(&clean, &node),
+                                mtu: 2800,
+                                broadcast_enabled: true,
+                                assigned_addresses: Vec::new(),
+                                routes: Vec::new(),
+                                port_device_name: format!("zt-{}", &clean[..6]),
+                                membership_token: None,
+                                allow_managed: true,
+                                allow_global: false,
+                                allow_default: false,
+                                allow_dns: false,
+                                connected: true,
+                            };
+                            nets.insert(clean.clone(), net);
+                        }
+                    }
+                }
+            }
+        }
+
+        let count = self.networks.read().await.len();
+        tracing::info!("[ZGALAXY PERSISTENCE] Loaded {} networks from {:?}", count, networks_dir);
+        Ok(count)
+    }
+
+    /// Save a network atomically to disk in `networks.d/<nwid>.json` and `<nwid>.conf`.
+    pub async fn persist_network_to_disk(&self, net: &Network) {
+        let Some(ref dir) = *self.working_dir.read().await else { return };
+        let networks_dir = dir.join("networks.d");
+        if let Err(e) = tokio::fs::create_dir_all(&networks_dir).await {
+            tracing::warn!("[ZGALAXY PERSISTENCE] Failed to create networks.d dir: {}", e);
+            return;
+        }
+
+        let json_file = networks_dir.join(format!("{}.json", net.nwid));
+        let conf_file = networks_dir.join(format!("{}.conf", net.nwid));
+
+        if let Ok(data) = serde_json::to_string_pretty(net) {
+            let tmp_file = networks_dir.join(format!("{}.json.tmp", net.nwid));
+            if tokio::fs::write(&tmp_file, data).await.is_ok() {
+                let _ = tokio::fs::rename(tmp_file, json_file).await;
+            }
+        }
+        let _ = tokio::fs::write(conf_file, b"").await;
+    }
+
+    /// Delete network files from `networks.d/`.
+    pub async fn delete_network_from_disk(&self, nwid: &str) {
+        let Some(ref dir) = *self.working_dir.read().await else { return };
+        let json_file = dir.join("networks.d").join(format!("{}.json", nwid));
+        let conf_file = dir.join("networks.d").join(format!("{}.conf", nwid));
+        let _ = tokio::fs::remove_file(json_file).await;
+        let _ = tokio::fs::remove_file(conf_file).await;
     }
 
     pub async fn join(&self, nwid: &str) -> Result<Network> {
@@ -109,12 +229,14 @@ impl NetworkManager {
             );
         }
 
-        // Fabricated addresses/routes before the controller answers were a
-        // deep-audit finding: a network must report REQUESTING_CONFIGURATION
-        // with NO managed addresses until a real NetworkConfig arrives.
         let node = self.node_address.read().await.clone().unwrap_or_default();
         let mut networks = self.networks.write().await;
-        let net = networks.entry(clean_nwid.clone()).or_insert_with(|| Network {
+        let net = networks.entry(clean_nwid.clone()).and_modify(|n| {
+            n.connected = true;
+            if n.status == NetworkStatus::Disconnected {
+                n.status = NetworkStatus::RequestingConfiguration;
+            }
+        }).or_insert_with(|| Network {
             nwid: clean_nwid.clone(),
             name: format!("ZT-{}", clean_nwid),
             status: NetworkStatus::RequestingConfiguration,
@@ -130,9 +252,14 @@ impl NetworkManager {
             allow_global: false,
             allow_default: false,
             allow_dns: false,
+            connected: true,
         });
 
-        Ok(net.clone())
+        let cloned = net.clone();
+        drop(networks);
+
+        self.persist_network_to_disk(&cloned).await;
+        Ok(cloned)
     }
 
     pub async fn update_network(&self, mut net: Network) {
@@ -151,7 +278,38 @@ impl NetworkManager {
             }
         }
         let mut networks = self.networks.write().await;
-        networks.insert(net.nwid.clone(), net);
+        networks.insert(net.nwid.clone(), net.clone());
+        drop(networks);
+
+        self.persist_network_to_disk(&net).await;
+    }
+
+    /// Disconnect a network: mark as Disconnected and connected=false, persist state, return previous network.
+    pub async fn disconnect(&self, nwid: &str) -> Option<Network> {
+        let clean_nwid = nwid.trim().to_lowercase();
+        let mut networks = self.networks.write().await;
+        let net = networks.get_mut(&clean_nwid)?;
+        net.connected = false;
+        net.status = NetworkStatus::Disconnected;
+        let cloned = net.clone();
+        drop(networks);
+
+        self.persist_network_to_disk(&cloned).await;
+        Some(cloned)
+    }
+
+    /// Connect a network: mark as RequestingConfiguration and connected=true, persist state.
+    pub async fn connect(&self, nwid: &str) -> Option<Network> {
+        let clean_nwid = nwid.trim().to_lowercase();
+        let mut networks = self.networks.write().await;
+        let net = networks.get_mut(&clean_nwid)?;
+        net.connected = true;
+        net.status = NetworkStatus::RequestingConfiguration;
+        let cloned = net.clone();
+        drop(networks);
+
+        self.persist_network_to_disk(&cloned).await;
+        Some(cloned)
     }
 
     /// Apply a partial settings update to a joined network. Returns the
@@ -176,13 +334,34 @@ impl NetworkManager {
         if let Some(v) = update.allow_dns {
             net.allow_dns = v;
         }
-        Some(net.clone())
+        if let Some(v) = update.connected {
+            net.connected = v;
+            if !v {
+                net.status = NetworkStatus::Disconnected;
+            } else if net.status == NetworkStatus::Disconnected {
+                net.status = NetworkStatus::RequestingConfiguration;
+            }
+        }
+        let cloned = net.clone();
+        drop(networks);
+
+        self.persist_network_to_disk(&cloned).await;
+        Some(cloned)
     }
 
-    pub async fn leave(&self, nwid: &str) -> Result<bool> {
+    /// Safe network leave / deletion:
+    /// Automatically performs pre-disconnect and teardown of active state,
+    /// removes from memory, and permanently deletes from disk.
+    pub async fn leave(&self, nwid: &str) -> Result<Option<Network>> {
         let clean_nwid = nwid.trim().to_lowercase();
         let mut networks = self.networks.write().await;
-        Ok(networks.remove(&clean_nwid).is_some())
+        let removed = networks.remove(&clean_nwid);
+        drop(networks);
+
+        if let Some(ref net) = removed {
+            self.delete_network_from_disk(&net.nwid).await;
+        }
+        Ok(removed)
     }
 
     /// Derive a locally-administered unicast MAC from (node address, nwid).
@@ -311,5 +490,60 @@ mod tests {
         let garbage = serde_json::json!({"allowManaged": "not-a-bool"});
         let u = NetworkSettingsUpdate::from_json(&garbage);
         assert_eq!(u.allow_managed, None, "bad types fall back to defaults");
+    }
+
+    #[tokio::test]
+    async fn test_network_persistence_and_disconnect_lifecycle() {
+        let temp_dir = std::env::temp_dir().join(format!("zgrs-net-persist-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let nm = NetworkManager::new();
+        nm.set_node_address("a1b2c3d4e5".into()).await;
+        nm.set_working_dir(temp_dir.clone()).await;
+
+        let nwid1 = "0123456789abcdef";
+        let nwid2 = "fedcba9876543210";
+
+        // 1. Join two networks
+        let net1 = nm.join(nwid1).await.unwrap();
+        assert_eq!(net1.status, NetworkStatus::RequestingConfiguration);
+        assert!(net1.connected);
+
+        let net2 = nm.join(nwid2).await.unwrap();
+        assert!(net2.connected);
+
+        // 2. Disconnect network 2
+        let disc2 = nm.disconnect(nwid2).await.unwrap();
+        assert_eq!(disc2.status, NetworkStatus::Disconnected);
+        assert!(!disc2.connected);
+
+        // 3. Verify files on disk
+        let net1_json = temp_dir.join("networks.d").join(format!("{}.json", nwid1));
+        let net2_json = temp_dir.join("networks.d").join(format!("{}.json", nwid2));
+        assert!(net1_json.exists());
+        assert!(net2_json.exists());
+
+        // 4. Simulate daemon restart: create a new NetworkManager and load from disk
+        let nm_reloaded = NetworkManager::new();
+        nm_reloaded.set_node_address("a1b2c3d4e5".into()).await;
+        let loaded_count = nm_reloaded.load_from_disk(&temp_dir).await.unwrap();
+        assert_eq!(loaded_count, 2);
+
+        let reloaded_net1 = nm_reloaded.get(nwid1).await.unwrap();
+        assert!(reloaded_net1.connected);
+        assert_eq!(reloaded_net1.status, NetworkStatus::RequestingConfiguration, "Connected network should auto-reconnect");
+
+        let reloaded_net2 = nm_reloaded.get(nwid2).await.unwrap();
+        assert!(!reloaded_net2.connected);
+        assert_eq!(reloaded_net2.status, NetworkStatus::Disconnected, "Disconnected network should remain Disconnected across reboots");
+
+        // 5. Test safe deletion / leave
+        let leave_res = nm_reloaded.leave(nwid1).await.unwrap();
+        assert!(leave_res.is_some());
+        assert!(!net1_json.exists(), "Delete network must erase file from disk");
+        assert!(nm_reloaded.get(nwid1).await.is_none());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }
