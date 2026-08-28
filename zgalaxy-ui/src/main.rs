@@ -29,16 +29,25 @@ fn net_state(n: &serde_json::Value) -> NetworkState {
 
 fn net_info(n: &serde_json::Value) -> NetworkInfo {
     let state = net_state(n);
+    let cats = categorize_ips(n);
+    let display_addr = if !cats.ipv4.is_empty() {
+        cats.ipv4
+    } else if !cats.ipv6_6plane.is_empty() {
+        cats.ipv6_6plane
+    } else if !cats.ipv6_rfc4193.is_empty() {
+        cats.ipv6_rfc4193
+    } else if !cats.ipv6_other.is_empty() {
+        cats.ipv6_other
+    } else if state == NetworkState::Connected {
+        "Connected (No IP assigned)".to_string()
+    } else {
+        "no address yet".to_string()
+    };
+
     NetworkInfo {
         name: s(n, "name").into(),
         nwid: s(n, "id").into(),
-        address: n
-            .get("assignedAddresses")
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.first())
-            .and_then(|v| v.as_str())
-            .unwrap_or("no address yet")
-            .into(),
+        address: display_addr.into(),
         state_label: state.label().into(),
         state_emoji: state.emoji().into(),
         state_kind: state.kind().into(),

@@ -667,17 +667,17 @@ export component MainWindow inherits Window {
                             padding: 0;
                             spacing: Tokens.sp-2;
                             Text {
-                                text: root.d-ipv4 != "" ? root.d-ipv4 : (root.d-address != "" ? root.d-address : "Waiting for IP assignment…");
+                                text: root.d-ipv4 != "" ? root.d-ipv4 : (root.d-connected ? "No IPv4 assigned" : "Waiting for IP assignment…");
                                 font-size: Tokens.font-emphasis;
                                 vertical-alignment: center;
+                                color: root.d-ipv4 != "" ? Palette.foreground : Palette.foreground.with-alpha(0.5);
                             }
                             Rectangle { horizontal-stretch: 1; }
-                            Button {
+                            if root.d-ipv4 != "" : Button {
                                 text: "Copy";
                                 min-height: Tokens.ctrl-h;
                                 min-width: Tokens.btn-sm-w;
-                                enabled: root.d-ipv4 != "" || root.d-address != "";
-                                clicked => { root.copy-text(root.d-ipv4 != "" ? root.d-ipv4 : root.d-address); }
+                                clicked => { root.copy-text(root.d-ipv4); }
                             }
                         }
                     }
@@ -905,7 +905,7 @@ export component MainWindow inherits Window {
                         padding: 0;
                         Text { text: "IPv4 Address"; font-size: Tokens.font-secondary; color: Palette.foreground.with-alpha(0.55); }
                         Rectangle { horizontal-stretch: 1; }
-                        Text { text: root.a-ipv4 != "" ? root.a-ipv4 : (root.a-address != "" ? root.a-address : "—"); font-size: Tokens.font-secondary; }
+                        Text { text: root.a-ipv4 != "" ? root.a-ipv4 : "—"; font-size: Tokens.font-secondary; }
                     }
 
                     if root.a-ipv6-6plane != "" : HorizontalLayout {

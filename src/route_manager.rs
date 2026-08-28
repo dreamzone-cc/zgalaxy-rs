@@ -142,11 +142,18 @@ impl RouteManager {
     pub fn remove_interface_ip(device_name: &str, ip_with_cidr: &str) -> Result<()> {
         info!("[ZGALAXY ROUTE MANAGER] Removing IP {} from interface {}", ip_with_cidr, device_name);
         let _is_v6 = ip_with_cidr.contains(':');
+        let cidr = if ip_with_cidr.contains('/') {
+            ip_with_cidr.to_string()
+        } else if _is_v6 {
+            format!("{}/128", ip_with_cidr)
+        } else {
+            format!("{}/24", ip_with_cidr)
+        };
 
         #[cfg(target_os = "linux")]
         {
             let _ = Command::new("ip")
-                .args(["addr", "del", ip_with_cidr, "dev", device_name])
+                .args(["addr", "del", &cidr, "dev", device_name])
                 .status();
         }
 

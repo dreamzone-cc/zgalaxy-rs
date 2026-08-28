@@ -328,6 +328,71 @@ impl EmbeddedController {
         // Update in-memory state.
         let mut nets = self.networks.write().await;
         nets.insert(nwid.clone(), net_config.clone());
+        drop(nets);
+
+        // Reconcile and propagate IP assignments to all existing authorized members
+        let mut members = self.members.write().await;
+        if let Some(nwid_members) = members.get_mut(&nwid) {
+            for (mem_id, member) in nwid_members.iter_mut() {
+                if member.authorized && !member.no_auto_assign_ips {
+                    let prev_ips = member.ip_assignments.clone();
+                    // 1. IPv4
+                    let is_v4_zt = net_config.v4_assign_mode.get("zt").and_then(|v| v.as_bool()).unwrap_or(true);
+                    if !is_v4_zt {
+                        member.ip_assignments.retain(|ip| ip.contains(':'));
+                    }
+                    // 2. 6PLANE
+                    let is_6plane = net_config.v6_assign_mode.get("6plane").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let v6_6plane = Self::compute_6plane_ip(&nwid, mem_id);
+                    if is_6plane {
+                        if let Some(ref ip) = v6_6plane {
+                            if !member.ip_assignments.contains(ip) {
+                                member.ip_assignments.push(ip.clone());
+                            }
+                        }
+                    } else {
+                        if let Some(ref ip) = v6_6plane {
+                            member.ip_assignments.retain(|x| x != ip);
+                        }
+                        member.ip_assignments.retain(|x| !x.to_lowercase().starts_with("fc"));
+                    }
+                    // 3. RFC4193
+                    let is_rfc4193 = net_config.v6_assign_mode.get("rfc4193").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let v6_rfc4193 = Self::compute_rfc4193_ip(&nwid, mem_id);
+                    if is_rfc4193 {
+                        if let Some(ref ip) = v6_rfc4193 {
+                            if !member.ip_assignments.contains(ip) {
+                                member.ip_assignments.push(ip.clone());
+                            }
+                        }
+                    } else {
+                        if let Some(ref ip) = v6_rfc4193 {
+                            member.ip_assignments.retain(|x| x != ip);
+                        }
+                        member.ip_assignments.retain(|x| !x.to_lowercase().starts_with("fd"));
+                    }
+                    // 4. Custom ZT IPv6
+                    let is_zt_v6 = net_config.v6_assign_mode.get("zt").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if !is_zt_v6 {
+                        member.ip_assignments.retain(|ip| {
+                            !ip.contains(':')
+                                || ip.to_lowercase().starts_with("fc")
+                                || ip.to_lowercase().starts_with("fd")
+                        });
+                    }
+
+                    if member.ip_assignments != prev_ips {
+                        member.revision += 1;
+                        let member_dir = self.db_path.join("network").join(&nwid).join("member");
+                        let member_file = member_dir.join(format!("{}.json", mem_id));
+                        if let Ok(ser) = serde_json::to_string_pretty(member) {
+                            let _ = fs::write(&member_file, ser).await;
+                        }
+                    }
+                }
+            }
+        }
+        drop(members);
 
         info!("[ZGALAXY CONTROLLER] Saved network '{}' ({})", net_config.name, nwid);
         Ok(net_config)
@@ -615,36 +680,56 @@ impl EmbeddedController {
         Some(std::net::Ipv6Addr::from(candidate))
     }
 
-    /// Assign auto IPv4 and IPv6 addresses for an authorized member.
+    /// Assign auto IPv4 and IPv6 addresses for an authorized member, adding newly enabled modes and removing disabled modes.
     pub async fn auto_assign_ips_for_member(&self, nwid: &str, member_id: &str, current_ips: &mut Vec<String>) {
         let Some(net) = self.get_network(nwid).await else { return };
 
-        // 1. IPv4 auto-assignment if member has no IPv4 assigned
-        let has_v4 = current_ips.iter().any(|ip| !ip.contains(':'));
-        if !has_v4 {
-            if let Some(free_ip) = self.next_free_ip(nwid, &net.ip_assignment_pools).await {
-                current_ips.push(free_ip);
+        // 1. IPv4 auto-assignment / removal
+        let is_v4_zt = net.v4_assign_mode.get("zt").and_then(|v| v.as_bool()).unwrap_or(true);
+        if is_v4_zt {
+            let has_v4 = current_ips.iter().any(|ip| !ip.contains(':'));
+            if !has_v4 {
+                if let Some(free_ip) = self.next_free_ip(nwid, &net.ip_assignment_pools).await {
+                    current_ips.push(free_ip);
+                }
             }
+        } else {
+            // Remove auto-assigned IPv4 addresses from pools if v4AssignMode.zt is false
+            current_ips.retain(|ip| ip.contains(':'));
         }
 
-        // 2. 6PLANE IPv6 auto-assignment (ZeroTier canonical /80)
+        // 2. 6PLANE IPv6 auto-assignment / removal (ZeroTier canonical /80)
         let is_6plane = net.v6_assign_mode.get("6plane").and_then(|v| v.as_bool()).unwrap_or(false);
+        let v6_6plane = Self::compute_6plane_ip(nwid, member_id);
         if is_6plane {
-            if let Some(v6_6plane) = Self::compute_6plane_ip(nwid, member_id) {
-                if !current_ips.contains(&v6_6plane) {
-                    current_ips.push(v6_6plane);
+            if let Some(ref ip) = v6_6plane {
+                if !current_ips.contains(ip) {
+                    current_ips.push(ip.clone());
                 }
             }
+        } else {
+            // Remove 6plane IPv6 if 6plane is disabled
+            if let Some(ref ip) = v6_6plane {
+                current_ips.retain(|x| x != ip);
+            }
+            current_ips.retain(|x| !x.to_lowercase().starts_with("fc"));
         }
 
-        // 3. RFC4193 IPv6 auto-assignment (ZeroTier canonical /128)
+        // 3. RFC4193 IPv6 auto-assignment / removal (ZeroTier canonical /128)
         let is_rfc4193 = net.v6_assign_mode.get("rfc4193").and_then(|v| v.as_bool()).unwrap_or(false);
+        let v6_rfc4193 = Self::compute_rfc4193_ip(nwid, member_id);
         if is_rfc4193 {
-            if let Some(v6_rfc4193) = Self::compute_rfc4193_ip(nwid, member_id) {
-                if !current_ips.contains(&v6_rfc4193) {
-                    current_ips.push(v6_rfc4193);
+            if let Some(ref ip) = v6_rfc4193 {
+                if !current_ips.contains(ip) {
+                    current_ips.push(ip.clone());
                 }
             }
+        } else {
+            // Remove RFC4193 IPv6 if rfc4193 is disabled
+            if let Some(ref ip) = v6_rfc4193 {
+                current_ips.retain(|x| x != ip);
+            }
+            current_ips.retain(|x| !x.to_lowercase().starts_with("fd"));
         }
 
         // 4. Custom IPv6 Range auto-assignment with RFC 7217 Opaque Identifiers (v6AssignMode: { "zt": true })
@@ -652,16 +737,21 @@ impl EmbeddedController {
         if is_zt_v6 {
             let has_custom_v6 = current_ips.iter().any(|ip| {
                 ip.contains(':')
-                    && !ip.starts_with("fc")
-                    && !ip.starts_with("FC")
-                    && !ip.starts_with("fd")
-                    && !ip.starts_with("FD")
+                    && !ip.to_lowercase().starts_with("fc")
+                    && !ip.to_lowercase().starts_with("fd")
             });
             if !has_custom_v6 {
                 if let Some(free_v6) = self.next_free_ipv6(nwid, member_id, &net.ip_assignment_pools).await {
                     current_ips.push(free_v6);
                 }
             }
+        } else {
+            // Remove custom ZT range IPv6 if zt mode is disabled
+            current_ips.retain(|ip| {
+                !ip.contains(':')
+                    || ip.to_lowercase().starts_with("fc")
+                    || ip.to_lowercase().starts_with("fd")
+            });
         }
     }
 

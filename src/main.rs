@@ -348,8 +348,6 @@ async fn main() -> Result<()> {
                 let tun_for_events = Arc::clone(&tun_arc);
                 let peers_for_events = peer_manager.clone();
                 let identity_for_events = identity.clone();
-                let mut applied_networks: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
                 let l2_for_events = Arc::clone(&l2_shared);
                 tokio::spawn(async move {
                     while let Some(event) = quic_events_rx.recv().await {
@@ -577,6 +575,11 @@ async fn main() -> Result<()> {
                                             })
                                             .unwrap_or_default();
                                         if let Some(mut net) = nm_for_events.get(&nwid).await {
+                                            let prev_ips = net.assigned_addresses.clone();
+                                            let prev_routes = net.routes.clone();
+                                            let prev_mtu = net.mtu;
+                                            let was_authorized = net.status == zgalaxy_rs::network::NetworkStatus::Ok;
+
                                             if let Some(name) = name_opt {
                                                 if !name.trim().is_empty() {
                                                     net.name = name.trim().to_string();
@@ -591,64 +594,99 @@ async fn main() -> Result<()> {
                                             } else {
                                                 zgalaxy_rs::network::NetworkStatus::AccessDenied
                                             };
-                                            if !ips.is_empty() {
-                                                net.assigned_addresses = ips;
+                                            net.assigned_addresses = ips.clone();
+                                            if let Some(r_arr) = config.get("routes").and_then(|v| v.as_array()) {
+                                                net.routes = r_arr
+                                                    .iter()
+                                                    .filter_map(|r| serde_json::from_value(r.clone()).ok())
+                                                    .collect();
                                             }
+                                            if let Some(m) = config.get("mtu").and_then(|v| v.as_u64()) {
+                                                net.mtu = m as u32;
+                                            }
+
                                             let updated_name = net.name.clone();
                                             nm_for_events.update_network(net.clone()).await;
-                                            info!("[ZGALAXY QUIC] Network {} updated (name: {}, authorized: {})", nwid, updated_name, authorized);
+                                            info!("[ZGALAXY QUIC] Network {} updated (name: {}, authorized: {}, ips: {:?})", nwid, updated_name, authorized, net.assigned_addresses);
 
-                                            // Apply managed address + routes + MTU to the host
-                                            // adapter once per network (idempotent set).
-                                            // Gated by the user-facing network flags:
-                                            // allowManaged gates everything; a
-                                            // default route additionally requires
-                                            // allowDefault.
-                                            if authorized
-                                                && net.allow_managed
-                                                && !net.assigned_addresses.is_empty()
-                                                && applied_networks.insert(nwid.clone())
-                                            {
-                                                // 1. Configure interface MTU
-                                                if net.mtu > 0 {
+                                            // Live Dynamic Interface Reconciliation (Real-time sync with controller)
+                                            if authorized && net.allow_managed {
+                                                // 1. Dynamic MTU update
+                                                if net.mtu > 0 && net.mtu != prev_mtu {
                                                     let _ = zgalaxy_rs::route_manager::RouteManager::set_mtu(
                                                         &tun_for_events.name,
                                                         net.mtu,
                                                     );
                                                 }
 
-                                                // 2. Assign all IPv4 and IPv6 addresses
-                                                for ip in &net.assigned_addresses {
-                                                    let is_v6 = ip.contains(':');
-                                                    let cidr = if ip.contains('/') {
-                                                        ip.clone()
-                                                    } else {
-                                                        // Prefer the managed route matching this IP family
-                                                        net.routes
-                                                            .iter()
-                                                            .find(|r| r.via.is_none() && (if is_v6 { r.target.contains(':') } else { !r.target.contains(':') }))
-                                                            .map(|r| r.target.clone())
-                                                            .unwrap_or_else(|| {
-                                                                if is_v6 {
-                                                                    format!("{}/128", ip)
-                                                                } else {
-                                                                    format!("{}/24", ip)
-                                                                }
-                                                            })
-                                                    };
-                                                    tun_for_events
-                                                        .assign_address(&cidr, Some(&net.mac))
-                                                        .await;
+                                                // 2. Remove obsolete IPs that were unassigned or disabled on controller
+                                                for old_ip in &prev_ips {
+                                                    if !net.assigned_addresses.contains(old_ip) {
+                                                        let _ = zgalaxy_rs::route_manager::RouteManager::remove_interface_ip(
+                                                            &tun_for_events.name,
+                                                            old_ip,
+                                                        );
+                                                    }
                                                 }
 
-                                                // 3. Add all network managed routes
-                                                for route in &net.routes {
-                                                    let is_default = route.target == "0.0.0.0/0"
-                                                        || route.target == "::/0";
-                                                    if is_default && !net.allow_default {
-                                                        continue;
+                                                // 3. Assign newly added IPs
+                                                for ip in &net.assigned_addresses {
+                                                    if !prev_ips.contains(ip) || !was_authorized {
+                                                        let is_v6 = ip.contains(':');
+                                                        let cidr = if ip.contains('/') {
+                                                            ip.clone()
+                                                        } else {
+                                                            net.routes
+                                                                .iter()
+                                                                .find(|r| r.via.is_none() && (if is_v6 { r.target.contains(':') } else { !r.target.contains(':') }))
+                                                                .map(|r| r.target.clone())
+                                                                .unwrap_or_else(|| {
+                                                                    if is_v6 {
+                                                                        format!("{}/128", ip)
+                                                                    } else {
+                                                                        format!("{}/24", ip)
+                                                                    }
+                                                                })
+                                                        };
+                                                        tun_for_events
+                                                            .assign_address(&cidr, Some(&net.mac))
+                                                            .await;
                                                     }
-                                                    let _ = zgalaxy_rs::route_manager::RouteManager::add_route(
+                                                }
+
+                                                // 4. Remove obsolete routes
+                                                for old_r in &prev_routes {
+                                                    if !net.routes.iter().any(|r| r.target == old_r.target) {
+                                                        let _ = zgalaxy_rs::route_manager::RouteManager::remove_route(
+                                                            &tun_for_events.name,
+                                                            &old_r.target,
+                                                        );
+                                                    }
+                                                }
+
+                                                // 5. Add new routes
+                                                for route in &net.routes {
+                                                    if !prev_routes.iter().any(|r| r.target == route.target) || !was_authorized {
+                                                        let is_default = route.target == "0.0.0.0/0" || route.target == "::/0";
+                                                        if is_default && !net.allow_default {
+                                                            continue;
+                                                        }
+                                                        let _ = zgalaxy_rs::route_manager::RouteManager::add_route(
+                                                            &tun_for_events.name,
+                                                            &route.target,
+                                                        );
+                                                    }
+                                                }
+                                            } else if was_authorized && !authorized {
+                                                // De-authorized from controller -> flush interface IPs and routes immediately
+                                                for ip in &prev_ips {
+                                                    let _ = zgalaxy_rs::route_manager::RouteManager::remove_interface_ip(
+                                                        &tun_for_events.name,
+                                                        ip,
+                                                    );
+                                                }
+                                                for route in &prev_routes {
+                                                    let _ = zgalaxy_rs::route_manager::RouteManager::remove_route(
                                                         &tun_for_events.name,
                                                         &route.target,
                                                     );
