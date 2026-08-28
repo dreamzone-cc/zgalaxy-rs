@@ -97,3 +97,37 @@ ZGALAXY-RS implements a fully native Embedded ZeroTier Controller in pure Rust:
 * **Auto-Generated Network IDs:** Generates standard 16-hex Network IDs (`<10-hex Controller Node Address> + <6-hex Network Index>`).
 * **IP Allocation Pools:** Automatically distributes IPv4 addresses from configured ranges (`ipAssignmentPools`) upon member authorization.
 * **ZTNET Integration:** Complete compatibility with the **ZTNET** web management platform via port `9993` REST endpoints.
+
+---
+
+## 6. Operating Modes & Role-Based Authority
+
+To maintain strict security and zero controller footprint on desktop clients:
+* **Client Mode (Standard Default):**
+  * Node runs strictly as a network client.
+  * Embedded controller routes are disabled (`403 Forbidden`).
+  * Inbound peer configuration requests over QUIC are rejected.
+  * The desktop GUI (`zgalaxy-ui`) is 100% focused on client workflows with no controller controls.
+* **Controller Mode (Explicit Activation):**
+  * Enabled exclusively for server and ZTNet controller deployments via `--controller` flag, `local.conf`, or `install.sh --controller`.
+  * Activates `controller.d/` storage, pool management, member authorization, and QUIC configuration serving.
+* **Role Invariants:**
+  * If `network_id[..10] == node_id`: Node acts as **Network Owner (Controller)**.
+  * If `network_id[..10] != node_id`: Node acts as **Joined Member (Client Mode)**.
+  See detailed documentation: [docs/OPERATING-MODES-AND-ROLES.md](docs/OPERATING-MODES-AND-ROLES.md).
+
+---
+
+## 7. IPv6 Addressing & Privacy Architecture
+
+* **6PLANE Mesh Routing (`fc00::/7`):**
+  * Subnet: `/40` network with `/80` assigned per node and host `::1`.
+  * Fully canonical ZeroTier RFC bit-for-bit derivation: $\text{folded} = \text{nwid} \oplus (\text{nwid} \gg 32)$.
+* **RFC 4193 Unique Local IPv6 (`fd00::/8`):**
+  * Subnet: `/88` per-network allocation using `fd<nwid>:9993:<node_id>`.
+* **RFC 7217 Semantically Opaque Identifiers:**
+  * For custom IPv6 pools, interface identifiers are derived using HMAC-SHA256:
+    $$\text{IID} = \text{HMAC-SHA256}_{K_{\text{controller}}}(\text{Prefix}, \text{Network ID}, \text{Member ID}, \text{DAD Counter})$$
+  * Guarantees anti-tracking privacy across multiple networks, cryptographic stability, and zero MAC/hardware exposure.
+  See detailed specification: [docs/IPV6-6PLANE-SPECIFICATION.md](docs/IPV6-6PLANE-SPECIFICATION.md).
+

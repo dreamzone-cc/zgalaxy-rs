@@ -28,6 +28,9 @@
 
 * 📜 **100% Sovereign Open Source (AGPL-3.0):** Clean-room implementation free from commercial BSL source-available licensing restrictions.
 * 🛡️ **Guaranteed Memory Safety:** Zero segmentation faults, zero buffer overflows, zero memory leaks—powered by Rust's ownership model and the Tokio asynchronous runtime.
+* 🔒 **Client Mode by Default & Explicit Controller Mode:** Operates strictly in Client Mode by default for standard desktop and client deployments; Controller Mode is explicitly enabled for ZTNet server orchestrators. See [docs/OPERATING-MODES-AND-ROLES.md](docs/OPERATING-MODES-AND-ROLES.md).
+* 👑 **Role-Based Network Authority:** Clean separation between Network Owner (Controller) and Joined Member (Client Mode) with real-time UI indicators.
+* 🌐 **Comprehensive IPv6 Engine (6PLANE, RFC 4193, RFC 7217):** Bit-for-bit canonical ZeroTier 6PLANE (`/40` overlay with `/80` per node) and RFC 7217 Semantically Opaque Interface Identifiers for anti-tracking privacy on custom pools. See [docs/IPV6-6PLANE-SPECIFICATION.md](docs/IPV6-6PLANE-SPECIFICATION.md).
 * ⚡ **Zero-Restart In-Memory Dynamic IP Relinking:** Background async DNS monitoring detects IP drift on domain roots (`dz.dreamzone.cc`) and updates socket routes in memory with **zero packet drops and zero service restarts**.
 * 🖥️ **Sovereign Slint Desktop GUI Client (`zgalaxy-ui`):** 100% Rust GUI with native system tray integration, fixed non-resizable aspect ratio (`580px × 640px`), and seamless **ZGALAXY Engine Sync**.
 * 🎛️ **Embedded ZeroTier Controller:** Complete native replacement for `nonfree/controller`, featuring full `FileDB` persistence (`controller.d/`), automatic 6-digit network generation, and IP assignment pools.
