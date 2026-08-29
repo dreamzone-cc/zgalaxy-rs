@@ -278,7 +278,7 @@ async fn main() -> Result<()> {
         controller: controller.clone(),
         controller_enabled: local_config.controller_enabled,
         resolver: resolver.clone(),
-        join_trigger: Some(join_tx),
+        join_trigger: Some(join_tx.clone()),
     };
 
     tokio::spawn(async move {
@@ -333,6 +333,38 @@ async fn main() -> Result<()> {
     let _ = tun_device.create_and_bind(None).await;
     let tun_arc = Arc::new(tun_device);
     tun_arc.start_packet_loop(tun_inbound_rx, tun_outbound_tx);
+
+    // Boot auto-recovery: pre-configure interface for all loaded networks with connected=true
+    let loaded_nets = network_manager.list().await;
+    for net in &loaded_nets {
+        if net.connected && net.allow_managed {
+            for ip in &net.assigned_addresses {
+                let is_v6 = ip.contains(':');
+                let cidr = if ip.contains('/') {
+                    ip.clone()
+                } else {
+                    net.routes
+                        .iter()
+                        .find(|r| r.via.is_none() && (if is_v6 { r.target.contains(':') } else { !r.target.contains(':') }))
+                        .map(|r| r.target.clone())
+                        .unwrap_or_else(|| if is_v6 { format!("{}/128", ip) } else { format!("{}/24", ip) })
+                };
+                tun_arc.assign_address(&cidr, Some(&net.mac)).await;
+            }
+            for r in &net.routes {
+                let is_default = r.target == "0.0.0.0/0" || r.target == "::/0";
+                if is_default && !net.allow_default {
+                    continue;
+                }
+                let _ = zgalaxy_rs::route_manager::RouteManager::add_route(&tun_arc.name, &r.target);
+            }
+            info!("[ZGALAXY BOOT] Pre-configured interface for active network {} (IPs: {:?})", net.nwid, net.assigned_addresses);
+        }
+        // Enqueue auto-connect for all active networks on boot
+        if net.connected {
+            let _ = join_tx.send(net.nwid.clone());
+        }
+    }
 
     if transport_mode == "quic" {
         let bind_addr_v6 = std::net::SocketAddr::from(([0u8; 16], local_config.port));
@@ -1045,7 +1077,7 @@ async fn main() -> Result<()> {
                             .list()
                             .await
                             .iter()
-                            .any(|n| n.status != zgalaxy_rs::network::NetworkStatus::Ok);
+                            .any(|n| n.connected && n.status != zgalaxy_rs::network::NetworkStatus::Ok);
                         let cadence = if any_pending { 500 } else { 3000 };
                         tokio::time::sleep(std::time::Duration::from_millis(cadence)).await;
                     }

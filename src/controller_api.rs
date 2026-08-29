@@ -213,8 +213,9 @@ async fn join_network(
         Err(_) => crate::network::NetworkSettingsUpdate::default(),
     };
 
-    // If request explicitly asks to disconnect (connected: false),
-    // update status and cleanly tear down routes and interface IPs.
+    // If request explicitly asks to disconnect (connected: false):
+    // Perform pure disconnect, update status, and cleanly tear down routes and interface IPs.
+    // Preserves the network and its configuration permanently on disk!
     if settings.connected == Some(false) {
         if let Some(disc_net) = state.network_manager.disconnect(&clean).await {
             for ip in &disc_net.assigned_addresses {
@@ -225,6 +226,7 @@ async fn join_network(
                 let _ = crate::route_manager::RouteManager::remove_route(&disc_net.port_device_name, &r.target);
                 let _ = crate::route_manager::RouteManager::remove_route("zgalaxy0", &r.target);
             }
+            tracing::info!("[ZGALAXY CLIENT API] Disconnected network {} (retained in client)", clean);
             return Ok(Json(network_to_zt_json(&disc_net)));
         }
     }
@@ -256,20 +258,31 @@ async fn leave_network(
         return Err(StatusCode::UNAUTHORIZED);
     }
     let clean = nwid.to_lowercase();
-    match state.network_manager.leave(&clean).await {
-        Ok(Some(net)) => {
-            // Automatic pre-disconnect guard: clean up interface routes and IPs
-            for ip in &net.assigned_addresses {
-                let _ = crate::route_manager::RouteManager::remove_interface_ip(&net.port_device_name, ip);
-                let _ = crate::route_manager::RouteManager::remove_interface_ip("zgalaxy0", ip);
-            }
-            for r in &net.routes {
-                let _ = crate::route_manager::RouteManager::remove_route(&net.port_device_name, &r.target);
-                let _ = crate::route_manager::RouteManager::remove_route("zgalaxy0", &r.target);
-            }
-            Ok(Json(json!({ "result": true })))
+
+    // Mandatory Pre-Disconnect Protocol:
+    // If the network exists and was connected or has assigned IPs/routes,
+    // execute complete disconnect and interface teardown FIRST before deletion.
+    if let Some(existing) = state.network_manager.get(&clean).await {
+        if existing.connected || existing.status != crate::network::NetworkStatus::Disconnected {
+            tracing::info!("[ZGALAXY CLIENT API] Pre-disconnecting network {} before removal", clean);
+            let _ = state.network_manager.disconnect(&clean).await;
         }
-        Ok(None) => Ok(Json(json!({ "result": false }))),
+        for ip in &existing.assigned_addresses {
+            let _ = crate::route_manager::RouteManager::remove_interface_ip(&existing.port_device_name, ip);
+            let _ = crate::route_manager::RouteManager::remove_interface_ip("zgalaxy0", ip);
+        }
+        for r in &existing.routes {
+            let _ = crate::route_manager::RouteManager::remove_route(&existing.port_device_name, &r.target);
+            let _ = crate::route_manager::RouteManager::remove_route("zgalaxy0", &r.target);
+        }
+    }
+
+    match state.network_manager.leave(&clean).await {
+        Ok(Some(_)) => {
+            tracing::info!("[ZGALAXY CLIENT API] Removed network {} completely from client and disk", clean);
+            Ok(Json(json!({ "result": true, "deleted": true, "nwid": clean })))
+        }
+        Ok(None) => Ok(Json(json!({ "result": false, "deleted": false }))),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }

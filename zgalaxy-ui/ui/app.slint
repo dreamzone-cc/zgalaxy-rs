@@ -140,6 +140,8 @@ component NetworkCard inherits Rectangle {
     callback ctx-copy-address();
     callback ctx-copy-nwid();
     callback ctx-disconnect();
+    callback ctx-connect();
+    callback ctx-remove();
 
     height: Tokens.card-height;
     border-radius: Tokens.radius;
@@ -180,9 +182,17 @@ component NetworkCard inherits Rectangle {
                 activated => { root.ctx-copy-nwid(); }
             }
             MenuSeparator {}
-            MenuItem {
+            if root.c-state-label != "Disconnected" : MenuItem {
                 title: "Disconnect";
                 activated => { root.ctx-disconnect(); }
+            }
+            if root.c-state-label == "Disconnected" : MenuItem {
+                title: "Connect";
+                activated => { root.ctx-connect(); }
+            }
+            MenuItem {
+                title: "Remove Network";
+                activated => { root.ctx-remove(); }
             }
         }
     }
@@ -412,6 +422,9 @@ export component MainWindow inherits Window {
     callback retry();
     callback copy-text(string);
     callback leave-network(string);
+    callback disconnect-network(string);
+    callback connect-network(string);
+    callback remove-network(string);
     callback disconnect-current();
     callback connect-current();
     callback open-delete-confirm();
@@ -617,7 +630,9 @@ export component MainWindow inherits Window {
                             ctx-open => { root.open-details(net.nwid); }
                             ctx-copy-address => { root.copy-text(net.address); }
                             ctx-copy-nwid => { root.copy-text(net.nwid); }
-                            ctx-disconnect => { root.leave-network(net.nwid); }
+                            ctx-disconnect => { root.disconnect-network(net.nwid); }
+                            ctx-connect => { root.connect-network(net.nwid); }
+                            ctx-remove => { root.remove-network(net.nwid); }
                         }
                     }
                 }
@@ -848,31 +863,38 @@ export component MainWindow inherits Window {
 
             HorizontalLayout {
                 spacing: Tokens.sp-2;
-                alignment: end;
-                Button {
-                    text: "Delete Network";
-                    min-height: Tokens.ctrl-h;
-                    min-width: Tokens.btn-min-w;
-                    clicked => { root.open-delete-confirm(); }
-                }
-                Rectangle { horizontal-stretch: 1; }
+                alignment: space-between;
+
                 Button {
                     text: "Advanced Settings…";
                     min-height: Tokens.ctrl-h;
                     min-width: Tokens.btn-min-w;
                     clicked => { root.open-advanced(); }
                 }
-                if root.d-connected || root.d-state-label != "Disconnected" : Button {
-                    text: "Disconnect";
-                    min-height: Tokens.ctrl-h;
-                    min-width: Tokens.btn-min-w;
-                    clicked => { root.disconnect-current(); }
-                }
-                if !root.d-connected && root.d-state-label == "Disconnected" : Button {
-                    text: "Connect";
-                    min-height: Tokens.ctrl-h;
-                    min-width: Tokens.btn-min-w;
-                    clicked => { root.connect-current(); }
+
+                VerticalLayout {
+                    spacing: Tokens.sp-2;
+                    alignment: end;
+
+                    if root.d-connected || root.d-state-label != "Disconnected" : Button {
+                        text: "Disconnect";
+                        min-height: Tokens.ctrl-h;
+                        min-width: Tokens.btn-min-w;
+                        clicked => { root.disconnect-current(); }
+                    }
+                    if !root.d-connected && root.d-state-label == "Disconnected" : Button {
+                        text: "Connect";
+                        min-height: Tokens.ctrl-h;
+                        min-width: Tokens.btn-min-w;
+                        clicked => { root.connect-current(); }
+                    }
+
+                    Button {
+                        text: "Remove Network";
+                        min-height: Tokens.ctrl-h;
+                        min-width: Tokens.btn-min-w;
+                        clicked => { root.open-delete-confirm(); }
+                    }
                 }
             }
         }
@@ -1464,7 +1486,7 @@ export component MainWindow inherits Window {
 
                 HorizontalLayout {
                     Text {
-                        text: "Delete Network";
+                        text: "Remove Network";
                         font-size: Tokens.font-section;
                         font-weight: 700;
                         color: Tokens.error;
@@ -1493,7 +1515,7 @@ export component MainWindow inherits Window {
                 }
 
                 Text {
-                    text: "Are you sure you want to delete network '" + root.d-name + "' (" + root.d-nwid + ") from this client?";
+                    text: "Are you sure you want to remove network '" + root.d-name + "' (" + root.d-nwid + ") from this client?";
                     font-size: Tokens.font-body;
                     font-weight: 600;
                     color: Palette.foreground;
@@ -1517,7 +1539,7 @@ export component MainWindow inherits Window {
                         clicked => { root.show-delete-modal = false; }
                     }
                     Button {
-                        text: "Delete Network";
+                        text: "Remove Network";
                         min-height: Tokens.ctrl-h;
                         min-width: Tokens.btn-min-w;
                         enabled: !root.delete-busy;

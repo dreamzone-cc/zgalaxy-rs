@@ -564,3 +564,71 @@ async fn test_matrix_network_rename_propagation() {
     assert_eq!(retrieved.name, "GlobalGamingLAN");
 }
 
+// ============================================================================
+// 11. Disconnect vs Remove Network & Boot Reconnect Matrix Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_matrix_disconnect_vs_remove_lifecycle() {
+    let temp_dir = tempdir().unwrap();
+    let working_dir = temp_dir.path().to_path_buf();
+    let nm = NetworkManager::new();
+    nm.set_node_address("5b07896437".to_string()).await;
+    nm.set_working_dir(working_dir.clone()).await;
+
+    let nwid = "ef313fb5c9503357";
+
+    // 1. Join network -> connected: true, status: RequestingConfiguration
+    let mut net = nm.join(nwid).await.unwrap();
+    assert!(net.connected);
+    assert_eq!(net.status, zgalaxy_rs::network::NetworkStatus::RequestingConfiguration);
+
+    // Simulate controller config arrival
+    net.status = zgalaxy_rs::network::NetworkStatus::Ok;
+    net.assigned_addresses = vec!["10.121.15.1".to_string()];
+    nm.update_network(net).await;
+
+    // Verify files created on disk
+    let json_file = working_dir.join("networks.d").join(format!("{}.json", nwid));
+    let conf_file = working_dir.join("networks.d").join(format!("{}.conf", nwid));
+    assert!(json_file.exists());
+    assert!(conf_file.exists());
+
+    // 2. Disconnect network -> must NOT delete disk files, must set connected=false, status=Disconnected
+    let disc = nm.disconnect(nwid).await.expect("Disconnect must return network");
+    assert!(!disc.connected);
+    assert_eq!(disc.status, zgalaxy_rs::network::NetworkStatus::Disconnected);
+    assert!(json_file.exists(), "networks.d/<nwid>.json must be preserved after disconnect");
+    assert!(conf_file.exists(), "networks.d/<nwid>.conf must be preserved after disconnect");
+
+    // 3. Re-load from disk (simulating reboot) -> network must load as Disconnected (preserving user intent)
+    let nm2 = NetworkManager::new();
+    nm2.set_node_address("5b07896437".to_string()).await;
+    let loaded_count = nm2.load_from_disk(&working_dir).await.unwrap();
+    assert_eq!(loaded_count, 1);
+    let loaded = nm2.get(nwid).await.unwrap();
+    assert!(!loaded.connected);
+    assert_eq!(loaded.status, zgalaxy_rs::network::NetworkStatus::Disconnected);
+
+    // 4. Reconnect network -> connected=true, status=RequestingConfiguration
+    let reconnected = nm2.connect(nwid).await.unwrap();
+    assert!(reconnected.connected);
+    assert_eq!(reconnected.status, zgalaxy_rs::network::NetworkStatus::RequestingConfiguration);
+
+    // 5. Re-load from disk (simulating reboot while connected) -> must load as RequestingConfiguration for auto-reconnect
+    let nm3 = NetworkManager::new();
+    nm3.set_node_address("5b07896437".to_string()).await;
+    let loaded3_count = nm3.load_from_disk(&working_dir).await.unwrap();
+    assert_eq!(loaded3_count, 1);
+    let loaded3 = nm3.get(nwid).await.unwrap();
+    assert!(loaded3.connected);
+    assert_eq!(loaded3.status, zgalaxy_rs::network::NetworkStatus::RequestingConfiguration);
+
+    // 6. Remove Network (Leave) -> must delete disk files and memory entry
+    let left = nm3.leave(nwid).await.unwrap().expect("Leave must return removed net");
+    assert_eq!(left.nwid, nwid);
+    assert!(!json_file.exists(), "networks.d/<nwid>.json must be deleted after leave");
+    assert!(!conf_file.exists(), "networks.d/<nwid>.conf must be deleted after leave");
+    assert!(nm3.get(nwid).await.is_none());
+}
+

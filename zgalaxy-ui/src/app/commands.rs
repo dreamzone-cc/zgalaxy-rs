@@ -24,8 +24,20 @@ pub fn join(client: Arc<DaemonClient>, nwid: String, wake_flag: Option<Arc<Atomi
     });
 }
 
-pub fn leave(client: Arc<DaemonClient>, nwid: String, wake_flag: Option<Arc<AtomicBool>>) {
+pub fn disconnect(client: Arc<DaemonClient>, nwid: String, wake_flag: Option<Arc<AtomicBool>>) {
+    let body = serde_json::json!({ "connected": false });
+    update_flags(client, nwid, body, wake_flag);
+}
+
+pub fn connect(client: Arc<DaemonClient>, nwid: String, wake_flag: Option<Arc<AtomicBool>>) {
+    let body = serde_json::json!({ "connected": true });
+    update_flags(client, nwid, body, wake_flag);
+}
+
+pub fn remove_network(client: Arc<DaemonClient>, nwid: String, wake_flag: Option<Arc<AtomicBool>>) {
     std::thread::spawn(move || {
+        // Pre-disconnect first to ensure safe interface teardown
+        let _ = client.post_network_settings(&nwid, &serde_json::json!({ "connected": false }));
         let _ = client.delete_network(&nwid);
         if let Some(flag) = wake_flag {
             flag.store(true, Ordering::Relaxed);

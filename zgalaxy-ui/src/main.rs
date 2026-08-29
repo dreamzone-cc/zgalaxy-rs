@@ -351,8 +351,39 @@ fn main() {
     main_w.on_leave_network(move |nwid| {
         let nwid = nwid.trim().to_string();
         if !nwid.is_empty() {
-            app::commands::leave(Arc::clone(&c), nwid, Some(Arc::clone(&leave_flag)));
+            app::commands::remove_network(Arc::clone(&c), nwid, Some(Arc::clone(&leave_flag)));
             if let Some(ui) = mw_leave.upgrade() {
+                ui.set_current_view("main".into());
+            }
+        }
+    });
+
+    let c_disc_net = Arc::clone(&client);
+    let disc_net_flag = Arc::clone(&poll_now);
+    main_w.on_disconnect_network(move |nwid| {
+        let nwid = nwid.trim().to_string();
+        if !nwid.is_empty() {
+            app::commands::disconnect(Arc::clone(&c_disc_net), nwid, Some(Arc::clone(&disc_net_flag)));
+        }
+    });
+
+    let c_conn_net = Arc::clone(&client);
+    let conn_net_flag = Arc::clone(&poll_now);
+    main_w.on_connect_network(move |nwid| {
+        let nwid = nwid.trim().to_string();
+        if !nwid.is_empty() {
+            app::commands::connect(Arc::clone(&c_conn_net), nwid, Some(Arc::clone(&conn_net_flag)));
+        }
+    });
+
+    let c_rem_net = Arc::clone(&client);
+    let rem_net_flag = Arc::clone(&poll_now);
+    let mw_rem = main_w.as_weak();
+    main_w.on_remove_network(move |nwid| {
+        let nwid = nwid.trim().to_string();
+        if !nwid.is_empty() {
+            app::commands::remove_network(Arc::clone(&c_rem_net), nwid, Some(Arc::clone(&rem_net_flag)));
+            if let Some(ui) = mw_rem.upgrade() {
                 ui.set_current_view("main".into());
             }
         }
@@ -363,8 +394,7 @@ fn main() {
     let sel_disc = Arc::clone(&selected_nwid);
     main_w.on_disconnect_current(move || {
         if let Some(nwid) = sel_disc.lock().unwrap().clone() {
-            let body = serde_json::json!({ "connected": false });
-            app::commands::update_flags(Arc::clone(&c), nwid, body, Some(Arc::clone(&disc_flag)));
+            app::commands::disconnect(Arc::clone(&c), nwid, Some(Arc::clone(&disc_flag)));
         }
     });
 
@@ -373,8 +403,7 @@ fn main() {
     let sel_conn = Arc::clone(&selected_nwid);
     main_w.on_connect_current(move || {
         if let Some(nwid) = sel_conn.lock().unwrap().clone() {
-            let body = serde_json::json!({ "connected": true });
-            app::commands::update_flags(Arc::clone(&c), nwid, body, Some(Arc::clone(&conn_flag)));
+            app::commands::connect(Arc::clone(&c), nwid, Some(Arc::clone(&conn_flag)));
         }
     });
 
@@ -391,7 +420,7 @@ fn main() {
     let mw_del = main_w.as_weak();
     main_w.on_confirm_delete_current(move || {
         if let Some(nwid) = sel_del.lock().unwrap().clone() {
-            app::commands::leave(Arc::clone(&c), nwid, Some(Arc::clone(&del_flag)));
+            app::commands::remove_network(Arc::clone(&c), nwid, Some(Arc::clone(&del_flag)));
             if let Some(ui) = mw_del.upgrade() {
                 ui.set_show_delete_modal(false);
                 ui.set_current_view("main".into());
