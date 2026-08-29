@@ -317,9 +317,8 @@ async fn main() -> Result<()> {
         .to_ascii_lowercase();
 
     // QUIC datagrams cannot exceed ~1200 bytes on the wire; a larger adapter
-    // MTU would produce frames that get silently dropped instead of sent.
-    // TAP frames carry a 14-byte Ethernet header, leaving 1186 for payload.
-    let tun_mtu: u32 = if transport_mode == "quic" { 1186 } else { 2800 };
+    // Canonical ZeroTier MTU (2800) satisfies RFC 8200 minimum IPv6 MTU (>= 1280) and standard L2 frames
+    let tun_mtu: u32 = 2800;
 
     // Initialize High-Performance UDP Transport Loop & Virtual Adapter Routing
     // ب2: one shared L2 learning table across TUN reader, QUIC events,
@@ -343,11 +342,12 @@ async fn main() -> Result<()> {
                 let cidr = if ip.contains('/') {
                     ip.clone()
                 } else {
-                    net.routes
+                    let prefix_len = net.routes
                         .iter()
                         .find(|r| r.via.is_none() && (if is_v6 { r.target.contains(':') } else { !r.target.contains(':') }))
-                        .map(|r| r.target.clone())
-                        .unwrap_or_else(|| if is_v6 { format!("{}/128", ip) } else { format!("{}/24", ip) })
+                        .and_then(|r| r.target.split('/').nth(1))
+                        .unwrap_or(if is_v6 { "128" } else { "24" });
+                    format!("{}/{}", ip, prefix_len)
                 };
                 tun_arc.assign_address(&cidr, Some(&net.mac)).await;
             }
@@ -702,17 +702,12 @@ async fn main() -> Result<()> {
                                                         let cidr = if ip.contains('/') {
                                                             ip.clone()
                                                         } else {
-                                                            net.routes
+                                                            let prefix_len = net.routes
                                                                 .iter()
                                                                 .find(|r| r.via.is_none() && (if is_v6 { r.target.contains(':') } else { !r.target.contains(':') }))
-                                                                .map(|r| r.target.clone())
-                                                                .unwrap_or_else(|| {
-                                                                    if is_v6 {
-                                                                        format!("{}/128", ip)
-                                                                    } else {
-                                                                        format!("{}/24", ip)
-                                                                    }
-                                                                })
+                                                                .and_then(|r| r.target.split('/').nth(1))
+                                                                .unwrap_or(if is_v6 { "128" } else { "24" });
+                                                            format!("{}/{}", ip, prefix_len)
                                                         };
                                                         tun_for_events
                                                             .assign_address(&cidr, Some(&net.mac))

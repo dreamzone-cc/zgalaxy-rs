@@ -47,15 +47,18 @@ impl RouteManager {
 
         #[cfg(target_os = "linux")]
         {
+            let _ = Command::new("ip").args(["link", "set", "dev", device_name, "up"]).status();
             let status = Command::new("ip")
-                .args(["addr", "add", ip_with_cidr, "dev", device_name])
+                .args(["addr", "replace", ip_with_cidr, "dev", device_name])
                 .status();
             if let Ok(s) = status {
                 if s.success() {
-                    let _ = Command::new("ip").args(["link", "set", "dev", device_name, "up"]).status();
                     return Ok(());
                 }
             }
+            let _ = Command::new("ip")
+                .args(["addr", "add", ip_with_cidr, "dev", device_name])
+                .status();
         }
 
         #[cfg(target_os = "windows")]
@@ -98,11 +101,24 @@ impl RouteManager {
 
         #[cfg(target_os = "linux")]
         {
+            let _ = Command::new("ip").args(["link", "set", "dev", device_name, "up"]).status();
             if is_v6 {
+                let status = Command::new("ip")
+                    .args(["-6", "route", "replace", target_subnet, "dev", device_name])
+                    .status();
+                if status.map(|s| s.success()).unwrap_or(false) {
+                    return Ok(());
+                }
                 let _ = Command::new("ip")
                     .args(["-6", "route", "add", target_subnet, "dev", device_name])
                     .status();
             } else {
+                let status = Command::new("ip")
+                    .args(["route", "replace", target_subnet, "dev", device_name])
+                    .status();
+                if status.map(|s| s.success()).unwrap_or(false) {
+                    return Ok(());
+                }
                 let _ = Command::new("ip")
                     .args(["route", "add", target_subnet, "dev", device_name])
                     .status();
