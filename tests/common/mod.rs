@@ -21,7 +21,7 @@ use bytes::Bytes;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use zgalaxy_rs::control::ControlMessage;
+use zgalaxy_rs::control::{ControlMessage, SignedConfig};
 use zgalaxy_rs::control_engine::{self, ControlEngine, MeshContext};
 use zgalaxy_rs::controller::EmbeddedController;
 use zgalaxy_rs::identity::Identity;
@@ -66,8 +66,11 @@ pub async fn bind(kind: TransportKind) -> (Arc<dyn MeshTransport>, mpsc::Receive
 }
 
 async fn spawn_node(kind: TransportKind, is_controller: bool, sync: bool) -> Node {
+    spawn_node_as(kind, Identity::generate(), is_controller, sync).await
+}
+
+async fn spawn_node_as(kind: TransportKind, identity: Identity, is_controller: bool, sync: bool) -> Node {
     let dir = tempfile::tempdir().unwrap();
-    let identity = Identity::generate();
     let (transport, events_rx) = bind(kind).await;
     let addr = transport.local_addr().unwrap();
 
@@ -168,6 +171,17 @@ pub async fn full_cycle(kind: TransportKind) {
     })
     .await;
 
+    // A genuine controller signature captured NOW is older than every
+    // config the client applies later: replaying it in step 4c must fail.
+    let stale = SignedConfig::sign(
+        &ctrl.ctx.identity,
+        &nwid,
+        &client_id,
+        &json!({"nwid": nwid, "authorized": true, "ipAssignments": ["10.77.0.99"], "routes": []}),
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
     // 2. Authorize (what ztnet does over REST) → OK with a pool address.
     ctrl.ctx
         .controller
@@ -218,6 +232,7 @@ pub async fn full_cycle(kind: TransportKind) {
             &ControlMessage::NetworkConfigResponse {
                 nwid: nwid.clone(),
                 config: json!({"authorized": true, "ipAssignments": ["6.6.6.6"], "routes": [{"target": "0.0.0.0/0", "via": null}]}),
+                signed: None,
             },
         )
         .await
@@ -230,6 +245,100 @@ pub async fn full_cycle(kind: TransportKind) {
         assert!(now.routes.iter().all(|r| r.target != "0.0.0.0/0"), "rogue default route must be ignored");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+
+    // 4b. An impostor claiming the CONTROLLER's address with its own key
+    // (64-byte public key blob: the stated address used to be trusted
+    // as-is) must not pass the identity proof, so it cannot push a config.
+    let attacker = Identity::generate();
+    let mut blob = vec![0u8; 32];
+    blob.extend_from_slice(attacker.verifying_key.as_bytes());
+    let impostor_id = Identity {
+        address: ctrl.ctx.identity.address,
+        verifying_key: attacker.verifying_key,
+        signing_key: attacker.signing_key.clone(),
+        raw_public_key: blob,
+    };
+    let impostor = spawn_node_as(kind, impostor_id, false, false).await;
+    impostor.ctx.transport.connect(client.addr).await.unwrap();
+    assert!(
+        !impostor.ctx.sessions.await_accepted_us(client.addr, Duration::from_secs(2)).await,
+        "impostor passed the identity proof as the controller"
+    );
+    impostor
+        .ctx
+        .transport
+        .send_control(
+            client.addr,
+            &ControlMessage::NetworkConfigResponse {
+                nwid: nwid.clone(),
+                config: json!({"authorized": true, "ipAssignments": ["6.6.6.7"], "routes": []}),
+                signed: None,
+            },
+        )
+        .await
+        .unwrap();
+    for _ in 0..50 {
+        let now = client.ctx.networks.get(&nwid).await.unwrap();
+        assert_eq!(now.assigned_addresses, vec!["10.77.0.10".to_string()], "impostor config must be ignored");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // 4c. On-path tampering: messages over the REAL controller's proven
+    // session (what a relay forwarding its أ3 proof could inject). Only a
+    // fresh controller signature for this member counts.
+    // Stamped a day ahead: the replay guard cannot be what rejects these,
+    // only the signature/addressing checks can. (A rejected config never
+    // advances the guard, so the real controller's configs keep flowing.)
+    let future = zgalaxy_rs::control::unix_millis() + 86_400_000;
+    let forged = json!({"nwid": nwid, "authorized": true, "ipAssignments": ["6.6.6.8"], "routes": []});
+    let genuine = SignedConfig::sign_at(&ctrl.ctx.identity, &nwid, &client_id, &forged, future).unwrap();
+    let attacks = [
+        ("unsigned", None),
+        ("edited body", Some(SignedConfig { body: genuine.body.replace("6.6.6.8", "6.6.6.9"), ..genuine.clone() })),
+        ("replayed stale", Some(stale)),
+        (
+            "issued to another member",
+            Some(SignedConfig::sign_at(&ctrl.ctx.identity, &nwid, "0123456789", &forged, future).unwrap()),
+        ),
+        (
+            "signed by another key",
+            Some(SignedConfig::sign_at(&Identity::generate(), &nwid, &client_id, &forged, future).unwrap()),
+        ),
+    ];
+    for (what, signed) in attacks {
+        ctrl.ctx
+            .transport
+            .send_control(
+                client.addr,
+                &ControlMessage::NetworkConfigResponse { nwid: nwid.clone(), config: forged.clone(), signed },
+            )
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            let now = client.ctx.networks.get(&nwid).await.unwrap();
+            assert_eq!(now.assigned_addresses, vec!["10.77.0.10".to_string()], "{} config was applied", what);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    // Control: the same path DOES apply a fresh genuine signature, so the
+    // rejections above are the checks working, not a dead channel.
+    let renamed = json!({"nwid": nwid, "name": "Signed", "authorized": true, "ipAssignments": ["10.77.0.10"], "routes": [{"target": "10.77.0.0/16", "via": null}]});
+    let fresh = SignedConfig::sign(&ctrl.ctx.identity, &nwid, &client_id, &renamed).unwrap();
+    ctrl.ctx
+        .transport
+        .send_control(
+            client.addr,
+            &ControlMessage::NetworkConfigResponse { nwid: nwid.clone(), config: renamed.clone(), signed: Some(fresh) },
+        )
+        .await
+        .unwrap();
+    let nm = client.ctx.networks.clone();
+    let n = nwid.clone();
+    wait_for("a genuine signed config applies", || {
+        let (nm, n) = (nm.clone(), n.clone());
+        async move { nm.get(&n).await.map(|x| x.name == "Signed").unwrap_or(false) }
+    })
+    .await;
 
     // 5. An anonymous session (no identity proof) cannot inject frames.
     let (anon, _anon_rx) = bind(kind).await;
