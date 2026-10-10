@@ -1,28 +1,28 @@
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
+use bytes::Bytes;
 use clap::Parser;
 use tokio::fs;
 use tokio::sync::mpsc;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, error};
 use tracing_subscriber::FmtSubscriber;
 use anyhow::{Context, Result};
 
 use zgalaxy_rs::cli::Cli;
 use zgalaxy_rs::config::LocalConfig;
+use zgalaxy_rs::control_engine::{self, ControlEngine, InterfaceTarget, MeshContext};
 use zgalaxy_rs::controller::EmbeddedController;
 use zgalaxy_rs::controller_api::{AppState, ControllerServer};
 use zgalaxy_rs::identity::Identity;
+use zgalaxy_rs::interface_sync;
+use zgalaxy_rs::mesh::capabilities::{CANONICAL_MTU, IPV6_MIN_MTU};
+use zgalaxy_rs::mesh::{MeshTransport, PeerSessions, TransportKind};
 use zgalaxy_rs::nat::NatTraversalEngine;
 use zgalaxy_rs::network::NetworkManager;
 use zgalaxy_rs::peer::PeerManager;
+use zgalaxy_rs::quic::{QuicMesh, QuicTransport};
 use zgalaxy_rs::resolver::DynamicDnsResolver;
-use zgalaxy_rs::transport::UdpTransport;
-
-/// Presence bookkeeping cadence for datagram-driven refreshes (ب3).
-const PEER_PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-/// RTT probe cadence over QUIC control streams (ب3).
-const RTT_PROBE_INTERVAL_SECS: u64 = 10;
+use zgalaxy_rs::transport::{BridgeMode, UdpTransport};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
         }
     });
 
+    #[cfg(unix)]
     if daemonize {
         // Re-spawn without -d in a new process group (detached, stdio null)
         // and exit — matching the ZeroTier `-d` daemonize contract that the
@@ -98,6 +99,10 @@ async fn main() -> Result<()> {
             .spawn()
             .context("failed to daemonize")?;
         return Ok(());
+    }
+    #[cfg(not(unix))]
+    if daemonize {
+        warn!("-d (daemonize) is not supported on this platform; running in the foreground");
     }
 
     if !cli_args.is_empty() {
@@ -252,10 +257,9 @@ async fn main() -> Result<()> {
     let _ = resolver.load_sources(&working_dir, local_config.port).await;
     resolver.clone().start_worker();
 
-    // Initialize NAT Traversal & Hole-Punching Engine.
-    // The raw-UDP keepalive worker is only meaningful for the legacy UDP
-    // transport; in QUIC mode keep-alives are built into the connection
-    // (transport.keep_alive_interval), so the worker starts there instead.
+    // NAT traversal / path keep-alive engine. With a mesh transport it only
+    // re-probes paths without a live session (the RTT prober covers live
+    // ones); with the legacy bridge it sends wire echoes.
     let nat_engine = Arc::new(NatTraversalEngine::new(peer_manager.clone()));
 
     // Initialize Embedded Controller (Pure Rust, FileDB compatible with ZeroTier controller.d/)
@@ -278,7 +282,7 @@ async fn main() -> Result<()> {
         controller: controller.clone(),
         controller_enabled: local_config.controller_enabled,
         resolver: resolver.clone(),
-        join_trigger: Some(join_tx.clone()),
+        join_trigger: Some(join_tx),
     };
 
     tokio::spawn(async move {
@@ -307,830 +311,178 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Transport selection: "quic" (primary mandatory protocol) or
-    // "udp" (legacy fallback path).
-    let transport_mode = local_config
-        .settings
-        .get("transportMode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("quic")
-        .to_ascii_lowercase();
+    // Mesh transport selection (settings.transportMode). The transport is
+    // bound FIRST: its capabilities size the virtual interface.
+    let requested = local_config.transport_mode();
+    let transport_kind = if requested.is_available() {
+        requested
+    } else {
+        warn!(
+            "[ZGALAXY MESH] transportMode '{}' has no backend in this build yet (docs/GTP-INTEGRATION.md) — using quic",
+            requested
+        );
+        TransportKind::Quic
+    };
 
-    // QUIC datagrams cannot exceed ~1200 bytes on the wire; a larger adapter
-    // Canonical ZeroTier MTU (2800) satisfies RFC 8200 minimum IPv6 MTU (>= 1280) and standard L2 frames
-    let tun_mtu: u32 = 2800;
+    let mut quic_transport: Option<Arc<QuicTransport>> = None;
+    if transport_kind == TransportKind::Quic {
+        let bind_v6 = std::net::SocketAddr::from(([0u8; 16], local_config.port));
+        let bind_v4 = std::net::SocketAddr::from(([0, 0, 0, 0], local_config.port));
+        let bound = QuicTransport::bind(bind_v6).or_else(|e_v6| {
+            info!(
+                "[ZGALAXY QUIC] IPv6 bind on [::]:{} unavailable ({:#}), falling back to 0.0.0.0:{}",
+                local_config.port, e_v6, local_config.port
+            );
+            QuicTransport::bind(bind_v4)
+        });
+        match bound {
+            Ok(quic) => quic_transport = Some(Arc::new(quic)),
+            Err(e) => error!("[ZGALAXY QUIC] Failed to bind QUIC transport: {:#} — falling back to UDP", e),
+        }
+    }
+    let mesh: Option<Arc<dyn MeshTransport>> = quic_transport
+        .as_ref()
+        .map(|q| Arc::new(QuicMesh(Arc::clone(q))) as Arc<dyn MeshTransport>);
 
-    // Initialize High-Performance UDP Transport Loop & Virtual Adapter Routing
-    // ب2: one shared L2 learning table across TUN reader, QUIC events,
-    // outbound relay, and RTT prober.
-    let l2_shared = Arc::new(zgalaxy_rs::L2Switch::new());
-    let (tun_inbound_tx, tun_inbound_rx) = mpsc::channel::<Vec<u8>>(1024);
-    let (tun_outbound_tx, tun_outbound_rx) = mpsc::channel::<Vec<u8>>(1024);
-    let mut tun_outbound_rx = Some(tun_outbound_rx);
+    // Canonical ZeroTier MTU (2800, ≥ 1280 for RFC 8200 IPv6), capped by what
+    // the transport can carry. QUIC sends frames above the datagram limit on
+    // a stream, so it carries the full 2800.
+    let tun_mtu = mesh
+        .as_ref()
+        .map(|m| m.capabilities().interface_mtu())
+        .unwrap_or(CANONICAL_MTU);
+    if tun_mtu < IPV6_MIN_MTU {
+        warn!("[ZGALAXY MESH] interface MTU {} is below the IPv6 minimum of {}", tun_mtu, IPV6_MIN_MTU);
+    }
+
+    // ب2: one shared L2 learning table across inbound events, the outbound
+    // forwarder and the prober.
+    let l2_shared = zgalaxy_rs::L2Switch::new();
+    let (tun_inbound_tx, tun_inbound_rx) = mpsc::channel::<Bytes>(1024);
+    let (tun_outbound_tx, tun_outbound_rx) = mpsc::channel::<Bytes>(1024);
 
     let mut tun_device = zgalaxy_rs::tun::TunDevice::new("zgalaxy0", tun_mtu);
     let _ = tun_device.create_and_bind(None).await;
+    // Checked before the packet loop takes the kernel handle out.
+    let interface = tun_device.is_live().then(|| InterfaceTarget {
+        device: tun_device.name.clone(),
+        mtu_cap: tun_mtu,
+    });
     let tun_arc = Arc::new(tun_device);
     tun_arc.start_packet_loop(tun_inbound_rx, tun_outbound_tx);
 
-    // Boot auto-recovery: pre-configure interface for all loaded networks with connected=true
-    let loaded_nets = network_manager.list().await;
-    for net in &loaded_nets {
-        if net.connected && net.allow_managed {
-            for ip in &net.assigned_addresses {
-                let is_v6 = ip.contains(':');
-                let cidr = if ip.contains('/') {
-                    ip.clone()
-                } else {
-                    let prefix_len = net.routes
-                        .iter()
-                        .find(|r| r.via.is_none() && (if is_v6 { r.target.contains(':') } else { !r.target.contains(':') }))
-                        .and_then(|r| r.target.split('/').nth(1))
-                        .unwrap_or(if is_v6 { "128" } else { "24" });
-                    format!("{}/{}", ip, prefix_len)
-                };
-                tun_arc.assign_address(&cidr, Some(&net.mac)).await;
+    // Boot auto-recovery: re-apply the cached config of every connected
+    // network, then let the sync loop refresh it from the controller.
+    for net in network_manager.list().await {
+        if let Some(iface) = &interface {
+            let plan = interface_sync::plan_boot(&net);
+            if !plan.is_empty() {
+                interface_sync::apply(&iface.device, plan).await;
+                info!(
+                    "[ZGALAXY BOOT] Pre-configured interface for active network {} (IPs: {:?})",
+                    net.nwid, net.assigned_addresses
+                );
             }
-            for r in &net.routes {
-                let is_default = r.target == "0.0.0.0/0" || r.target == "::/0";
-                if is_default && !net.allow_default {
-                    continue;
-                }
-                let _ = zgalaxy_rs::route_manager::RouteManager::add_route(&tun_arc.name, &r.target);
-            }
-            info!("[ZGALAXY BOOT] Pre-configured interface for active network {} (IPs: {:?})", net.nwid, net.assigned_addresses);
-        }
-        // Enqueue auto-connect for all active networks on boot
-        if net.connected {
-            let _ = join_tx.send(net.nwid.clone());
         }
     }
 
-    if transport_mode == "quic" {
-        let bind_addr_v6 = std::net::SocketAddr::from(([0u8; 16], local_config.port));
-        let bind_addr_v4 = std::net::SocketAddr::from(([0, 0, 0, 0], local_config.port));
-        let quic_res = zgalaxy_rs::quic::QuicTransport::bind(
-            bind_addr_v6,
-            identity.address.to_string(),
-            identity.to_public_string(),
-        ).or_else(|e_v6| {
-            tracing::info!(
-                "[ZGALAXY QUIC] IPv6 bind on [::]:{} unavailable ({:?}), falling back to IPv4 0.0.0.0:{}",
-                local_config.port,
-                e_v6,
-                local_config.port
-            );
-            zgalaxy_rs::quic::QuicTransport::bind(
-                bind_addr_v4,
-                identity.address.to_string(),
-                identity.to_public_string(),
-            )
+    let sync_now = Arc::new(tokio::sync::Notify::new());
+    // Headless: the packet loop never started, so there is nothing to forward.
+    let mut tun_outbound_rx = interface.is_some().then_some(tun_outbound_rx);
+
+    if let (Some(quic), Some(mesh)) = (&quic_transport, &mesh) {
+        nat_engine.set_mesh_transport(Arc::clone(mesh)).await;
+
+        let (events_tx, events_rx) = mpsc::channel(1024);
+        let quic_runner = Arc::clone(quic);
+        tokio::spawn(async move {
+            if let Err(e) = quic_runner.run(events_tx).await {
+                error!("[ZGALAXY QUIC] Accept loop terminated: {:#}", e);
+            }
         });
-        match quic_res {
-            Ok(quic) => {
-                let quic = Arc::new(quic);
-                nat_engine.set_quic_transport(Arc::clone(&quic)).await;
-                nat_engine.clone().start_worker();
 
-                let (quic_events_tx, mut quic_events_rx) = mpsc::channel(1024);
+        let ctx = MeshContext {
+            transport: Arc::clone(mesh),
+            sessions: PeerSessions::new(),
+            identity: identity.clone(),
+            controller: controller.clone(),
+            is_controller: local_config.controller_enabled,
+            networks: network_manager.clone(),
+            peers: peer_manager.clone(),
+            l2: l2_shared.clone(),
+            tun_tx: tun_inbound_tx.clone(),
+            interface: interface.clone(),
+            sync_now: Arc::clone(&sync_now),
+        };
+        info!(
+            "[ZGALAXY MESH] {} transport active (interface MTU {}, data plane {})",
+            mesh.kind(),
+            tun_mtu,
+            if interface.is_some() { "live" } else { "headless" }
+        );
+        spawn_watched("mesh-engine", ControlEngine::new(ctx.clone()).run(events_rx));
+        if let Some(rx) = tun_outbound_rx.take() {
+            spawn_watched("mesh-outbound", control_engine::forward_outbound(ctx.clone(), rx));
+        }
+        spawn_watched("mesh-rtt-prober", control_engine::rtt_prober(ctx.clone()));
+        spawn_watched("mesh-config-sync", control_engine::config_sync_loop(ctx, resolver.clone()));
+    }
 
-                let quic_runner = Arc::clone(&quic);
-                tokio::spawn(async move {
-                    if let Err(e) = quic_runner.run(quic_events_tx).await {
-                        error!("[ZGALAXY QUIC] Accept loop terminated: {}", e);
-                    }
-                });
+    // Legacy UDP wire bridge. Sole transport when no mesh transport is up;
+    // beside one it only does controller duties (see BridgeMode).
+    let run_bridge = mesh.is_none() || local_config.udp_bridge_enabled();
+    let mut udp_bridge: Option<Arc<UdpTransport>> = None;
+    if run_bridge {
+        match UdpTransport::bind(local_config.port, identity.clone(), peer_manager.clone(), resolver.clone()).await {
+            Ok(transport) => {
+                let transport = Arc::new(transport);
+                let mode = if mesh.is_some() { BridgeMode::ControllerOnly } else { BridgeMode::Full };
+                transport.set_controller(controller.clone()).await;
+                transport.set_network_manager(network_manager.clone()).await;
+                transport.start_rx_loop(tun_inbound_tx.clone(), mode);
+                nat_engine.set_transport(Arc::clone(&transport)).await;
 
-                // Engine loop: QUIC events → TUN / network manager / presence.
-                let nm_for_events = network_manager.clone();
-                let tun_tx = tun_inbound_tx.clone();
-                let quic_engine = Arc::clone(&quic);
-                let ctrl_for_events = controller.clone();
-                let tun_for_events = Arc::clone(&tun_arc);
-                let peers_for_events = peer_manager.clone();
-                let identity_for_events = identity.clone();
-                let l2_for_events = Arc::clone(&l2_shared);
-                let is_controller_node = local_config.controller_enabled;
-                tokio::spawn(async move {
-                    while let Some(event) = quic_events_rx.recv().await {
-                        use zgalaxy_rs::quic::QuicEvent;
-                        // Presence refresh throttle: datagrams can arrive at
-                        // game tick rates; member/peer bookkeeping runs at most
-                        // once per PEER_PRESENCE_INTERVAL per remote.
-                        let mut last_presence: std::collections::HashMap<
-                            std::net::SocketAddr,
-                            std::time::Instant,
-                        > = std::collections::HashMap::new();
-                        match event {
-                            QuicEvent::Datagram { remote, data } => {
-                                tracing::debug!("[ZGALAXY QUIC] Frame ({}B) from {}", data.len(), remote);
-                                // ب2 backward learning: src MAC ↔ delivering endpoint
-                                // (every frame — one map write, no throttle needed).
-                                if let Some((_, src_mac)) =
-                                    zgalaxy_rs::l2_switch::L2Switch::parse_ethernet(&data)
-                                {
-                                    l2_for_events.learn(src_mac, remote).await;
-                                }
-                                let fresh = last_presence
-                                    .get(&remote)
-                                    .map(|t| t.elapsed() >= PEER_PRESENCE_INTERVAL)
-                                    .unwrap_or(true);
-                                if fresh {
-                                    last_presence.insert(remote, std::time::Instant::now());
-                                    if let Some(addr_str) =
-                                        quic_engine.announced_address(remote).await
-                                    {
-                                        if let Ok(node) =
-                                            zgalaxy_rs::identity::Address::from_str(&addr_str)
-                                        {
-                                            peers_for_events
-                                                .add_or_update_peer(
-                                                    node,
-                                                    zgalaxy_rs::peer::PeerRole::Leaf,
-                                                    remote,
-                                                    0,
-                                                )
-                                                .await;
-                                            ctrl_for_events
-                                                .touch_member_last_seen(
-                                                    &addr_str,
-                                                    &format!("{}/{}", remote.ip(), remote.port()),
-                                                )
-                                                .await;
-                                        }
-                                    }
-                                }
-                                let _ = tun_tx.send(data.to_vec()).await;
-                            }
-                            QuicEvent::Control { remote, message } => {
-                                use zgalaxy_rs::quic::control::ControlMessage;
-                                match message {
-                                    ControlMessage::NodeAnnounce { address, .. } => {
-                                        info!("[ZGALAXY QUIC] Peer {} announced as {} — challenging (أ3)", remote, address);
-                                        // أ3: never trust an unproven announcement.
-                                        // Issue a nonce challenge; presence wiring
-                                        // happens only after a valid AnnounceProof.
-                                        let nonce =
-                                            quic_engine.challenge_announce(remote, &address).await;
-                                        let _ = quic_engine
-                                            .send_control(
-                                                remote,
-                                                &ControlMessage::NodeChallenge { nonce },
-                                            )
-                                            .await;
-                                    }
-                                    ControlMessage::NodeChallenge { nonce } => {
-                                        // We are the announcer side: prove possession
-                                        // of our identity's secret key.
-                                        let address =
-                                            identity_for_events.address.to_string();
-                                        let material = zgalaxy_rs::quic::challenge_material(
-                                            nonce,
-                                            &address,
-                                        );
-                                        match identity_for_events.sign(&material) {
-                                            Ok(sig) => {
-                                                let _ = quic_engine
-                                                    .send_control(
-                                                        remote,
-                                                        &ControlMessage::AnnounceProof {
-                                                            nonce,
-                                                            address,
-                                                            signature: hex::encode(sig),
-                                                            public_identity: identity_for_events.to_public_string(),
-                                                        },
-                                                    )
-                                                    .await;
-                                            }
-                                            Err(e) => warn!(
-                                                "[ZGALAXY QUIC] cannot sign announce proof: {}", e
-                                            ),
-                                        }
-                                    }
-                                    ControlMessage::AnnounceProof { nonce, address, signature, public_identity } => {
-                                        // ب3 + أ3: presence/ZTNET observability is
-                                        // granted only to cryptographically proven
-                                        // announcements.
-                                        if quic_engine
-                                            .verify_announce_proof(
-                                                remote, nonce, &address, &signature, &public_identity,
-                                            )
-                                            .await
-                                        {
-                                            info!(
-                                                "[ZGALAXY QUIC] Peer {} proven as {}",
-                                                remote, address
-                                            );
-                                            // Acknowledge so the prover can proceed
-                                            // immediately (no blind retry wait).
-                                            quic_engine.record_accepted(remote, &address).await;
-                                            let _ = quic_engine
-                                                .send_control(
-                                                    remote,
-                                                    &ControlMessage::AnnounceAccepted {
-                                                        address: address.clone(),
-                                                    },
-                                                )
-                                                .await;
-                                            if let Ok(node) =
-                                                zgalaxy_rs::identity::Address::from_str(&address)
-                                            {
-                                                peers_for_events
-                                                    .add_or_update_peer(
-                                                        node,
-                                                        zgalaxy_rs::peer::PeerRole::Leaf,
-                                                        remote,
-                                                        0,
-                                                    )
-                                                    .await;
-                                            }
-                                            ctrl_for_events
-                                                .touch_member_last_seen(
-                                                    &address,
-                                                    &format!("{}/{}", remote.ip(), remote.port()),
-                                                )
-                                                .await;
-                                        } else {
-                                            warn!(
-                                                "[ZGALAXY QUIC] announce proof from {} rejected",
-                                                remote
-                                            );
-                                        }
-                                    }
-                                    ControlMessage::NetworkConfigRequest { nwid, token } => {
-                                        if !is_controller_node {
-                                            warn!("[ZGALAXY QUIC] Inbound config request from {} for {} ignored: node is in Client Mode", remote, nwid);
-                                            continue;
-                                        }
-                                        // Act as controller for networks owned by this node.
-                                        // The member id MUST be the announced node address —
-                                        // anything else cannot map to a member record.
-                                        // announced_address is Some only AFTER a valid
-                                        // AnnounceProof (أ3) — unproven peers are refused.
-                                        let Some(member) = quic_engine.announced_address(remote).await else {
-                                            warn!("[ZGALAXY QUIC] config request from {} before proven announce — ignored", remote);
-                                            continue;
-                                        };
-                                        match ctrl_for_events.register_join_request(&nwid, &member, None).await {
-                                            Ok(_) => {
-                                                if let Some(net) = ctrl_for_events.get_network(&nwid).await {
-                                                    let member_rec = ctrl_for_events.get_effective_member(&nwid, &member).await;
-                                                    let authorized = member_rec.as_ref().map(|m| m.authorized).unwrap_or(false);
-                                                    let ips = member_rec.map(|m| m.ip_assignments).unwrap_or_default();
-
-                                                    // أ1 enforcement: a PRESENTED token must
-                                                    // verify for (nwid, member). An invalid
-                                                    // token means revocation/revision-bump —
-                                                    // refuse instead of re-arming the peer.
-                                                    if let Some(presented) = token.as_deref() {
-                                                        if authorized
-                                                            && ctrl_for_events
-                                                                .verify_membership_token(presented, &nwid, &member)
-                                                                .is_none()
-                                                        {
-                                                            warn!(
-                                                                "[ZGALAXY QUIC] invalid membership token from {} for {} — refused",
-                                                                member, nwid
-                                                            );
-                                                            continue;
-                                                        }
-                                                    }
-
-                                                    // Issue a fresh short-TTL token for
-                                                    // authorized members (COM replacement).
-                                                    let issued = if authorized {
-                                                        ctrl_for_events.issue_membership_token(&nwid, &member).await
-                                                    } else {
-                                                        None
-                                                    };
-
-                                                    let response = serde_json::json!({
-                                                        "nwid": nwid,
-                                                        "name": net.name,
-                                                        "authorized": authorized,
-                                                        "ipAssignments": ips,
-                                                        "routes": net.routes,
-                                                        "mtu": net.mtu,
-                                                        "membershipToken": issued,
-                                                    });
-                                                    if let Err(e) = quic_engine.send_control(
-                                                        remote,
-                                                        &ControlMessage::NetworkConfigResponse { nwid, config: response },
-                                                    ).await {
-                                                        warn!("[ZGALAXY QUIC] failed to answer config request from {}: {}", remote, e);
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!("[ZGALAXY QUIC] join request {} from {} rejected: {}", nwid, member, e);
-                                            }
-                                        }
-                                    }
-                                    ControlMessage::NetworkConfigResponse { nwid, config } => {
-                                        let authorized = config.get("authorized")
-                                            .and_then(|v| v.as_bool())
-                                            .unwrap_or(false);
-                                        let name_opt = config.get("name").and_then(|v| v.as_str());
-                                        let ips: Vec<String> = config
-                                            .get("ipAssignments")
-                                            .and_then(|v| v.as_array())
-                                            .map(|a| {
-                                                a.iter()
-                                                    .filter_map(|x| x.as_str().map(String::from))
-                                                    .collect()
-                                            })
-                                            .unwrap_or_default();
-                                        if let Some(mut net) = nm_for_events.get(&nwid).await {
-                                            let prev_ips = net.assigned_addresses.clone();
-                                            let prev_routes = net.routes.clone();
-                                            let prev_mtu = net.mtu;
-                                            let was_authorized = net.status == zgalaxy_rs::network::NetworkStatus::Ok;
-
-                                            if let Some(name) = name_opt {
-                                                if !name.trim().is_empty() {
-                                                    net.name = name.trim().to_string();
-                                                }
-                                            }
-                                            net.membership_token = config
-                                                .get("membershipToken")
-                                                .and_then(|v| v.as_str())
-                                                .map(String::from);
-                                            net.status = if authorized {
-                                                zgalaxy_rs::network::NetworkStatus::Ok
-                                            } else {
-                                                zgalaxy_rs::network::NetworkStatus::AccessDenied
-                                            };
-                                            net.assigned_addresses = ips.clone();
-                                            if let Some(r_arr) = config.get("routes").and_then(|v| v.as_array()) {
-                                                net.routes = r_arr
-                                                    .iter()
-                                                    .filter_map(|r| serde_json::from_value(r.clone()).ok())
-                                                    .collect();
-                                            }
-                                            if let Some(m) = config.get("mtu").and_then(|v| v.as_u64()) {
-                                                net.mtu = m as u32;
-                                            }
-
-                                            let updated_name = net.name.clone();
-                                            nm_for_events.update_network(net.clone()).await;
-                                            info!("[ZGALAXY QUIC] Network {} updated (name: {}, authorized: {}, ips: {:?})", nwid, updated_name, authorized, net.assigned_addresses);
-
-                                            // Live Dynamic Interface Reconciliation (Real-time sync with controller)
-                                            if authorized && net.allow_managed {
-                                                // 1. Dynamic MTU update
-                                                if net.mtu > 0 && net.mtu != prev_mtu {
-                                                    let _ = zgalaxy_rs::route_manager::RouteManager::set_mtu(
-                                                        &tun_for_events.name,
-                                                        net.mtu,
-                                                    );
-                                                }
-
-                                                // 2. Remove obsolete IPs that were unassigned or disabled on controller
-                                                for old_ip in &prev_ips {
-                                                    if !net.assigned_addresses.contains(old_ip) {
-                                                        let _ = zgalaxy_rs::route_manager::RouteManager::remove_interface_ip(
-                                                            &tun_for_events.name,
-                                                            old_ip,
-                                                        );
-                                                    }
-                                                }
-
-                                                // 3. Assign newly added IPs
-                                                for ip in &net.assigned_addresses {
-                                                    if !prev_ips.contains(ip) || !was_authorized {
-                                                        let is_v6 = ip.contains(':');
-                                                        let cidr = if ip.contains('/') {
-                                                            ip.clone()
-                                                        } else {
-                                                            let prefix_len = net.routes
-                                                                .iter()
-                                                                .find(|r| r.via.is_none() && (if is_v6 { r.target.contains(':') } else { !r.target.contains(':') }))
-                                                                .and_then(|r| r.target.split('/').nth(1))
-                                                                .unwrap_or(if is_v6 { "128" } else { "24" });
-                                                            format!("{}/{}", ip, prefix_len)
-                                                        };
-                                                        tun_for_events
-                                                            .assign_address(&cidr, Some(&net.mac))
-                                                            .await;
-                                                    }
-                                                }
-
-                                                // 4. Remove obsolete routes
-                                                for old_r in &prev_routes {
-                                                    if !net.routes.iter().any(|r| r.target == old_r.target) {
-                                                        let _ = zgalaxy_rs::route_manager::RouteManager::remove_route(
-                                                            &tun_for_events.name,
-                                                            &old_r.target,
-                                                        );
-                                                    }
-                                                }
-
-                                                // 5. Add new routes
-                                                for route in &net.routes {
-                                                    if !prev_routes.iter().any(|r| r.target == route.target) || !was_authorized {
-                                                        let is_default = route.target == "0.0.0.0/0" || route.target == "::/0";
-                                                        if is_default && !net.allow_default {
-                                                            continue;
-                                                        }
-                                                        let _ = zgalaxy_rs::route_manager::RouteManager::add_route(
-                                                            &tun_for_events.name,
-                                                            &route.target,
-                                                        );
-                                                    }
-                                                }
-                                            } else if was_authorized && !authorized {
-                                                // De-authorized from controller -> flush interface IPs and routes immediately
-                                                for ip in &prev_ips {
-                                                    let _ = zgalaxy_rs::route_manager::RouteManager::remove_interface_ip(
-                                                        &tun_for_events.name,
-                                                        ip,
-                                                    );
-                                                }
-                                                for route in &prev_routes {
-                                                    let _ = zgalaxy_rs::route_manager::RouteManager::remove_route(
-                                                        &tun_for_events.name,
-                                                        &route.target,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    ControlMessage::AnnounceAccepted { address } => {
-                                        // The peer verified OUR announce proof —
-                                        // config requests are now safe to send.
-                                        quic_engine.record_accepted(remote, &address).await;
-                                        debug!(
-                                            "[ZGALAXY QUIC] our announce accepted by {} for {}",
-                                            remote, address
-                                        );
-                                    }
-                                    ControlMessage::Ping { nonce, sent_ms } => {
-                                        let now = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis() as u64;
-                                        let _ = quic_engine.send_control(
-                                            remote,
-                                            &ControlMessage::Pong { nonce, sent_ms, received_ms: now },
-                                        ).await;
-                                    }
-                                    ControlMessage::Pong { sent_ms, .. } => {
-                                        // Real RTT is measured at the sender:
-                                        // receipt_now - original_sent_ms.
-                                        let now = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis() as u64;
-                                        let rtt = now.saturating_sub(sent_ms) as i32;
-                                        if let Some(addr_str) =
-                                            quic_engine.announced_address(remote).await
-                                        {
-                                            if let Ok(node) =
-                                                zgalaxy_rs::identity::Address::from_str(&addr_str)
-                                            {
-                                                peers_for_events
-                                                    .add_or_update_peer(
-                                                        node,
-                                                        zgalaxy_rs::peer::PeerRole::Leaf,
-                                                        remote,
-                                                        rtt,
-                                                    )
-                                                    .await;
-                                                tracing::debug!(
-                                                    "[ZGALAXY QUIC RTT] {} -> {}ms",
-                                                    addr_str,
-                                                    rtt
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            QuicEvent::Connected { remote } => {
-                                info!("[ZGALAXY QUIC] Peer session established: {}", remote);
-                            }
-                            QuicEvent::Disconnected { remote, stable_id } => {
-                                // Ignore teardowns of connections that were already
-                                // replaced by a newer one (ب4 replace-on-dial).
-                                let still_active = quic_engine
-                                    .connected_peers()
-                                    .read()
-                                    .await
-                                    .get(&remote)
-                                    .map(|p| p.conn.stable_id() == stable_id)
-                                    .unwrap_or(false);
-                                info!(
-                                    "[ZGALAXY QUIC] Peer session lost: {} (replaced: {})",
-                                    remote,
-                                    !still_active
-                                );
-                                if !still_active {
-                                    continue;
-                                }
-                                // ب4: drop the peer's learned MACs immediately —
-                                // frames to them fall back to flooding until the
-                                // peer reconnects and re-teaches itself.
-                                let removed = l2_for_events.remove_endpoint(remote).await;
-                                if removed > 0 {
-                                    tracing::debug!(
-                                        "[ZGALAXY QUIC] evicted {} learned MAC(s) for {}",
-                                        removed,
-                                        remote
-                                    );
-                                }
-                            }
+                if let Some(mut rx) = tun_outbound_rx.take() {
+                    let tp = Arc::clone(&transport);
+                    spawn_watched("udp-outbound", async move {
+                        while let Some(frame) = rx.recv().await {
+                            let _ = tp.broadcast_frame(frame).await;
                         }
-                    }
-                });
+                    });
+                }
 
-                // ب2: selective L2 forwarding — unicast frames go only to the
-                // learned owner endpoint; broadcast/multicast/unknown flood to
-                // all connected peers.
-                let quic_for_outbound = Arc::clone(&quic);
-                // Same shared table: inbound frames teach it, outbound frames consult it.
-                let l2_for_outbound = Arc::clone(&l2_shared);
-                let Some(mut tun_outbound_rx) = tun_outbound_rx.take() else {
-                    return Ok(());
-                };
-                tokio::spawn(async move {
-                    while let Some(frame) = tun_outbound_rx.recv().await {
-                        let (dst_known, dst_mac) =
-                            zgalaxy_rs::l2_switch::L2Switch::parse_ethernet(&frame)
-                                .map(|(d, _)| {
-                                    (
-                                        !zgalaxy_rs::l2_switch::L2Switch::is_broadcast(&d)
-                                            && !zgalaxy_rs::l2_switch::L2Switch::is_multicast(&d),
-                                        d,
-                                    )
-                                })
-                                .unwrap_or((false, [0u8; 6]));
-                        let target: Option<std::net::SocketAddr> = if dst_known {
-                            l2_for_outbound.resolve(&dst_mac).await
-                        } else {
-                            None
-                        };
-                        match target {
-                            Some(endpoint) => {
-                                if let Err(e) =
-                                    quic_for_outbound.send_frame(endpoint, bytes::Bytes::from(frame)).await
-                                {
-                                    warn!("[ZGALAXY QUIC] unicast frame to {} dropped: {}", endpoint, e);
-                                }
-                            }
-                            None => {
-                                let frame = bytes::Bytes::from(frame);
-                                let peers = quic_for_outbound.connected_peers().read().await;
-                                for remote in peers.keys() {
-                                    if let Err(e) =
-                                        quic_for_outbound.send_frame(*remote, frame.clone()).await
-                                    {
-                                        warn!("[ZGALAXY QUIC] flooded frame to {} dropped: {}", remote, e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-
-                // ب3: periodic RTT probes ride the reliable control streams;
-                // Pong handling feeds real latency into PeerManager (ZTNET).
-                // These pings double as NAT-binding keepalives in QUIC mode.
-                let quic_for_rtt = Arc::clone(&quic);
-                let l2_for_rtt = Arc::clone(&l2_shared);
-                spawn_watched("quic-rtt-prober", async move {
-                    let mut interval =
-                        tokio::time::interval(std::time::Duration::from_secs(RTT_PROBE_INTERVAL_SECS));
+                // Join requests over the wire bridge so controllers register
+                // members for ztnet, in parallel with the mesh transport.
+                let nm_for_sync = network_manager.clone();
+                let tp_for_sync = Arc::clone(&transport);
+                spawn_watched("udp-sync-loop", async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
                     loop {
                         interval.tick().await;
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        let remotes: Vec<std::net::SocketAddr> = quic_for_rtt
-                            .connected_peers()
-                            .read()
-                            .await
-                            .keys()
-                            .copied()
-                            .collect();
-                        for remote in remotes {
-                            let msg = zgalaxy_rs::quic::control::ControlMessage::Ping {
-                                nonce: rand::random::<u64>(),
-                                sent_ms: now,
-                            };
-                            if let Err(e) = quic_for_rtt.send_control(remote, &msg).await {
-                                tracing::debug!("[ZGALAXY QUIC RTT] probe to {} failed: {}", remote, e);
-                            }
+                        for net in nm_for_sync.list().await.into_iter().filter(|n| n.connected) {
+                            let _ = tp_for_sync.send_network_config_request(&net.nwid).await;
                         }
-                        // ب2 hygiene: drop silent MACs after 5 minutes of silence.
-                        let _ = l2_for_rtt.evict_stale(std::time::Duration::from_secs(300)).await;
                     }
                 });
-
-                // Periodic network-config sync over reliable control streams.
-                let nm_for_sync = network_manager.clone();
-                let resolver_for_sync = resolver.clone();
-                let peers_for_sync = peer_manager.clone();
-                let quic_for_sync = Arc::clone(&quic);
-                spawn_watched("quic-sync-loop", async move {
-                    // ب4 adaptive cadence: 500ms while any joined network is
-                    // still REQUESTING/ACCESS_DENIED (fast recovery), 3s steady.
-                    loop {
-                        let nets = nm_for_sync.list().await;
-                        if nets.is_empty() {
-                            tracing::debug!("[ZGALAXY QUIC SYNC] heartbeat: no joined networks");
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                            continue;
-                        }
-                        // ب4 recovery: pinned/operator endpoints come FIRST
-                        // (they are the intended controllers), then resolver
-                        // roots as fallback; duplicates removed.
-                        let mut targets: Vec<std::net::SocketAddr> = Vec::new();
-                        if let Ok(extra) = std::env::var("ZGALAXY_EXTRA_ENDPOINTS") {
-                            for ep in extra.split(',') {
-                                let ep = ep.trim();
-                                if ep.is_empty() {
-                                    continue;
-                                }
-                                // SocketAddr::parse cannot resolve hostnames —
-                                // dial names via DNS (docker service names etc.).
-                                match ep.parse::<std::net::SocketAddr>() {
-                                    Ok(addr) => {
-                                        if !targets.contains(&addr) {
-                                            targets.push(addr)
-                                        }
-                                    }
-                                    Err(_) => match tokio::net::lookup_host(ep).await {
-                                        Ok(mut addrs) => {
-                                            if let Some(addr) = addrs.next() {
-                                                if !targets.contains(&addr) {
-                                                    targets.push(addr);
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!("[ZGALAXY QUIC] cannot resolve extra endpoint '{}': {}", ep, e)
-                                        }
-                                    },
-                                }
-                            }
-                        }
-                        // Add active paths of the controllers for connected networks
-                        for net in &nets {
-                            if !net.connected {
-                                continue;
-                            }
-                            let ctrl_str = if net.nwid.len() >= 10 { &net.nwid[..10] } else { "" };
-                            if let Ok(ctrl_addr) = zgalaxy_rs::identity::Address::from_str(ctrl_str) {
-                                if let Some(peer) = peers_for_sync.get_peer(&ctrl_addr).await {
-                                    for path in peer.paths.iter().filter(|p| p.active) {
-                                        if let Ok(addr) = path.address.replace('/', ":").parse::<std::net::SocketAddr>() {
-                                            if !targets.contains(&addr) {
-                                                targets.push(addr);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        for addr in resolver_for_sync.get_all_active_addresses().await {
-                            if !targets.contains(&addr) {
-                                targets.push(addr);
-                            }
-                        }
-                        // Heartbeat: proves the sync task is alive and shows
-                        // exactly what it is about to dial.
-                        info!(
-                            "[ZGALAXY QUIC SYNC] heartbeat: {} network(s), {} target(s): {:?}",
-                            nets.len(),
-                            targets.len(),
-                            targets
-                        );
-                        // ب4: fire all (net,target) requests CONCURRENTLY — one
-                        // dead root must never delay recovery past its own 5s
-                        // timeout (was: sequential 5s-per-dead-target stall).
-                        let mut jobs = Vec::new();
-                        for net in &nets {
-                            if !net.connected {
-                                continue;
-                            }
-                            for target in &targets {
-                                let msg =
-                                    zgalaxy_rs::quic::control::ControlMessage::NetworkConfigRequest {
-                                        nwid: net.nwid.clone(),
-                                        token: net.membership_token.clone(),
-                                    };
-                                info!("[ZGALAXY QUIC SYNC] dialing {} for {}", target, net.nwid);
-                                let q = Arc::clone(&quic_for_sync);
-                                jobs.push(async move {
-                                    let t = *target;
-                                    tokio::time::timeout(
-                                        std::time::Duration::from_secs(5),
-                                        async {
-                                            q.connect(t).await?;
-                                            // أ3 sequencing: wait until THIS side's
-                                            // announce was verified by the peer
-                                            // (bounded), then the config request
-                                            // cannot be dropped as unproven.
-                                            let _ = q.await_accepted(t, std::time::Duration::from_millis(750)).await;
-                                            q.send_control(t, &msg).await
-                                        },
-                                    )
-                                    .await
-                                    .map_err(|_| anyhow::anyhow!("timeout"))
-                                    .and_then(|r| r)
-                                    .map_err(move |e| (t, e))
-                                });
-                            }
-                        }
-                        let results = futures::future::join_all(jobs).await;
-                        info!("[ZGALAXY QUIC SYNC] all {} request(s) dispatched", results.len());
-                        let mut ok = 0usize;
-                        let mut failed = 0usize;
-                        for r in results {
-                            match r {
-                                Ok(_) => ok += 1,
-                                Err((target, e)) => {
-                                    failed += 1;
-                                    let nwid0 = nets.first().map(|n| n.nwid.clone()).unwrap_or_default();
-                                    warn!(
-                                        "[ZGALAXY QUIC SYNC] request to {} for {} failed: {:#}",
-                                        target,
-                                        nwid0,
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        info!(
-                            "[ZGALAXY QUIC SYNC] cycle done: sent={} ok={} failed={}",
-                            ok + failed,
-                            ok,
-                            failed
-                        );
-                        let any_pending = nm_for_sync
-                            .list()
-                            .await
-                            .iter()
-                            .any(|n| n.connected && n.status != zgalaxy_rs::network::NetworkStatus::Ok);
-                        let cadence = if any_pending { 500 } else { 3000 };
-                        tokio::time::sleep(std::time::Duration::from_millis(cadence)).await;
-                    }
-                });
+                udp_bridge = Some(transport);
             }
-            Err(e) => {
-                error!("[ZGALAXY QUIC] Failed to bind QUIC transport: {} — falling back to UDP", e);
-            }
+            Err(e) => warn!("[ZGALAXY UDP] Could not bind UDP port {} ({:#}), running in client API mode.", local_config.port, e),
         }
     }
+    nat_engine.clone().start_worker();
 
-    // Wire interoperability & ZeroTier / ZTNET UDP controller bridge:
-    // Starts UdpTransport so the client can query and register with standard
-    // ZeroTier UDP wire controllers (such as ZTNET on port 9993/9994) in parallel with QUIC.
-    if let Ok(transport) = UdpTransport::bind(local_config.port, identity.clone(), peer_manager.clone(), resolver.clone()).await {
-        let transport_arc = Arc::new(transport);
-        transport_arc.set_controller(controller.clone()).await;
-        transport_arc.set_network_manager(network_manager.clone()).await;
-        transport_arc.start_rx_loop(tun_inbound_tx);
-        nat_engine.set_transport(transport_arc.clone()).await;
-
-        // Relay host outbound frames captured from TUN into UDP wire transport if not taken
-        let tp_for_outbound = transport_arc.clone();
-        if let Some(mut tun_outbound_rx) = tun_outbound_rx.take() {
-            tokio::spawn(async move {
-                while let Some(frame) = tun_outbound_rx.recv().await {
-                    let _ = tp_for_outbound.broadcast_frame(frame).await;
-                }
-            });
+    // Instant join: a REST join wakes the mesh sync loop and fires a wire
+    // request right away instead of waiting for the next cycle.
+    let sync_for_join = Arc::clone(&sync_now);
+    spawn_watched("instant-join-trigger", async move {
+        while let Some(nwid) = join_rx.recv().await {
+            info!("[ZGALAXY INSTANT JOIN] config request dispatched immediately for {}", nwid);
+            sync_for_join.notify_one();
+            if let Some(tp) = &udp_bridge {
+                let _ = tp.send_network_config_request(&nwid).await;
+            }
         }
-
-        // Instant network join trigger task
-        let tp_for_instant = transport_arc.clone();
-        spawn_watched("instant-udp-join-trigger", async move {
-            while let Some(nwid) = join_rx.recv().await {
-                info!("[ZGALAXY INSTANT JOIN] Dispatched UDP NetworkConfigRequest immediately for {}", nwid);
-                let _ = tp_for_instant.send_network_config_request(&nwid).await;
-            }
-        });
-
-        // Background network join & configuration sync loop
-        let nm_for_sync = network_manager.clone();
-        let tp_for_sync = transport_arc.clone();
-        spawn_watched("udp-sync-loop", async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
-            loop {
-                interval.tick().await;
-                let nets = nm_for_sync.list().await;
-                for net in nets {
-                    if net.connected {
-                        let _ = tp_for_sync.send_network_config_request(&net.nwid).await;
-                    }
-                }
-            }
-        });
-    } else {
-        warn!("[ZGALAXY UDP] Could not bind UDP port {}, running in client API mode.", local_config.port);
-    }
+    });
 
     // Auto-join configured networks from local.conf if not already loaded from networks.d/
     for nwid in &local_config.auto_join_networks {

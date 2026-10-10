@@ -12,6 +12,7 @@
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -42,9 +43,8 @@ impl TunDevice {
 
     /// Create the kernel TAP (Layer 2) interface.
     ///
-    /// NOTE: the MTU must leave room for the 14-byte Ethernet header inside a
-    /// single QUIC datagram (max 1200 bytes on the wire), hence TAP MTU is
-    /// capped at 1186 by callers in QUIC mode.
+    /// The caller sizes the MTU from the active transport's capabilities
+    /// (`TransportCapabilities::interface_mtu`).
     pub async fn create_and_bind(&mut self, assigned_ip: Option<Ipv4Addr>) -> anyhow::Result<()> {
         self.ip4 = assigned_ip;
         self.create_device().await
@@ -110,8 +110,8 @@ impl TunDevice {
     ///   transport for peer encapsulation.
     pub fn start_packet_loop(
         self: &Arc<Self>,
-        mut inbound_rx: mpsc::Receiver<Vec<u8>>,
-        outbound_tx: mpsc::Sender<Vec<u8>>,
+        mut inbound_rx: mpsc::Receiver<Bytes>,
+        outbound_tx: mpsc::Sender<Bytes>,
     ) {
         let name = self.name.clone();
 
@@ -164,7 +164,7 @@ impl TunDevice {
                         break;
                     }
                     Ok(n) => {
-                        if outbound_tx.send(buf[..n].to_vec()).await.is_err() {
+                        if outbound_tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
                             debug!("[ZGALAXY TUN READ] transport channel closed; stopping pump");
                             break;
                         }
@@ -254,10 +254,10 @@ mod tests {
             .await
             .expect("timeout: TAP reader did not surface the transmitted frame")
             .expect("outbound channel closed");
-        assert_eq!(read_back, frame, "host→mesh frame must match");
+        assert_eq!(&read_back[..], &frame[..], "host→mesh frame must match");
 
         // --- mesh -> host: inject via inbound channel, expect AF_PACKET copy.
-        inbound_tx.send(frame.clone()).await.unwrap();
+        inbound_tx.send(Bytes::from(frame.clone())).await.unwrap();
         let fd_raw = fd.as_raw_fd();
         let (n, _) = tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; 2048];

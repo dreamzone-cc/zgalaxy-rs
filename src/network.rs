@@ -86,6 +86,17 @@ impl NetworkSettingsUpdate {
     }
 }
 
+/// Result of applying a controller's network config to a joined network.
+#[derive(Debug, Clone)]
+pub struct ConfigApplied {
+    pub previous: Network,
+    pub current: Network,
+    pub was_authorized: bool,
+    pub authorized: bool,
+    /// False when the config matched what we already had (nothing persisted).
+    pub changed: bool,
+}
+
 /// Network membership and routing manager
 #[derive(Clone, Default)]
 pub struct NetworkManager {
@@ -268,6 +279,58 @@ impl NetworkManager {
         drop(networks);
 
         self.persist_network_to_disk(&net).await;
+    }
+
+    /// Apply a `NetworkConfigResponse` body atomically. Returns None when the
+    /// network is unknown or the user disconnected it — a late response must
+    /// never resurrect a disconnected network or undo the user's choice.
+    /// Persists to disk only when something actually changed.
+    pub async fn apply_controller_config(&self, nwid: &str, config: &serde_json::Value) -> Option<ConfigApplied> {
+        let clean_nwid = nwid.trim().to_lowercase();
+        let authorized = config.get("authorized").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let mut networks = self.networks.write().await;
+        let net = networks.get_mut(&clean_nwid)?;
+        if !net.connected {
+            return None;
+        }
+        let previous = net.clone();
+        let was_authorized = previous.status == NetworkStatus::Ok;
+
+        if let Some(name) = config.get("name").and_then(|v| v.as_str()) {
+            if !name.trim().is_empty() {
+                net.name = name.trim().to_string();
+            }
+        }
+        net.membership_token = config.get("membershipToken").and_then(|v| v.as_str()).map(String::from);
+        net.status = if authorized { NetworkStatus::Ok } else { NetworkStatus::AccessDenied };
+        net.assigned_addresses = config
+            .get("ipAssignments")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        if let Some(routes) = config.get("routes").and_then(|v| v.as_array()) {
+            net.routes = routes.iter().filter_map(|r| serde_json::from_value(r.clone()).ok()).collect();
+        }
+        if let Some(mtu) = config.get("mtu").and_then(|v| v.as_u64()).and_then(|m| u32::try_from(m).ok()) {
+            net.mtu = mtu;
+        }
+
+        let current = net.clone();
+        drop(networks);
+
+        // The token is re-issued on every response; it alone is not a change
+        // worth a disk write every few seconds.
+        let changed = previous.name != current.name
+            || previous.status != current.status
+            || previous.assigned_addresses != current.assigned_addresses
+            || previous.mtu != current.mtu
+            || serde_json::to_value(&previous.routes).ok() != serde_json::to_value(&current.routes).ok()
+            || previous.membership_token.is_some() != current.membership_token.is_some();
+        if changed {
+            self.persist_network_to_disk(&current).await;
+        }
+        Some(ConfigApplied { previous, current, was_authorized, authorized, changed })
     }
 
     /// Disconnect a network: mark as Disconnected and connected=false, persist state, return previous network.
@@ -531,5 +594,42 @@ mod tests {
         assert!(nm_reloaded.get(nwid1).await.is_none());
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn controller_config_applies_atomically_and_respects_disconnect() {
+        let nm = NetworkManager::new();
+        nm.set_node_address("a1b2c3d4e5".into()).await;
+        let nwid = "0123456789abcdef";
+        nm.join(nwid).await.unwrap();
+
+        let cfg = serde_json::json!({
+            "nwid": nwid, "name": "Arena", "authorized": true,
+            "ipAssignments": ["10.10.0.5"],
+            "routes": [{"target": "10.10.0.0/16", "via": null}],
+            "mtu": 2800, "membershipToken": "tok1"
+        });
+        let applied = nm.apply_controller_config(nwid, &cfg).await.unwrap();
+        assert!(applied.changed && applied.authorized && !applied.was_authorized);
+        assert_eq!(applied.current.name, "Arena");
+        assert_eq!(applied.current.status, NetworkStatus::Ok);
+        assert_eq!(applied.current.assigned_addresses, vec!["10.10.0.5"]);
+
+        // Same config again (fresh token only) is not a change.
+        let mut again = cfg.clone();
+        again["membershipToken"] = "tok2".into();
+        let applied = nm.apply_controller_config(nwid, &again).await.unwrap();
+        assert!(!applied.changed && applied.was_authorized);
+        assert_eq!(applied.current.membership_token.as_deref(), Some("tok2"));
+
+        // A response landing after the user disconnected is ignored.
+        nm.disconnect(nwid).await.unwrap();
+        assert!(nm.apply_controller_config(nwid, &cfg).await.is_none());
+        let net = nm.get(nwid).await.unwrap();
+        assert!(!net.connected);
+        assert_eq!(net.status, NetworkStatus::Disconnected);
+
+        // Unknown networks are ignored.
+        assert!(nm.apply_controller_config("ffffffffffffffff", &cfg).await.is_none());
     }
 }

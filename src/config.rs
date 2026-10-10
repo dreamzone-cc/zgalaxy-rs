@@ -3,7 +3,7 @@ use std::path::Path;
 use tokio::fs;
 use serde::{Serialize, Deserialize};
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 use anyhow::Result;
 
 /// Local node configuration loaded from `local.conf` and `networks.d/`
@@ -60,11 +60,17 @@ impl LocalConfig {
         let conf_file = working_dir.join("local.conf");
 
         if conf_file.exists() {
-            if let Ok(content) = fs::read_to_string(&conf_file).await {
-                if let Ok(parsed) = serde_json::from_str::<LocalConfig>(&content) {
-                    cfg = parsed;
-                    info!("[ZGALAXY CONFIG] Loaded local.conf from {:?}", conf_file);
-                }
+            match fs::read_to_string(&conf_file).await {
+                Ok(content) => match serde_json::from_str::<LocalConfig>(&content) {
+                    Ok(parsed) => {
+                        cfg = parsed;
+                        info!("[ZGALAXY CONFIG] Loaded local.conf from {:?}", conf_file);
+                    }
+                    // A broken local.conf used to fall back to defaults
+                    // silently (loopback-only management, default port).
+                    Err(e) => warn!("[ZGALAXY CONFIG] {:?} is not valid JSON ({}); using defaults", conf_file, e),
+                },
+                Err(e) => warn!("[ZGALAXY CONFIG] cannot read {:?}: {}; using defaults", conf_file, e),
             }
         }
 
@@ -132,6 +138,25 @@ impl LocalConfig {
         cfg
     }
 
+    /// Mesh transport from `settings.transportMode` ("quic" default, "gtp",
+    /// "udp"). An unknown value is reported and falls back to QUIC.
+    pub fn transport_mode(&self) -> crate::mesh::TransportKind {
+        use crate::mesh::TransportKind;
+        match self.settings.get("transportMode").and_then(|v| v.as_str()) {
+            None => TransportKind::Quic,
+            Some(raw) => raw.parse().unwrap_or_else(|e| {
+                warn!("[ZGALAXY CONFIG] {}; using quic", e);
+                TransportKind::Quic
+            }),
+        }
+    }
+
+    /// Whether the legacy UDP bridge runs beside the mesh transport
+    /// (`settings.udpBridge`, default true — ztnet join registration).
+    pub fn udp_bridge_enabled(&self) -> bool {
+        self.settings.get("udpBridge").and_then(|v| v.as_bool()).unwrap_or(true)
+    }
+
     /// Save an auto-joined network into `networks.d/<nwid>.conf`
     pub async fn persist_network_join(working_dir: &Path, nwid: &str) -> Result<()> {
         let networks_dir = working_dir.join("networks.d");
@@ -175,6 +200,22 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transport_mode_parses_and_defaults_to_quic() {
+        use crate::mesh::TransportKind;
+        let mut cfg = LocalConfig::default();
+        assert_eq!(cfg.transport_mode(), TransportKind::Quic);
+        cfg.settings.insert("transportMode".into(), serde_json::json!("GTP"));
+        assert_eq!(cfg.transport_mode(), TransportKind::Gtp);
+        cfg.settings.insert("transportMode".into(), serde_json::json!("udp"));
+        assert_eq!(cfg.transport_mode(), TransportKind::Udp);
+        cfg.settings.insert("transportMode".into(), serde_json::json!("carrier-pigeon"));
+        assert_eq!(cfg.transport_mode(), TransportKind::Quic);
+        assert!(cfg.udp_bridge_enabled());
+        cfg.settings.insert("udpBridge".into(), serde_json::json!(false));
+        assert!(!cfg.udp_bridge_enabled());
     }
 
     #[tokio::test]

@@ -336,51 +336,7 @@ impl EmbeddedController {
             for (mem_id, member) in nwid_members.iter_mut() {
                 if member.authorized && !member.no_auto_assign_ips {
                     let prev_ips = member.ip_assignments.clone();
-                    // 1. IPv4
-                    let is_v4_zt = net_config.v4_assign_mode.get("zt").and_then(|v| v.as_bool()).unwrap_or(true);
-                    if !is_v4_zt {
-                        member.ip_assignments.retain(|ip| ip.contains(':'));
-                    }
-                    // 2. 6PLANE
-                    let is_6plane = net_config.v6_assign_mode.get("6plane").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let v6_6plane = Self::compute_6plane_ip(&nwid, mem_id);
-                    if is_6plane {
-                        if let Some(ref ip) = v6_6plane {
-                            if !member.ip_assignments.contains(ip) {
-                                member.ip_assignments.push(ip.clone());
-                            }
-                        }
-                    } else {
-                        if let Some(ref ip) = v6_6plane {
-                            member.ip_assignments.retain(|x| x != ip);
-                        }
-                        member.ip_assignments.retain(|x| !x.to_lowercase().starts_with("fc"));
-                    }
-                    // 3. RFC4193
-                    let is_rfc4193 = net_config.v6_assign_mode.get("rfc4193").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let v6_rfc4193 = Self::compute_rfc4193_ip(&nwid, mem_id);
-                    if is_rfc4193 {
-                        if let Some(ref ip) = v6_rfc4193 {
-                            if !member.ip_assignments.contains(ip) {
-                                member.ip_assignments.push(ip.clone());
-                            }
-                        }
-                    } else {
-                        if let Some(ref ip) = v6_rfc4193 {
-                            member.ip_assignments.retain(|x| x != ip);
-                        }
-                        member.ip_assignments.retain(|x| !x.to_lowercase().starts_with("fd"));
-                    }
-                    // 4. Custom ZT IPv6
-                    let is_zt_v6 = net_config.v6_assign_mode.get("zt").and_then(|v| v.as_bool()).unwrap_or(false);
-                    if !is_zt_v6 {
-                        member.ip_assignments.retain(|ip| {
-                            !ip.contains(':')
-                                || ip.to_lowercase().starts_with("fc")
-                                || ip.to_lowercase().starts_with("fd")
-                        });
-                    }
-
+                    Self::reconcile_derived_v6(&net_config, &nwid, mem_id, &mut member.ip_assignments);
                     if member.ip_assignments != prev_ips {
                         member.revision += 1;
                         let member_dir = self.db_path.join("network").join(&nwid).join("member");
@@ -684,74 +640,54 @@ impl EmbeddedController {
     pub async fn auto_assign_ips_for_member(&self, nwid: &str, member_id: &str, current_ips: &mut Vec<String>) {
         let Some(net) = self.get_network(nwid).await else { return };
 
-        // 1. IPv4 auto-assignment / removal
+        // Mode flags control AUTO-assignment only (ZeroTier semantics):
+        // switching a mode off never deletes addresses an operator assigned
+        // by hand. Only the derived 6PLANE / RFC4193 addresses — which are
+        // pure functions of (nwid, member) — follow their flags both ways.
+
+        // 1. IPv4 from the assignment pools.
         let is_v4_zt = net.v4_assign_mode.get("zt").and_then(|v| v.as_bool()).unwrap_or(true);
-        if is_v4_zt {
-            let has_v4 = current_ips.iter().any(|ip| !ip.contains(':'));
-            if !has_v4 {
-                if let Some(free_ip) = self.next_free_ip(nwid, &net.ip_assignment_pools).await {
-                    current_ips.push(free_ip);
-                }
+        if is_v4_zt && !current_ips.iter().any(|ip| !ip.contains(':')) {
+            if let Some(free_ip) = self.next_free_ip(nwid, &net.ip_assignment_pools).await {
+                current_ips.push(free_ip);
             }
-        } else {
-            // Remove auto-assigned IPv4 addresses from pools if v4AssignMode.zt is false
-            current_ips.retain(|ip| ip.contains(':'));
         }
 
-        // 2. 6PLANE IPv6 auto-assignment / removal (ZeroTier canonical /80)
-        let is_6plane = net.v6_assign_mode.get("6plane").and_then(|v| v.as_bool()).unwrap_or(false);
-        let v6_6plane = Self::compute_6plane_ip(nwid, member_id);
-        if is_6plane {
-            if let Some(ref ip) = v6_6plane {
-                if !current_ips.contains(ip) {
-                    current_ips.push(ip.clone());
-                }
-            }
-        } else {
-            // Remove 6plane IPv6 if 6plane is disabled
-            if let Some(ref ip) = v6_6plane {
-                current_ips.retain(|x| x != ip);
-            }
-            current_ips.retain(|x| !x.to_lowercase().starts_with("fc"));
-        }
+        // 2+3. 6PLANE (/80) and RFC4193 (/128) derived addresses.
+        Self::reconcile_derived_v6(&net, nwid, member_id, current_ips);
 
-        // 3. RFC4193 IPv6 auto-assignment / removal (ZeroTier canonical /128)
-        let is_rfc4193 = net.v6_assign_mode.get("rfc4193").and_then(|v| v.as_bool()).unwrap_or(false);
-        let v6_rfc4193 = Self::compute_rfc4193_ip(nwid, member_id);
-        if is_rfc4193 {
-            if let Some(ref ip) = v6_rfc4193 {
-                if !current_ips.contains(ip) {
-                    current_ips.push(ip.clone());
-                }
-            }
-        } else {
-            // Remove RFC4193 IPv6 if rfc4193 is disabled
-            if let Some(ref ip) = v6_rfc4193 {
-                current_ips.retain(|x| x != ip);
-            }
-            current_ips.retain(|x| !x.to_lowercase().starts_with("fd"));
-        }
-
-        // 4. Custom IPv6 Range auto-assignment with RFC 7217 Opaque Identifiers (v6AssignMode: { "zt": true })
+        // 4. Custom IPv6 range with RFC 7217 opaque identifiers (v6AssignMode.zt).
         let is_zt_v6 = net.v6_assign_mode.get("zt").and_then(|v| v.as_bool()).unwrap_or(false);
         if is_zt_v6 {
-            let has_custom_v6 = current_ips.iter().any(|ip| {
-                ip.contains(':')
-                    && !ip.to_lowercase().starts_with("fc")
-                    && !ip.to_lowercase().starts_with("fd")
-            });
+            let derived = [Self::compute_6plane_ip(nwid, member_id), Self::compute_rfc4193_ip(nwid, member_id)];
+            let has_custom_v6 = current_ips
+                .iter()
+                .any(|ip| ip.contains(':') && !derived.iter().flatten().any(|d| d == ip));
             if !has_custom_v6 {
                 if let Some(free_v6) = self.next_free_ipv6(nwid, member_id, &net.ip_assignment_pools).await {
                     current_ips.push(free_v6);
                 }
             }
-        } else {
-            // Remove custom ZT range IPv6 if zt mode is disabled
-            current_ips.retain(|ip| {
-                !ip.contains(':')
-                    || ip.to_lowercase().starts_with("fc")
-                    || ip.to_lowercase().starts_with("fd")
-            });
+        }
+    }
+
+    /// Add or remove the derived 6PLANE / RFC4193 addresses of `member_id`
+    /// to match the network's v6AssignMode. Touches nothing else.
+    fn reconcile_derived_v6(net: &NetworkConfig, nwid: &str, member_id: &str, ips: &mut Vec<String>) {
+        let modes = [
+            ("6plane", Self::compute_6plane_ip(nwid, member_id)),
+            ("rfc4193", Self::compute_rfc4193_ip(nwid, member_id)),
+        ];
+        for (mode, derived) in modes {
+            let Some(ip) = derived else { continue };
+            let enabled = net.v6_assign_mode.get(mode).and_then(|v| v.as_bool()).unwrap_or(false);
+            if enabled {
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            } else {
+                ips.retain(|x| x != &ip);
+            }
         }
     }
 
@@ -947,6 +883,48 @@ mod tests {
         let identity = Identity::generate();
         let base = temp_dir().join(format!("zgalaxy_ctrl_test_{}_{}", std::process::id(), rand::random::<u32>()));
         EmbeddedController::new(identity, base)
+    }
+
+    /// Mode flags only control AUTO-assignment: switching them off must not
+    /// delete addresses an operator assigned by hand (ZeroTier semantics),
+    /// while derived 6PLANE/RFC4193 addresses still follow their flags.
+    #[tokio::test]
+    async fn test_mode_flags_never_delete_manual_addresses() {
+        let controller = test_controller();
+        let _ = controller.init().await;
+        let net = controller
+            .save_network(json!({
+                "name": "Manual",
+                "private": true,
+                "v4AssignMode": {"zt": false},
+                "v6AssignMode": {"zt": false, "6plane": false, "rfc4193": true}
+            }))
+            .await
+            .unwrap();
+        let nwid = net.id.clone();
+        let member = "abcdef0123";
+        let manual = vec!["10.50.0.7".to_string(), "fd00:1234::7".to_string(), "fc00::9".to_string()];
+        let rec = controller
+            .save_member(&nwid, member, json!({"authorized": true, "ipAssignments": manual}))
+            .await
+            .unwrap();
+        for ip in &manual {
+            assert!(rec.ip_assignments.contains(ip), "manual {} was deleted: {:?}", ip, rec.ip_assignments);
+        }
+        let rfc4193 = EmbeddedController::compute_rfc4193_ip(&nwid, member).unwrap();
+        assert!(rec.ip_assignments.contains(&rfc4193), "enabled rfc4193 address is derived");
+
+        // Turning rfc4193 off removes exactly the derived address.
+        controller
+            .save_network(json!({"id": nwid, "v6AssignMode": {"zt": false, "6plane": false, "rfc4193": false}}))
+            .await
+            .unwrap();
+        let rec = controller.get_effective_member(&nwid, member).await.unwrap();
+        assert!(!rec.ip_assignments.contains(&rfc4193));
+        for ip in &manual {
+            assert!(rec.ip_assignments.contains(ip), "manual {} was deleted: {:?}", ip, rec.ip_assignments);
+        }
+        let _ = std::fs::remove_dir_all(controller.db_path.parent().unwrap());
     }
 
     /// ZTNET integration: partial network payloads must merge, not wipe.
