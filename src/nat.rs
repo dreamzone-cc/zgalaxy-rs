@@ -6,11 +6,14 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{info, debug};
 
+use crate::control::{unix_millis, ControlMessage};
 use crate::identity::Address;
-use crate::peer::{PeerManager, PeerRole};
-use crate::quic::QuicTransport;
-use crate::quic::control::ControlMessage;
+use crate::mesh::MeshTransport;
+use crate::peer::{parse_path_address, PeerManager, PeerRole};
 use crate::transport::UdpTransport;
+
+/// A keepalive probe to a path without a live session gets this long to dial.
+const PROBE_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub struct NatPathCandidate {
@@ -27,7 +30,7 @@ pub struct NatTraversalEngine {
     path_candidates: Arc<RwLock<HashMap<Address, Vec<NatPathCandidate>>>>,
     keepalive_interval: Duration,
     transport: Arc<RwLock<Option<Arc<UdpTransport>>>>,
-    quic_transport: Arc<RwLock<Option<Arc<QuicTransport>>>>,
+    mesh: Arc<RwLock<Option<Arc<dyn MeshTransport>>>>,
 }
 
 impl NatTraversalEngine {
@@ -37,14 +40,14 @@ impl NatTraversalEngine {
             path_candidates: Arc::new(RwLock::new(HashMap::new())),
             keepalive_interval: Duration::from_secs(25), // 25s keepalive for stateful NAT firewalls
             transport: Arc::new(RwLock::new(None)),
-            quic_transport: Arc::new(RwLock::new(None)),
+            mesh: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Attach the active QUIC transport to enable transmitting native QUIC probes
-    pub async fn set_quic_transport(&self, quic: Arc<QuicTransport>) {
-        let mut guard = self.quic_transport.write().await;
-        *guard = Some(quic);
+    /// Attach the active mesh transport (QUIC today, GTP later) so probes
+    /// ride its reliable control channel.
+    pub async fn set_mesh_transport(&self, mesh: Arc<dyn MeshTransport>) {
+        *self.mesh.write().await = Some(mesh);
     }
 
     /// Attach the active UDP transport to enable transmitting real keepalive probes (legacy)
@@ -88,45 +91,44 @@ impl NatTraversalEngine {
 
     async fn send_keepalives(&self) {
         let peers = self.peer_manager.list_peers().await;
-        let quic_opt = self.quic_transport.read().await.clone();
+        let mesh_opt = self.mesh.read().await.clone();
         let transport_opt = self.transport.read().await.clone();
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        for peer in peers {
-            for path in peer.paths {
-                if let Some(sock_addr) = parse_path_addr(&path.address) {
-                    debug!("[ZGALAXY NAT KEEPALIVE] Probing path {} for peer {}", path.address, peer.address);
-                    if let Some(ref quic) = quic_opt {
-                        let ping = ControlMessage::Ping {
-                            nonce: rand::random::<u64>(),
-                            sent_ms: now,
-                        };
-                        let _ = quic.send_control(sock_addr, &ping).await;
-                    } else if let Some(ref tp) = transport_opt {
-                        let _ = tp.send_echo(sock_addr).await;
+        let mut paths: Vec<(Address, SocketAddr)> = Vec::new();
+        for peer in &peers {
+            for path in &peer.paths {
+                if let Some(endpoint) = parse_path_address(&path.address) {
+                    if !paths.iter().any(|(_, e)| *e == endpoint) {
+                        paths.push((peer.address, endpoint));
                     }
                 }
+            }
+        }
+
+        if let Some(mesh) = mesh_opt {
+            // Live sessions are already probed by the RTT prober and kept up
+            // by transport keep-alives; only re-try the others, all at once
+            // and bounded, so one dead path never delays the rest.
+            let live = mesh.connected_peers().await;
+            let now = unix_millis();
+            let probes = paths.into_iter().filter(|(_, e)| !live.contains(e)).map(|(node, endpoint)| {
+                let mesh = Arc::clone(&mesh);
+                async move {
+                    debug!("[ZGALAXY NAT KEEPALIVE] Probing path {} for peer {}", endpoint, node);
+                    let ping = ControlMessage::Ping { nonce: rand::random::<u64>(), sent_ms: now };
+                    let _ = tokio::time::timeout(PROBE_DIAL_TIMEOUT, mesh.send_control(endpoint, &ping)).await;
+                }
+            });
+            futures::future::join_all(probes).await;
+        } else if let Some(tp) = transport_opt {
+            for (node, endpoint) in paths {
+                debug!("[ZGALAXY NAT KEEPALIVE] Probing path {} for peer {}", endpoint, node);
+                let _ = tp.send_echo(endpoint).await;
             }
         }
     }
 }
 
-/// Parse a ZeroTier path string ("ip/port" or "ip:port", IPv4 or bracketed
-/// IPv6) back into a `SocketAddr`.
-fn parse_path_addr(path: &str) -> Option<SocketAddr> {
-    if let Some(slash) = path.rfind('/') {
-        let host = &path[..slash];
-        let port: u16 = path[slash + 1..].parse().ok()?;
-        return format!("{}:{}", host.trim_start_matches('[').trim_end_matches(']'), port)
-            .parse()
-            .ok();
-    }
-    path.parse().ok()
-}
 
 #[cfg(test)]
 mod tests {

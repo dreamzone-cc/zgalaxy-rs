@@ -45,6 +45,27 @@ fn default_true() -> bool {
     true
 }
 
+/// Paths kept per peer. NAT rebinding hands out a new source port every time
+/// it happens; without a cap a long-lived peer's path list grows forever.
+pub const MAX_PATHS_PER_PEER: usize = 8;
+
+/// Format an endpoint as a canonical ZeroTier path string (`"ip/port"`).
+pub fn format_path_address(endpoint: SocketAddr) -> String {
+    format!("{}/{}", endpoint.ip(), endpoint.port())
+}
+
+/// Parse a path string back into a `SocketAddr`. Accepts the canonical
+/// ZeroTier form `"ip/port"` (IPv4 or bare IPv6) as well as `"ip:port"` and
+/// `"[v6]:port"`. Naive `replace('/', ":")` breaks every IPv6 path.
+pub fn parse_path_address(path: &str) -> Option<SocketAddr> {
+    let path = path.trim();
+    if let Some((host, port)) = path.rsplit_once('/') {
+        let ip: std::net::IpAddr = host.trim_start_matches('[').trim_end_matches(']').parse().ok()?;
+        return Some(SocketAddr::new(ip, port.parse().ok()?));
+    }
+    path.parse().ok()
+}
+
 fn default_one() -> i32 {
     1
 }
@@ -106,7 +127,7 @@ impl PeerManager {
             .as_secs();
 
         // Canonical ZeroTier path notation: "ip/port".
-        let path_str = format!("{}/{}", endpoint.ip(), endpoint.port());
+        let path_str = format_path_address(endpoint);
 
         let peer = peers.entry(address).or_insert_with(|| Peer {
             address,
@@ -140,6 +161,18 @@ impl PeerManager {
                 expired: false,
                 fixed: false,
             });
+            if peer.paths.len() > MAX_PATHS_PER_PEER {
+                // Drop the path heard from least recently.
+                if let Some(oldest) = peer
+                    .paths
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, p)| p.last_receive)
+                    .map(|(i, _)| i)
+                {
+                    peer.paths.remove(oldest);
+                }
+            }
         }
 
         // Re-evaluate preferred path with Happy Eyeballs RFC 8305 semantics:
@@ -212,5 +245,33 @@ mod tests {
         assert_eq!(json["paths"][0]["trustedPathId"], 0);
         assert_eq!(json["paths"][0]["active"], true);
         assert!(json["physicalAddress"].is_null() || json["physicalAddress"].is_string());
+    }
+
+    #[test]
+    fn path_addresses_roundtrip_for_ipv4_and_ipv6() {
+        for ep in ["192.0.2.25:9993", "[2001:db8::1]:9993", "[::ffff:10.0.0.1]:1"] {
+            let ep: SocketAddr = ep.parse().unwrap();
+            assert_eq!(parse_path_address(&format_path_address(ep)), Some(ep));
+        }
+        assert_eq!(
+            parse_path_address("[2001:db8::2]/443"),
+            Some("[2001:db8::2]:443".parse().unwrap())
+        );
+        assert_eq!(parse_path_address("10.0.0.1:9993"), Some("10.0.0.1:9993".parse().unwrap()));
+        assert_eq!(parse_path_address("not a path"), None);
+        assert_eq!(parse_path_address("10.0.0.1/99999"), None);
+    }
+
+    #[tokio::test]
+    async fn path_list_is_bounded() {
+        let pm = PeerManager::new();
+        let addr = Address([9, 9, 9, 9, 9]);
+        for port in 0..(MAX_PATHS_PER_PEER as u16 + 5) {
+            let ep: SocketAddr = format!("198.51.100.7:{}", 10000 + port).parse().unwrap();
+            pm.add_or_update_peer(addr, PeerRole::Leaf, ep, 1).await;
+        }
+        let peer = pm.get_peer(&addr).await.unwrap();
+        assert_eq!(peer.paths.len(), MAX_PATHS_PER_PEER);
+        assert_eq!(peer.paths.iter().filter(|p| p.preferred).count(), 1);
     }
 }

@@ -15,6 +15,22 @@ use crate::resolver::DynamicDnsResolver;
 use crate::controller::EmbeddedController;
 use crate::network::NetworkManager;
 
+/// What the legacy UDP bridge is allowed to do.
+///
+/// The bridge speaks a plaintext, unauthenticated wire format. When it is the
+/// ONLY transport (`transportMode: "udp"`, or QUIC failed to bind) it carries
+/// everything. When it runs beside an authenticated mesh transport it is
+/// restricted to controller duties (registering joins for ztnet) — otherwise
+/// any host that can reach the port could inject frames into the virtual LAN
+/// or flip a network's authorization state with one spoofed datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeMode {
+    /// Legacy data plane: frames, configs, joins.
+    Full,
+    /// Beside QUIC/GTP: answer join/config requests and echoes only.
+    ControllerOnly,
+}
+
 /// Asynchronous UDP Transport and Wire Protocol Dispatcher
 #[derive(Clone)]
 pub struct UdpTransport {
@@ -77,7 +93,8 @@ impl UdpTransport {
     /// Start the asynchronous UDP receive, decrypt, and dispatch loop
     pub fn start_rx_loop(
         &self,
-        tun_inbound_tx: mpsc::Sender<Vec<u8>>,
+        tun_inbound_tx: mpsc::Sender<Bytes>,
+        mode: BridgeMode,
     ) {
         let socket = self.socket.clone();
         let identity = self.identity.clone();
@@ -87,7 +104,7 @@ impl UdpTransport {
 
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
-            info!("[ZGALAXY UDP RX] Native packet processing pipeline active.");
+            info!("[ZGALAXY UDP RX] Native packet processing pipeline active ({:?}).", mode);
 
             loop {
                 match socket.recv_from(&mut buf).await {
@@ -125,8 +142,11 @@ impl UdpTransport {
                                     debug!("[ZGALAXY PONG] Received heartbeat response from {}", src_addr);
                                 }
                                 PacketType::Frame | PacketType::ExtFrame => {
-                                    // Forward decrypted Ethernet frame to TUN adapter
-                                    let _ = tun_inbound_tx.send(packet.payload.to_vec()).await;
+                                    if mode == BridgeMode::Full {
+                                        let _ = tun_inbound_tx.send(packet.payload.clone()).await;
+                                    } else {
+                                        debug!("[ZGALAXY UDP RX] unauthenticated frame from {} dropped (controller-only bridge)", src_addr);
+                                    }
                                 }
                                 PacketType::Hello => {
                                     let ok = Packet::new(
@@ -176,7 +196,7 @@ impl UdpTransport {
                                         }
                                     }
                                 }
-                                PacketType::NetworkConfig => {
+                                PacketType::NetworkConfig if mode == BridgeMode::Full => {
                                     if let Ok(config_val) = serde_json::from_slice::<serde_json::Value>(&packet.payload) {
                                         if let Some(nwid) = config_val.get("nwid").and_then(|v| v.as_str()) {
                                             let authorized = config_val.get("authorized").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -241,7 +261,7 @@ impl UdpTransport {
     }
 
     /// Broadcast an encapsulated Layer-2 Frame packet to all active peers
-    pub async fn broadcast_frame(&self, frame_bytes: Vec<u8>) -> Result<()> {
+    pub async fn broadcast_frame(&self, frame_bytes: Bytes) -> Result<()> {
         let active_addrs = self.resolver.get_all_active_addresses().await;
         if active_addrs.is_empty() {
             warn!("[ZGALAXY UDP TX] No active remote endpoints available for frame broadcast.");
@@ -253,7 +273,7 @@ impl UdpTransport {
             self.identity.address,
             rand::random::<u64>(),
             PacketType::Frame,
-            Bytes::from(frame_bytes),
+            frame_bytes,
         );
 
         let encoded = frame_pkt.encode();
@@ -310,7 +330,7 @@ impl UdpTransport {
         if controller_addr != Address::NULL {
             if let Some(peer) = self.peer_manager.get_peer(&controller_addr).await {
                 for path in peer.paths.iter().filter(|p| p.active) {
-                    if let Ok(endpoint) = path.address.replace('/', ":").parse::<SocketAddr>() {
+                    if let Some(endpoint) = crate::peer::parse_path_address(&path.address) {
                         let _ = self.socket.send_to(&encoded, endpoint).await;
                     }
                 }

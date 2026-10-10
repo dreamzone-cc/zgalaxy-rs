@@ -622,10 +622,12 @@ async fn management_source_guard(
 }
 
 fn ip_allowed(peer: SocketAddr, allowed: &[String]) -> bool {
-    if peer.ip().is_loopback() {
+    // An IPv4 client on a dual-stack socket shows up as ::ffff:a.b.c.d;
+    // compare it as the IPv4 address it is.
+    let ip = peer.ip().to_canonical();
+    if ip.is_loopback() {
         return true;
     }
-    let ip = peer.ip();
     allowed.iter().any(|entry| {
         if let Ok(cidr) = entry.parse::<ipnet::IpNet>() {
             return cidr.contains(&ip);
@@ -635,4 +637,23 @@ fn ip_allowed(peer: SocketAddr, allowed: &[String]) -> bool {
             .map(|a| a == ip)
             .unwrap_or(false)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn management_guard_handles_cidrs_plain_ips_and_v4_mapped() {
+        let allowed = vec!["172.31.255.0/29".to_string(), "10.0.0.5".to_string()];
+        let ok = |s: &str| ip_allowed(s.parse().unwrap(), &allowed);
+        assert!(ok("127.0.0.1:1"), "loopback is always allowed");
+        assert!(ok("[::1]:1"));
+        assert!(ok("172.31.255.3:1"));
+        assert!(ok("10.0.0.5:1"));
+        assert!(ok("[::ffff:172.31.255.3]:1"), "v4-mapped client must match its IPv4 entry");
+        assert!(ok("[::ffff:127.0.0.1]:1"), "v4-mapped loopback is loopback");
+        assert!(!ok("172.31.255.9:1"));
+        assert!(!ok("[2001:db8::1]:1"));
+    }
 }

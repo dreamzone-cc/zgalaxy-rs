@@ -16,11 +16,15 @@
 
 pub mod cli;
 pub mod config;
+pub mod control;
+pub mod control_engine;
 pub mod controller;
 pub mod controller_api;
 pub mod crypto;
 pub mod identity;
+pub mod interface_sync;
 pub mod l2_switch;
+pub mod mesh;
 pub mod nat;
 pub mod network;
 pub mod packet;
@@ -45,6 +49,7 @@ pub use nat::NatTraversalEngine;
 pub use route_manager::RouteManager;
 pub use transport::UdpTransport;
 pub use l2_switch::L2Switch;
+pub use mesh::{MeshTransport, TransportCapabilities, TransportEvent, TransportKind};
 pub use sync_provider::{SyncProviderClient, SyncProviderConfig, SyncSummary, SyncStatus};
 
 pub const DEFAULT_PORT: u16 = 9993;

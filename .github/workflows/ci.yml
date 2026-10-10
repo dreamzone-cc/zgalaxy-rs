@@ -20,6 +20,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -34,6 +36,9 @@ jobs:
 
       - name: Cargo Check
         run: cargo check --verbose
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Cargo Test
         run: cargo test --verbose

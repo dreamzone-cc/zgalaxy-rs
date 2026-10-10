@@ -14,86 +14,65 @@
 //! | Unreliable L2/L3 frame forwarding   | QUIC Datagrams (RFC 9221)                         |
 //! | Path failover / direct paths        | QUIC connection migration (future)                |
 //!
-//! Data-plane Ethernet/IP frames ride QUIC Datagrams (no retransmit head-of-line
-//! blocking — same semantics as a real NIC). Control-plane messages (network
-//! config requests/responses, identity announcements) ride reliable QUIC
-//! streams.
+//! Data-plane Ethernet frames ride QUIC Datagrams (no retransmit head-of-line
+//! blocking — same semantics as a real NIC). A frame larger than the current
+//! datagram limit (the interface MTU is 2800 so IPv6 works) rides its own
+//! unidirectional stream instead of being dropped. Control-plane messages
+//! ride reliable bi-streams, one message per stream.
+//!
+//! This module is a pure transport: identity binding lives in
+//! [`crate::mesh::PeerSessions`] and message handling in
+//! [`crate::control_engine`]. The [`crate::mesh::MeshTransport`] impl at the
+//! bottom is what the engine talks to.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn};
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tracing::{debug, info, warn};
+
+pub use crate::control;
+pub use crate::control::challenge_material;
+use crate::control::ControlMessage;
+use crate::mesh::{MeshTransport, SessionGeneration, TransportCapabilities, TransportEvent, TransportKind};
+
+/// Inbound event type. Kept as an alias so existing callers keep compiling;
+/// it is the transport-independent [`TransportEvent`].
+pub type QuicEvent = TransportEvent;
 
 /// ALPN protocol identifier for the ZGALAXY mesh.
 pub const ALPN: &str = "zgalaxy-mesh";
 
-/// Maximum QUIC datagram payload (must fit in a single QUIC packet).
+/// Conservative QUIC datagram payload before PMTU discovery raises it. The
+/// live limit is `quinn::Connection::max_datagram_size()`.
 pub const MAX_DATAGRAM_SIZE: usize = 1200;
 
-/// Reliable control-stream message envelope: 4-byte big-endian length prefix
-/// followed by a JSON payload (see `ControlMessage`).
-pub mod control {
-    use serde::{Deserialize, Serialize};
+/// Largest frame accepted on the stream fallback path.
+pub const MAX_FRAME_SIZE: usize = 64 * 1024;
 
-    /// Messages exchanged over reliable QUIC bi-streams.
-    #[derive(Debug, Serialize, Deserialize)]
-    #[serde(tag = "type", content = "data")]
-    pub enum ControlMessage {
-        /// Announce this node's ZGALAXY address so the peer can bind
-        /// the connection to the right peer entry (app-level identity).
-        /// `public_identity` must be a full "<address>:0:<pubkey>" string whose
-        /// pubkey derives exactly `address`; the responder challenges it.
-        NodeAnnounce { address: String, public_identity: String },
-        /// Responder challenge: prove possession of the announced identity by
-        /// signing (domain || nonce || address) with its secret key.
-        NodeChallenge { nonce: u64 },
-        /// Proof of possession: ed25519 signature over the challenge material,
-        /// produced by the secret key matching the announced public identity.
-        AnnounceProof { nonce: u64, address: String, signature: String, public_identity: String },
-        /// Verifier acknowledges a valid proof — the announcer may now treat
-        /// this connection as fully trusted (send config requests etc.).
-        AnnounceAccepted { address: String },
-        /// Request the network configuration for a network this node joined.
-        /// `token` carries the controller-signed membership token (COM
-        /// replacement) when the client holds one from a previous response.
-        NetworkConfigRequest { nwid: String, token: Option<String> },
-        /// Controller-side response with the effective network configuration.
-        NetworkConfigResponse { nwid: String, config: serde_json::Value },
-        /// Ping over the control stream (diagnostics / RTT measurement).
-        Ping { nonce: u64, sent_ms: u64 },
-        Pong { nonce: u64, sent_ms: u64, received_ms: u64 },
-    }
+/// A control message must arrive completely within this window.
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-    pub fn encode(msg: &ControlMessage) -> anyhow::Result<Vec<u8>> {
-        let json = serde_json::to_vec(msg)?;
-        let len = (json.len() as u32).to_be_bytes();
-        let mut out = Vec::with_capacity(4 + json.len());
-        out.extend_from_slice(&len);
-        out.extend_from_slice(&json);
-        Ok(out)
-    }
+/// An oversized frame waits at most this long for stream credit; the data
+/// plane never stalls behind one slow peer.
+const FRAME_STREAM_OPEN_TIMEOUT: Duration = Duration::from_millis(50);
 
-    /// Decode a message body (without the length prefix).
-    pub fn decode_body(body: &[u8]) -> anyhow::Result<ControlMessage> {
-        Ok(serde_json::from_slice(body)?)
-    }
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// ب4: bounded dead-peer detection — a lost peer is declared within ~15s.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
-    pub fn decode(buf: &[u8]) -> anyhow::Result<ControlMessage> {
-        use anyhow::bail;
-        if buf.len() < 4 {
-            bail!("control message too short");
-        }
-        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        if buf.len() < 4 + len {
-            bail!("control message truncated");
-        }
-        Ok(serde_json::from_slice(&buf[4..4 + len])?)
-    }
+/// Canonical form of a remote endpoint: an IPv4 peer reached through a
+/// dual-stack `[::]` socket is reported as `::ffff:a.b.c.d`, while the same
+/// peer is dialed as `a.b.c.d`. Keying sessions by the raw form made every
+/// dial miss the live session and replace it — reconnect churn on every
+/// sync cycle. All session keys and events use the canonical form.
+pub fn canonical_endpoint(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
 /// A peer connection established over QUIC.
@@ -101,58 +80,45 @@ pub mod control {
 pub struct PeerConnection {
     pub remote: SocketAddr,
     pub conn: quinn::Connection,
+    /// Set once the peer withheld stream credit for an oversized frame.
+    /// Peers older than the stream fallback never accept uni streams, so
+    /// their credit never comes back: stop trying instead of paying the open
+    /// timeout on every large frame.
+    stream_fallback_off: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Inbound event delivered to the engine loop.
-#[derive(Debug)]
-pub enum QuicEvent {
-    /// Unreliable data-plane frame received via QUIC Datagrams.
-    Datagram { remote: SocketAddr, data: Bytes },
-    /// Reliable control-plane message received via a QUIC stream.
-    Control { remote: SocketAddr, message: control::ControlMessage },
-    /// A connection was established.
-    Connected { remote: SocketAddr },
-    /// A connection was lost. `stable_id` lets consumers ignore teardowns of
-    /// connections that were already replaced by newer ones.
-    Disconnected { remote: SocketAddr, stable_id: usize },
+impl PeerConnection {
+    fn new(remote: SocketAddr, conn: quinn::Connection) -> Self {
+        Self { remote, conn, stream_fallback_off: Arc::default() }
+    }
 }
 
 pub struct QuicTransport {
     endpoint: quinn::Endpoint,
     peers: Arc<RwLock<HashMap<SocketAddr, PeerConnection>>>,
-    events: RwLock<Option<mpsc::Sender<QuicEvent>>>,
-    /// Node address announced by each remote (app-level identity binding).
-    announced: RwLock<HashMap<SocketAddr, String>>,
-    /// Serializes outbound handshakes to close the connect() TOCTOU.
-    connect_lock: tokio::sync::Mutex<()>,
-    /// Our own node address announced on control streams.
-    node_address: String,
-    /// Our own public identity string ("<addr>:0:<pub>") sent with announces.
-    public_identity: String,
-    /// Outstanding challenges awaiting an AnnounceProof, keyed by remote.
-    /// Value: (nonce, announced_address).
-    pending_challenges: Arc<RwLock<HashMap<SocketAddr, (u64, String)>>>,
-    /// Remotes whose announcements WE have verified (remote -> address).
-    accepted: Arc<RwLock<HashMap<SocketAddr, String>>>,
+    events: RwLock<Option<mpsc::Sender<TransportEvent>>>,
+    /// One dial lock per remote: concurrent dials to the same remote
+    /// collapse into one handshake, while a dead remote never blocks dials
+    /// to the others.
+    dial_locks: Mutex<HashMap<SocketAddr, Arc<Mutex<()>>>>,
 }
 
-/// Domain-separated challenge material: sig = ed25519_sign(material).
-pub fn challenge_material(nonce: u64, address: &str) -> Vec<u8> {
-    let mut m = Vec::with_capacity(3 + 8 + address.len());
-    m.extend_from_slice(b"ZG1");
-    m.extend_from_slice(&nonce.to_be_bytes());
-    m.extend_from_slice(address.as_bytes());
-    m
+fn transport_config() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("valid idle timeout")));
+    // Each oversized frame uses one short-lived uni stream.
+    transport.max_concurrent_uni_streams(256u32.into());
+    transport
 }
 
 impl QuicTransport {
     /// Build a QUIC endpoint with a fresh self-signed certificate.
     ///
-    /// Peer authentication currently happens at the application layer
-    /// (NodeAnnounce binding; certificate pinning keyed by node address is the
-    /// next step). TLS 1.3 still encrypts the channel against passive
-    /// attackers.
-    pub fn bind(bind_addr: SocketAddr, node_address: String, public_identity: String) -> Result<Self> {
+    /// Peer authentication happens at the application layer (challenge /
+    /// proof bound to the node identity, see `crate::mesh::PeerSessions`).
+    /// TLS 1.3 still encrypts the channel against passive attackers.
+    pub fn bind(bind_addr: SocketAddr) -> Result<Self> {
         let cert = rcgen::generate_simple_self_signed(vec!["zgalaxy".into()])
             .context("failed to generate self-signed QUIC certificate")?;
         let cert_der = cert.cert.der().clone();
@@ -164,20 +130,10 @@ impl QuicTransport {
             .context("failed to build rustls server config")?;
         server_crypto.alpn_protocols = vec![ALPN.as_bytes().to_vec()];
 
-        let mut transport = quinn::TransportConfig::default();
-        transport.keep_alive_interval(Some(Duration::from_secs(5)));
-        // ب4: bounded dead-peer detection — a lost peer is declared within
-        // ~15s worst case, letting the 3s sync loop re-establish quickly.
-        transport.max_idle_timeout(Some(
-            Duration::from_secs(15)
-                .try_into()
-                .expect("valid idle timeout"),
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
         ));
-        let mut server_config =
-            quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(
-                server_crypto,
-            )?));
-        server_config.transport_config(Arc::new(transport));
+        server_config.transport_config(Arc::new(transport_config()));
 
         let mut endpoint = quinn::Endpoint::server(server_config, bind_addr)
             .with_context(|| format!("failed to bind QUIC endpoint on {}", bind_addr))?;
@@ -187,16 +143,10 @@ impl QuicTransport {
             .with_custom_certificate_verifier(SkipServerVerification::new())
             .with_no_client_auth();
         client_crypto.alpn_protocols = vec![ALPN.as_bytes().to_vec()];
-        let mut client_transport = quinn::TransportConfig::default();
-        client_transport.keep_alive_interval(Some(Duration::from_secs(5)));
-        client_transport.max_idle_timeout(Some(
-            Duration::from_secs(15).try_into().expect("valid idle timeout"),
-        ));
-        let client_quic_config =
-            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
-                .context("failed to build QUIC client config")?;
+        let client_quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+            .context("failed to build QUIC client config")?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(client_quic_config));
-        client_config.transport_config(Arc::new(client_transport));
+        client_config.transport_config(Arc::new(transport_config()));
         endpoint.set_default_client_config(client_config);
 
         info!("[ZGALAXY QUIC] Endpoint bound on {}", endpoint.local_addr()?);
@@ -205,36 +155,8 @@ impl QuicTransport {
             endpoint,
             peers: Arc::new(RwLock::new(HashMap::new())),
             events: RwLock::new(None),
-            announced: RwLock::new(HashMap::new()),
-            connect_lock: tokio::sync::Mutex::new(()),
-            node_address,
-            public_identity,
-            pending_challenges: Arc::new(RwLock::new(HashMap::new())),
-            accepted: Arc::new(RwLock::new(HashMap::new())),
+            dial_locks: Mutex::new(HashMap::new()),
         })
-    }
-
-    /// Record that `remote`'s announcement (for `address`) passed verification.
-    pub async fn record_accepted(&self, remote: SocketAddr, address: &str) {
-        self.accepted.write().await.insert(remote, address.to_string());
-    }
-
-    /// Wait until `remote` acknowledged OUR announcement (i.e., it verified our
-    /// AnnounceProof), or `dur` elapses. Returns its announced address if known.
-    pub async fn await_accepted(&self, remote: SocketAddr, dur: Duration) -> Option<()> {
-        let deadline = Instant::now() + dur;
-        while Instant::now() < deadline {
-            if self.accepted.read().await.contains_key(&remote) {
-                return Some(());
-            }
-            tokio::time::sleep(Duration::from_millis(15)).await;
-        }
-        None
-    }
-
-    /// Our own public identity string (used when composing announces).
-    pub fn public_identity(&self) -> &str {
-        &self.public_identity
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -246,271 +168,103 @@ impl QuicTransport {
     }
 
     /// Accept loop: for each inbound QUIC connection spawn reader tasks that
-    /// forward datagrams and control-stream messages as `QuicEvent`s.
-    pub async fn run(self: Arc<Self>, events_tx: mpsc::Sender<QuicEvent>) -> Result<()> {
+    /// forward datagrams and control-stream messages as events.
+    pub async fn run(self: Arc<Self>, events_tx: mpsc::Sender<TransportEvent>) -> Result<()> {
         *self.events.write().await = Some(events_tx.clone());
         loop {
             let incoming = self.endpoint.accept().await.context("QUIC endpoint closed")?;
             let this = Arc::clone(&self);
             let events = events_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = this.handle_incoming(incoming, events).await {
-                    warn!("[ZGALAXY QUIC] inbound connection failed: {:#}", e);
+                match incoming.await {
+                    Ok(conn) => {
+                        info!("[ZGALAXY QUIC] Peer connected: {}", canonical_endpoint(conn.remote_address()));
+                        this.activate(conn, events).await;
+                    }
+                    Err(e) => warn!("[ZGALAXY QUIC] inbound handshake failed: {}", e),
                 }
             });
         }
     }
 
-    async fn handle_incoming(
-        self: &Arc<Self>,
-        incoming: quinn::Incoming,
-        events_tx: mpsc::Sender<QuicEvent>,
-    ) -> Result<()> {
-        let conn = incoming.await.context("QUIC handshake failed")?;
-        let remote = conn.remote_address();
-        info!("[ZGALAXY QUIC] Peer connected: {}", remote);
-
-        if self.activate(remote, conn, events_tx.clone()).await {
-            let _ = events_tx.send(QuicEvent::Connected { remote }).await;
-        }
-        Ok(())
-    }
-
-    /// The node address a remote announced for itself, if any.
-    pub async fn announced_address(&self, remote: SocketAddr) -> Option<String> {
-        self.announced.read().await.get(&remote).cloned()
-    }
-
-    /// Activate a connection for `remote` and spawn its reader loops exactly
-    /// once. When both mesh sides dial simultaneously, the first connection
-    /// wins; the loser is ignored (its traffic would be duplicate).
-    /// Returns true when this connection became the active one.
-    async fn activate(
-        self: &Arc<Self>,
-        remote: SocketAddr,
-        conn: quinn::Connection,
-        events_tx: mpsc::Sender<QuicEvent>,
-    ) -> bool {
+    /// Make `conn` the active session for its remote and start its readers.
+    ///
+    /// ب4: a NEW successful handshake always wins — a stale entry (peer
+    /// restarted, old connection half-dead) must never block recovery, so the
+    /// old connection is closed and its slot taken. `Connected` is emitted
+    /// before the readers start so the engine sees it ahead of any traffic.
+    async fn activate(self: &Arc<Self>, conn: quinn::Connection, events_tx: mpsc::Sender<TransportEvent>) {
+        let remote = canonical_endpoint(conn.remote_address());
+        let generation = conn.stable_id() as SessionGeneration;
         {
-            let peers = self.peers.read().await;
+            let mut peers = self.peers.write().await;
             if let Some(existing) = peers.get(&remote) {
                 if existing.conn.stable_id() == conn.stable_id() {
-                    return false; // literally the same connection — already active
+                    return; // literally the same connection — already active
                 }
             }
-        }
-        // ب4: a NEW successful handshake always wins. A stale entry (e.g. the
-        // peer restarted and its old connection is half-dead) must never block
-        // recovery — close the old connection and take the slot.
-        if let Some(old) = self
-            .peers
-            .write()
-            .await
-            .insert(remote, PeerConnection { remote, conn: conn.clone() })
-        {
-            warn!(
-                "[ZGALAXY QUIC] replacing stale connection (stable_id {}) for {}",
-                old.conn.stable_id(),
-                remote
-            );
-            old.conn.close(quinn::VarInt::from_u32(0), b"zgalaxy-replaced");
-            self.accepted.write().await.remove(&remote);
-        }
-
-        // Announce our identity on a dedicated control stream. The full
-        // public identity lets the peer verify our AnnounceProof.
-        let announce = control::ControlMessage::NodeAnnounce {
-            address: self.node_address.clone(),
-            public_identity: self.public_identity.clone(),
-        };
-        if let Ok(buf) = control::encode(&announce) {
-            if let Ok((mut send, _recv)) = conn.open_bi().await {
-                if let Err(e) = send.write_all(&buf).await {
-                    warn!("[ZGALAXY QUIC] announce write failed: {}", e);
-                }
-                let _ = send.finish();
-            }
-        }
-
-        let conn2 = conn.clone();
-        let this = Arc::clone(self);
-        let events0 = events_tx.clone();
-        tokio::spawn(async move {
-            let _ = this.read_datagrams(&conn2, remote, events0.clone()).await;
-            // Remove only if the closing connection is still the active one.
-            let mut peers = this.peers.write().await;
-            if peers
-                .get(&remote)
-                .map(|p| p.conn.stable_id() == conn2.stable_id())
-                .unwrap_or(false)
-            {
-                peers.remove(&remote);
-            }
-            drop(peers);
-            this.announced.write().await.remove(&remote);
-            this.accepted.write().await.remove(&remote);
-            let _ = events0
-                .send(QuicEvent::Disconnected { remote, stable_id: conn2.stable_id() })
-                .await;
-        });
-
-        let conn3 = conn.clone();
-        let this2 = Arc::clone(self);
-        let events1 = events_tx.clone();
-        tokio::spawn(async move {
-            let _ = this2.accept_control_streams(&conn3, remote, events1).await;
-        });
-        true
-    }
-
-    /// Record a node address announced by a remote over a control stream.
-    /// A remote may announce exactly ONE address per connection; a conflicting
-    /// re-announce is rejected (identity binding, audit A3).
-    pub async fn remember_announce(&self, remote: SocketAddr, address: &str) -> bool {
-        if address.len() != 10 || !address.chars().all(|c| c.is_ascii_hexdigit()) {
-            warn!("[ZGALAXY QUIC] remote {} announced invalid address '{}'", remote, address);
-            return false;
-        }
-        let mut announced = self.announced.write().await;
-        if let Some(existing) = announced.get(&remote) {
-            if existing != address {
+            if let Some(old) = peers.insert(remote, PeerConnection::new(remote, conn.clone())) {
                 warn!(
-                    "[ZGALAXY QUIC] remote {} re-announced a different address ({} != {}) — rejected",
-                    remote, address, existing
+                    "[ZGALAXY QUIC] replacing stale connection (stable_id {}) for {}",
+                    old.conn.stable_id(),
+                    remote
                 );
-                return false;
-            }
-            return true;
-        }
-        announced.insert(remote, address.to_string());
-        true
-    }
-
-    /// Issue (or refresh) a challenge for the address a remote announced.
-    /// Returns the nonce. The challenge is stored so the matching
-    /// AnnounceProof can be validated later (single outstanding per remote).
-    pub async fn challenge_announce(&self, remote: SocketAddr, address: &str) -> u64 {
-        let nonce = rand::random::<u64>();
-        self.pending_challenges
-            .write()
-            .await
-            .insert(remote, (nonce, address.to_string()));
-        nonce
-    }
-
-    /// Verify an AnnounceProof against the outstanding challenge: (1) a
-    /// challenge exists for `remote`, (2) nonce and announced address match,
-    /// (3) public_identity parses and its pubkey derives exactly `address`,
-    /// (4) the ed25519 signature over the challenge material validates.
-    /// On success the announcement is accepted via [`remember_announce`].
-    pub async fn verify_announce_proof(
-        &self,
-        remote: SocketAddr,
-        nonce: u64,
-        address: &str,
-        signature_hex: &str,
-        public_identity: &str,
-    ) -> bool {
-        let pending = self
-            .pending_challenges
-            .read()
-            .await
-            .get(&remote)
-            .map(|(n, a)| (*n, a.clone()));
-        let Some((expected_nonce, expected_address)) = pending else {
-            warn!("[ZGALAXY QUIC] proof from {} without outstanding challenge", remote);
-            return false;
-        };
-        if expected_nonce != nonce || expected_address != address {
-            warn!("[ZGALAXY QUIC] stale/mismatched proof from {}", remote);
-            return false;
-        }
-        // The public identity must parse and derive the announced address.
-        let Ok(identity) = crate::identity::Identity::parse(public_identity) else {
-            warn!("[ZGALAXY QUIC] unparseable public identity from {}", remote);
-            return false;
-        };
-        if identity.address.to_string() != address {
-            warn!("[ZGALAXY QUIC] identity derives {} but announced {} — rejected", identity.address, address);
-            return false;
-        }
-        let Ok(sig_bytes) = hex::decode(signature_hex) else {
-            return false;
-        };
-        let Ok(sig) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else {
-            return false;
-        };
-        if !identity.verify(&challenge_material(nonce, address), &sig) {
-            warn!("[ZGALAXY QUIC] invalid announce signature from {}", remote);
-            return false;
-        }
-        self.pending_challenges.write().await.remove(&remote);
-        self.remember_announce(remote, address).await
-    }
-
-    async fn read_datagrams(
-        &self,
-        conn: &quinn::Connection,
-        remote: SocketAddr,
-        events_tx: mpsc::Sender<QuicEvent>,
-    ) -> Result<()> {
-        loop {
-            match conn.read_datagram().await {
-                Ok(data) => {
-                    let _ = events_tx.send(QuicEvent::Datagram { remote, data }).await;
-                }
-                Err(e) => {
-                    info!("[ZGALAXY QUIC] Datagram stream from {} ended: {}", remote, e);
-                    return Ok(());
-                }
+                old.conn.close(quinn::VarInt::from_u32(0), b"zgalaxy-replaced");
             }
         }
+
+        let _ = events_tx.send(TransportEvent::Connected { remote, generation }).await;
+
+        let this = Arc::clone(self);
+        let conn_dg = conn.clone();
+        let events_dg = events_tx.clone();
+        tokio::spawn(async move {
+            read_datagrams(&conn_dg, remote, &events_dg).await;
+            // Remove only if the closing connection is still the active one.
+            {
+                let mut peers = this.peers.write().await;
+                if peers.get(&remote).map(|p| p.conn.stable_id() == conn_dg.stable_id()).unwrap_or(false) {
+                    peers.remove(&remote);
+                }
+            }
+            let _ = events_dg.send(TransportEvent::Disconnected { remote, generation }).await;
+        });
+
+        let conn_ctl = conn.clone();
+        let events_ctl = events_tx.clone();
+        tokio::spawn(async move { accept_control_streams(&conn_ctl, remote, &events_ctl).await });
+
+        tokio::spawn(async move { accept_frame_streams(&conn, remote, &events_tx).await });
     }
 
-    /// Accept control streams one at a time and decode one message per stream.
-    async fn accept_control_streams(
-        &self,
-        conn: &quinn::Connection,
-        remote: SocketAddr,
-        events_tx: mpsc::Sender<QuicEvent>,
-    ) -> Result<()> {
-        loop {
-            let stream = match conn.accept_bi().await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("[ZGALAXY QUIC] accept_bi ended for {}: {}", remote, e);
-                    return Err(anyhow::anyhow!("accept_bi ended: {}", e));
-                }
-            };
-            let events = events_tx.clone();
-            tokio::spawn(async move {
-                let (_send, mut recv) = stream;
-                match read_control_message(&mut recv).await {
-                    Ok(message) => {
-                        let _ = events.send(QuicEvent::Control { remote, message }).await;
-                    }
-                    Err(e) => warn!("[ZGALAXY QUIC] malformed control message from {}: {}", remote, e),
-                }
-            });
-        }
+    async fn active(&self, remote: SocketAddr) -> Option<PeerConnection> {
+        self.peers.read().await.get(&canonical_endpoint(remote)).cloned()
+    }
+
+    async fn dial_lock(&self, remote: SocketAddr) -> Arc<Mutex<()>> {
+        let mut locks = self.dial_locks.lock().await;
+        // Drop locks nobody holds or waits on, so the map cannot grow forever.
+        locks.retain(|_, l| Arc::strong_count(l) > 1);
+        Arc::clone(locks.entry(remote).or_default())
     }
 
     /// Connect to a remote peer (idempotent — reuses an existing connection).
-    /// Serialized per-process to close the check/handshake/insert race; refuses
-    /// to run before `run()` installed the event sink so inbound traffic can
-    /// never be blackholed.
+    /// Refuses to run before `run()` installed the event sink so inbound
+    /// traffic can never be blackholed.
     pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> Result<PeerConnection> {
-        if let Some(existing) = self.peers.read().await.get(&remote) {
-            return Ok(existing.clone());
+        let remote = canonical_endpoint(remote);
+        if let Some(existing) = self.active(remote).await {
+            return Ok(existing);
         }
-        if self.events.read().await.is_none() {
+        let Some(events) = self.events.read().await.clone() else {
             bail!("QUIC transport not started (run() must be called before connect)");
-        }
+        };
 
-        let _guard = self.connect_lock.lock().await;
+        let lock = self.dial_lock(remote).await;
+        let _guard = lock.lock().await;
         // Re-check after acquiring the lock — another caller may have won.
-        if let Some(existing) = self.peers.read().await.get(&remote) {
-            return Ok(existing.clone());
+        if let Some(existing) = self.active(remote).await {
+            return Ok(existing);
         }
 
         let conn = self
@@ -519,43 +273,54 @@ impl QuicTransport {
             .with_context(|| format!("failed to start QUIC connection to {}", remote))?
             .await
             .with_context(|| format!("QUIC handshake with {} failed", remote))?;
-
-        info!("[ZGALAXY QUIC DIAL] handshake to {} completed", remote);
-        let peer = PeerConnection { remote, conn: conn.clone() };
-        let events = self
-            .events
-            .read()
-            .await
-            .clone()
-            .expect("events sink checked above");
-        let activated = self.activate(remote, conn, events).await;
-        if !activated {
-            // A simultaneous inbound connection won the race; reuse it.
-            if let Some(existing) = self.peers.read().await.get(&remote) {
-                return Ok(existing.clone());
-            }
-        }
         info!("[ZGALAXY QUIC] Connected to peer {}", remote);
-        Ok(peer)
+
+        self.activate(conn, events).await;
+        self.active(remote)
+            .await
+            .with_context(|| format!("QUIC session to {} closed right after the handshake", remote))
     }
 
-    /// Send an unreliable data-plane frame (Ethernet/IP packet) via QUIC Datagrams.
-    pub async fn send_frame(self: &Arc<Self>, remote: SocketAddr, frame: Bytes) -> Result<()> {
-        let peer = self.connect(remote).await?;
-        if frame.len() > MAX_DATAGRAM_SIZE {
-            bail!("frame of {} bytes exceeds QUIC datagram limit", frame.len());
+    /// Send a data-plane frame on an EXISTING session. Never dials: the data
+    /// plane must not stall for a handshake timeout on a dead endpoint.
+    pub async fn send_frame(&self, remote: SocketAddr, frame: Bytes) -> Result<()> {
+        if frame.len() > MAX_FRAME_SIZE {
+            bail!("frame of {} bytes exceeds the {} byte mesh frame limit", frame.len(), MAX_FRAME_SIZE);
         }
-        peer.conn
-            .send_datagram(frame)
-            .map_err(|e| anyhow::anyhow!("QUIC datagram send failed: {}", e))
+        let Some(peer) = self.active(remote).await else {
+            bail!("no QUIC session to {}", remote);
+        };
+        let fits_datagram = peer.conn.max_datagram_size().map(|max| frame.len() <= max).unwrap_or(false);
+        if fits_datagram {
+            return peer
+                .conn
+                .send_datagram(frame)
+                .map_err(|e| anyhow::anyhow!("QUIC datagram send failed: {}", e));
+        }
+        // Oversized for one datagram: one uni stream per frame.
+        use std::sync::atomic::Ordering;
+        if peer.stream_fallback_off.load(Ordering::Relaxed) {
+            bail!("{} does not take oversized frames ({} bytes dropped)", remote, frame.len());
+        }
+        let mut stream = match tokio::time::timeout(FRAME_STREAM_OPEN_TIMEOUT, peer.conn.open_uni()).await {
+            Ok(opened) => opened.context("failed to open frame stream")?,
+            Err(_) => {
+                peer.stream_fallback_off.store(true, Ordering::Relaxed);
+                warn!(
+                    "[ZGALAXY QUIC] {} withholds stream credit — oversized frames to it are dropped from now on \
+                     (peer predates the stream fallback?)",
+                    remote
+                );
+                bail!("no stream credit for a {} byte frame", frame.len());
+            }
+        };
+        stream.write_chunk(frame).await.context("failed to write frame stream")?;
+        stream.finish().context("failed to finish frame stream")?;
+        Ok(())
     }
 
     /// Send a reliable control message over a new bidirectional stream.
-    pub async fn send_control(
-        self: &Arc<Self>,
-        remote: SocketAddr,
-        msg: &control::ControlMessage,
-    ) -> Result<()> {
+    pub async fn send_control(self: &Arc<Self>, remote: SocketAddr, msg: &ControlMessage) -> Result<()> {
         let peer = self.connect(remote).await?;
         let (mut send, _recv) = peer.conn.open_bi().await.context("failed to open control stream")?;
         let buf = control::encode(msg)?;
@@ -563,14 +328,83 @@ impl QuicTransport {
         send.finish().context("failed to close control stream")?;
         Ok(())
     }
+
+    /// Close the session to `remote`, if any.
+    pub async fn close(&self, remote: SocketAddr) {
+        if let Some(peer) = self.peers.write().await.remove(&canonical_endpoint(remote)) {
+            peer.conn.close(quinn::VarInt::from_u32(0), b"zgalaxy-close");
+        }
+    }
+}
+
+async fn read_datagrams(conn: &quinn::Connection, remote: SocketAddr, events_tx: &mpsc::Sender<TransportEvent>) {
+    loop {
+        match conn.read_datagram().await {
+            Ok(data) => {
+                if events_tx.send(TransportEvent::Frame { remote, data }).await.is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                info!("[ZGALAXY QUIC] Datagram stream from {} ended: {}", remote, e);
+                return;
+            }
+        }
+    }
+}
+
+/// Accept control streams and decode one message per stream.
+async fn accept_control_streams(conn: &quinn::Connection, remote: SocketAddr, events_tx: &mpsc::Sender<TransportEvent>) {
+    loop {
+        let (_send, mut recv) = match conn.accept_bi().await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("[ZGALAXY QUIC] accept_bi ended for {}: {}", remote, e);
+                return;
+            }
+        };
+        let events = events_tx.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(CONTROL_READ_TIMEOUT, read_control_message(&mut recv)).await {
+                Ok(Ok(message)) => {
+                    let _ = events.send(TransportEvent::Control { remote, message }).await;
+                }
+                Ok(Err(e)) => warn!("[ZGALAXY QUIC] malformed control message from {}: {:#}", remote, e),
+                Err(_) => warn!("[ZGALAXY QUIC] control message from {} timed out", remote),
+            }
+        });
+    }
+}
+
+/// Accept oversized-frame streams: each uni stream carries exactly one frame.
+async fn accept_frame_streams(conn: &quinn::Connection, remote: SocketAddr, events_tx: &mpsc::Sender<TransportEvent>) {
+    loop {
+        let mut recv = match conn.accept_uni().await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("[ZGALAXY QUIC] accept_uni ended for {}: {}", remote, e);
+                return;
+            }
+        };
+        let events = events_tx.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(CONTROL_READ_TIMEOUT, recv.read_to_end(MAX_FRAME_SIZE)).await {
+                Ok(Ok(data)) => {
+                    let _ = events.send(TransportEvent::Frame { remote, data: Bytes::from(data) }).await;
+                }
+                Ok(Err(e)) => debug!("[ZGALAXY QUIC] frame stream from {} failed: {}", remote, e),
+                Err(_) => debug!("[ZGALAXY QUIC] frame stream from {} timed out", remote),
+            }
+        });
+    }
 }
 
 /// Read one length-prefixed control message from a stream.
-async fn read_control_message(recv: &mut quinn::RecvStream) -> Result<control::ControlMessage> {
+async fn read_control_message(recv: &mut quinn::RecvStream) -> Result<ControlMessage> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await.context("control header read failed")?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 1 << 20 {
+    if len > control::MAX_CONTROL_MESSAGE_LEN {
         bail!("control message too large ({} bytes)", len);
     }
     let mut buf = vec![0u8; len];
@@ -578,10 +412,59 @@ async fn read_control_message(recv: &mut quinn::RecvStream) -> Result<control::C
     control::decode_body(&buf)
 }
 
+/// [`MeshTransport`] adapter over a shared [`QuicTransport`].
+#[derive(Clone)]
+pub struct QuicMesh(pub Arc<QuicTransport>);
+
+#[async_trait]
+impl MeshTransport for QuicMesh {
+    fn kind(&self) -> TransportKind {
+        TransportKind::Quic
+    }
+
+    fn capabilities(&self) -> TransportCapabilities {
+        TransportCapabilities {
+            unreliable: true,
+            reliable_ordered: true,
+            path_migration: false,
+            max_datagram_payload: MAX_DATAGRAM_SIZE,
+            max_frame: MAX_FRAME_SIZE,
+        }
+    }
+
+    fn local_addr(&self) -> Result<SocketAddr> {
+        self.0.local_addr()
+    }
+
+    async fn connect(&self, remote: SocketAddr) -> Result<()> {
+        self.0.connect(remote).await.map(|_| ())
+    }
+
+    async fn send_frame(&self, remote: SocketAddr, frame: Bytes) -> Result<()> {
+        self.0.send_frame(remote, frame).await
+    }
+
+    async fn send_control(&self, remote: SocketAddr, message: &ControlMessage) -> Result<()> {
+        self.0.send_control(remote, message).await
+    }
+
+    async fn connected_peers(&self) -> Vec<SocketAddr> {
+        self.0.peers.read().await.keys().copied().collect()
+    }
+
+    async fn active_generation(&self, remote: SocketAddr) -> Option<SessionGeneration> {
+        self.0.active(remote).await.map(|p| p.conn.stable_id() as SessionGeneration)
+    }
+
+    async fn close(&self, remote: SocketAddr) {
+        self.0.close(remote).await
+    }
+}
+
 /// Certificate verifier that accepts the self-signed mesh certificates.
 /// Channel confidentiality is still guaranteed by TLS 1.3; node-level
-/// authorization happens at the application layer (NodeAnnounce binding and,
-/// later, certificate pinning keyed by node address).
+/// authorization happens at the application layer (challenge/proof bound to
+/// the node identity).
 #[derive(Debug)]
 struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 
@@ -609,12 +492,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
     }
 
     fn verify_tls13_signature(
@@ -623,74 +501,10 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::identity::Identity;
-
-    /// أ3 negative/positive matrix: the proof must bind (nonce, address,
-    /// pubkey) — anything else is rejected.
-    #[tokio::test]
-    async fn test_announce_challenge_proof_matrix() {
-        let remote: SocketAddr = "203.0.113.9:9993".parse().unwrap();
-        let quic = QuicTransport::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            "1111111111".into(),
-            "1111111111:0:aa".into(),
-        )
-        .expect("bind");
-
-        let legit = Identity::generate();
-        let addr = legit.address.to_string();
-        let pub_str = format!("{}:0:{}", addr, hex::encode(legit.verifying_key.as_bytes()));
-
-        // Positive path.
-        let nonce = quic.challenge_announce(remote, &addr).await;
-        let sig = legit.sign(&challenge_material(nonce, &addr)).unwrap();
-        assert!(
-            quic.verify_announce_proof(remote, nonce, &addr, &hex::encode(sig), &pub_str.clone()).await,
-            "valid proof must be accepted"
-        );
-        // Accepted announcement is visible; challenge consumed.
-        assert_eq!(quic.announced_address(remote).await.as_deref(), Some(addr.as_str()));
-
-        // Negative: wrong nonce.
-        let remote2: SocketAddr = "203.0.113.10:9993".parse().unwrap();
-        let nonce = quic.challenge_announce(remote2, &addr).await;
-        let sig = legit.sign(&challenge_material(nonce, &addr)).unwrap();
-        assert!(!quic.verify_announce_proof(remote2, nonce ^ 1, &addr, &hex::encode(sig), &pub_str).await);
-
-        // Negative: address/pubkey mismatch (key derives a different address).
-        let remote3: SocketAddr = "203.0.113.11:9993".parse().unwrap();
-        let nonce = quic.challenge_announce(remote3, &addr).await;
-        let sig = legit.sign(&challenge_material(nonce, &addr)).unwrap();
-        assert!(
-            !quic.verify_announce_proof(remote3, nonce, &addr, &hex::encode(sig), &pub_str.replace(&addr, "2222222222")).await
-        );
-
-        // Negative: signature by a different key.
-        let other = Identity::generate();
-        let remote4: SocketAddr = "203.0.113.12:9993".parse().unwrap();
-        let nonce = quic.challenge_announce(remote4, &addr).await;
-        let wrong_sig = other.sign(&challenge_material(nonce, &addr)).unwrap();
-        assert!(!quic.verify_announce_proof(remote4, nonce, &addr, &hex::encode(wrong_sig), &pub_str).await);
-
-        // Negative: proof without an outstanding challenge.
-        let remote5: SocketAddr = "203.0.113.13:9993".parse().unwrap();
-        let sig = legit.sign(&challenge_material(7, &addr)).unwrap();
-        assert!(!quic.verify_announce_proof(remote5, 7, &addr, &hex::encode(sig), &pub_str).await);
     }
 }
