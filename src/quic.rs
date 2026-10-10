@@ -62,6 +62,9 @@ const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// plane never stalls behind one slow peer.
 const FRAME_STREAM_OPEN_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// At shutdown, how long to wait for CONNECTION_CLOSE frames to leave.
+const SHUTDOWN_DRAIN: Duration = Duration::from_millis(500);
+
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// ب4: bounded dead-peer detection — a lost peer is declared within ~15s.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -172,7 +175,11 @@ impl QuicTransport {
     pub async fn run(self: Arc<Self>, events_tx: mpsc::Sender<TransportEvent>) -> Result<()> {
         *self.events.write().await = Some(events_tx.clone());
         loop {
-            let incoming = self.endpoint.accept().await.context("QUIC endpoint closed")?;
+            let Some(incoming) = self.endpoint.accept().await else {
+                // Only `close_all` closes the endpoint: a clean shutdown.
+                info!("[ZGALAXY QUIC] Endpoint closed, accept loop stopped");
+                return Ok(());
+            };
             let this = Arc::clone(&self);
             let events = events_tx.clone();
             tokio::spawn(async move {
@@ -334,6 +341,16 @@ impl QuicTransport {
         if let Some(peer) = self.peers.write().await.remove(&canonical_endpoint(remote)) {
             peer.conn.close(quinn::VarInt::from_u32(0), b"zgalaxy-close");
         }
+    }
+
+    /// Close every session at shutdown and give the CONNECTION_CLOSE frames
+    /// time to leave. Exiting without them leaves peers waiting for their
+    /// 15 s idle timeout (a client then needed ~13.5 s to recover from a
+    /// controller restart; with them, about a second).
+    pub async fn close_all(&self) {
+        self.peers.write().await.clear();
+        self.endpoint.close(quinn::VarInt::from_u32(0), b"zgalaxy-shutdown");
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, self.endpoint.wait_idle()).await;
     }
 }
 

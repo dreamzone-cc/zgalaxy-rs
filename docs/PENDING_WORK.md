@@ -68,13 +68,15 @@
 - [x] المرحلة 8: `GtpMesh` (`src/gtp_transport.rs`) + اختبارات النقل + الدورة الكاملة
   عبر GTP + ربط `main.rs` (`transportMode: "gtp"` مع `--features gtp`). 99 اختباراً
   بالـfeature، 91 بدونه. حيّ: إعادة تشغيل المتحكم → 0.9–1.5s (GTP-INTEGRATION.md §4.6).
-- [ ] QUIC: إرسال CLOSE عند الإيقاف (`endpoint.close` + `wait_idle`) كما يفعل GTP —
-  يخفض استرداد العملاء بعد إعادة تشغيل متحكم QUIC من ~13.5s إلى <2s.
+- [x] QUIC: إرسال CLOSE عند الإيقاف (`QuicTransport::close_all`: `endpoint.close` +
+  `wait_idle` بسقف 500ms) — حيّ: إعادة تشغيل متحكم QUIC → config جديد عند العميل
+  في 0.92–1.45s (4/4)، كان ~13.5s. (فرع feat/quic-graceful-shutdown)
 - [ ] GTP: PathManager/relay، تثبيت مفتاح المتحكم (`bind_with_static_identity`)،
   وتشغيل QUIC+GTP معاً على العقدة نفسها (GTP-INTEGRATION.md §5).
-- [ ] تعافي العميل بعد إعادة تشغيل **المتحكم** ~13.5s (مقاس حياً): الجلسة الميتة تبقى
-      حتى idle-timeout ‏15s (قرار ب4). اقتراح: keep-alive ‏2s + idle ‏6s، أو كشف
-      حيوية تطبيقي (Pong مفقود).
+- [~] تعافي العميل بعد إعادة تشغيل **المتحكم**: الإيقاف النظيف (SIGINT/systemd stop)
+      صار ~1s على QUIC وGTP (CLOSE عند الإيقاف). المتبقي: الانهيار/فقد الشبكة بلا
+      CLOSE ما زال ينتظر idle-timeout ‏15s (قرار ب4). اقتراح: keep-alive ‏2s + idle ‏6s،
+      أو كشف حيوية تطبيقي (Pong مفقود).
 - [ ] فشل ربط منفذ REST لا يوقف الدايمون (يكمل "fully active" بلا API).
 - [ ] رد UDP على NetworkConfigRequest يرسل عناوين العضو لأي مصدر غير مُصادَق (تسرب/انعكاس).
 - [ ] الاتصال المزدوج المتزامن (الطرفان يطلبان معاً) قد يغلق الاتصالين معاً ("الأحدث يفوز"

@@ -536,8 +536,11 @@ async fn main() -> Result<()> {
     // Keep running until signal
     tokio::signal::ctrl_c().await?;
     info!("Shutting down ZGALAXY Client Daemon cleanly...");
-    // GTP sessions are not torn down by dropping them: say goodbye so peers
-    // see the CLOSE now instead of after their 15 s idle timeout.
+    // Say goodbye so peers see the session end now instead of after their
+    // 15 s idle timeout. (GTP sessions are not even torn down by dropping them.)
+    if let Some(quic) = &quic_transport {
+        quic.close_all().await;
+    }
     #[cfg(feature = "gtp")]
     if let Some(gtp) = &gtp_transport {
         gtp.close_all().await;
