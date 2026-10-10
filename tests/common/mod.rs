@@ -1,0 +1,250 @@
+//! Shared end-to-end scenario for the mesh engine, run over every mesh
+//! transport: a controller node and a client node run the full daemon
+//! wiring (ControlEngine + config sync loop + outbound forwarder)
+//! in-process over real loopback sessions.
+//!
+//! Covers: identity proof → join → pending → authorize → address assigned →
+//! frames flow (including a full 2800-MTU frame); a proven peer that is NOT
+//! the network's controller cannot push a config; an unproven session cannot
+//! inject frames; disconnect sticks.
+//!
+//! Each transport runs it from its own test binary (one test per binary: it
+//! sets ZGALAXY_EXTRA_ENDPOINTS, which is process-global).
+
+#![allow(dead_code)]
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use serde_json::json;
+use tokio::sync::mpsc;
+
+use zgalaxy_rs::control::ControlMessage;
+use zgalaxy_rs::control_engine::{self, ControlEngine, MeshContext};
+use zgalaxy_rs::controller::EmbeddedController;
+use zgalaxy_rs::identity::Identity;
+use zgalaxy_rs::l2_switch::L2Switch;
+use zgalaxy_rs::mesh::{MeshTransport, PeerSessions, TransportEvent, TransportKind};
+use zgalaxy_rs::network::{NetworkManager, NetworkStatus};
+use zgalaxy_rs::peer::PeerManager;
+use zgalaxy_rs::quic::{QuicMesh, QuicTransport};
+#[cfg(feature = "gtp")]
+use zgalaxy_rs::gtp_transport::{GtpMesh, GtpTransport};
+use zgalaxy_rs::resolver::DynamicDnsResolver;
+
+struct Node {
+    addr: SocketAddr,
+    ctx: MeshContext,
+    tun_rx: mpsc::Receiver<Bytes>,
+    tun_out: mpsc::Sender<Bytes>,
+    _dir: tempfile::TempDir,
+}
+
+/// Bind a loopback mesh transport of `kind` and start its accept loop.
+pub async fn bind(kind: TransportKind) -> (Arc<dyn MeshTransport>, mpsc::Receiver<TransportEvent>) {
+    let (events_tx, events_rx) = mpsc::channel(256);
+    let transport: Arc<dyn MeshTransport> = match kind {
+        TransportKind::Quic => {
+            let quic = Arc::new(QuicTransport::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+            let runner = Arc::clone(&quic);
+            tokio::spawn(async move { runner.run(events_tx).await });
+            Arc::new(QuicMesh(quic))
+        }
+        #[cfg(feature = "gtp")]
+        TransportKind::Gtp => {
+            let gtp = Arc::new(GtpTransport::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+            let runner = Arc::clone(&gtp);
+            tokio::spawn(async move { runner.run(events_tx).await });
+            Arc::new(GtpMesh(gtp))
+        }
+        other => panic!("no mesh backend for {} in this build", other),
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (transport, events_rx)
+}
+
+async fn spawn_node(kind: TransportKind, is_controller: bool, sync: bool) -> Node {
+    let dir = tempfile::tempdir().unwrap();
+    let identity = Identity::generate();
+    let (transport, events_rx) = bind(kind).await;
+    let addr = transport.local_addr().unwrap();
+
+    let controller = EmbeddedController::new(identity.clone(), dir.path().to_path_buf());
+    if is_controller {
+        controller.init().await.unwrap();
+    }
+    let networks = NetworkManager::new();
+    networks.set_node_address(identity.address.to_string()).await;
+    networks.set_working_dir(dir.path().to_path_buf()).await;
+
+    let (tun_tx, tun_rx) = mpsc::channel(64);
+    let (tun_out, tun_out_rx) = mpsc::channel(64);
+    let ctx = MeshContext {
+        transport,
+        sessions: PeerSessions::new(),
+        identity,
+        controller,
+        is_controller,
+        networks,
+        peers: PeerManager::new(),
+        l2: L2Switch::new(),
+        tun_tx,
+        interface: None,
+        sync_now: Arc::new(tokio::sync::Notify::new()),
+    };
+
+    tokio::spawn(ControlEngine::new(ctx.clone()).run(events_rx));
+    tokio::spawn(control_engine::forward_outbound(ctx.clone(), tun_out_rx));
+    if sync {
+        tokio::spawn(control_engine::config_sync_loop(ctx.clone(), Arc::new(DynamicDnsResolver::new(30))));
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Node { addr, ctx, tun_rx, tun_out, _dir: dir }
+}
+
+async fn wait_for<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..200 {
+        if check().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for: {}", what);
+}
+
+pub fn ethernet(dst: [u8; 6], src: [u8; 6], len: usize) -> Bytes {
+    let mut f = Vec::with_capacity(len);
+    f.extend_from_slice(&dst);
+    f.extend_from_slice(&src);
+    f.extend_from_slice(&[0x08, 0x00]);
+    f.resize(len, 0x5a);
+    Bytes::from(f)
+}
+
+/// The whole scenario, over the transport `kind`.
+pub async fn full_cycle(kind: TransportKind) {
+    let mut ctrl = spawn_node(kind, true, false).await;
+    let net = ctrl
+        .ctx
+        .controller
+        .save_network(json!({
+            "name": "Arena",
+            "private": true,
+            "routes": [{"target": "10.77.0.0/16", "via": null}],
+            "ipAssignmentPools": [{"ipRangeStart": "10.77.0.10", "ipRangeEnd": "10.77.0.20"}],
+            "v4AssignMode": {"zt": true}
+        }))
+        .await
+        .unwrap();
+    let nwid = net.id.clone();
+    assert_eq!(&nwid[..10], ctrl.ctx.identity.address.to_string(), "nwid carries the controller address");
+
+    std::env::set_var("ZGALAXY_EXTRA_ENDPOINTS", ctrl.addr.to_string());
+    let mut client = spawn_node(kind, false, true).await;
+    let client_id = client.ctx.identity.address.to_string();
+    client.ctx.networks.join(&nwid).await.unwrap();
+    client.ctx.sync_now.notify_one();
+
+    // 1. Identity proof + join request → pending member, ACCESS_DENIED.
+    let (c, id) = (ctrl.ctx.controller.clone(), client_id.clone());
+    let n = nwid.clone();
+    wait_for("member registered at the controller", || {
+        let (c, id, n) = (c.clone(), id.clone(), n.clone());
+        async move { c.get_member(&n, &id).await.is_some() }
+    })
+    .await;
+    assert!(!ctrl.ctx.controller.get_member(&nwid, &client_id).await.unwrap().authorized);
+    let nm = client.ctx.networks.clone();
+    let n = nwid.clone();
+    wait_for("client sees ACCESS_DENIED", || {
+        let (nm, n) = (nm.clone(), n.clone());
+        async move { nm.get(&n).await.map(|x| x.status == NetworkStatus::AccessDenied).unwrap_or(false) }
+    })
+    .await;
+
+    // 2. Authorize (what ztnet does over REST) → OK with a pool address.
+    ctrl.ctx
+        .controller
+        .save_member(&nwid, &client_id, json!({"authorized": true}))
+        .await
+        .unwrap();
+    let nm = client.ctx.networks.clone();
+    let n = nwid.clone();
+    wait_for("client authorized with an address", || {
+        let (nm, n) = (nm.clone(), n.clone());
+        async move {
+            nm.get(&n)
+                .await
+                .map(|x| x.status == NetworkStatus::Ok && x.assigned_addresses == vec!["10.77.0.10".to_string()])
+                .unwrap_or(false)
+        }
+    })
+    .await;
+    let joined = client.ctx.networks.get(&nwid).await.unwrap();
+    assert_eq!(joined.name, "Arena");
+    assert!(joined.membership_token.is_some(), "authorized member holds a signed token");
+
+    // 3. Data plane: a frame written to the client's TAP reaches the
+    // controller's TAP (broadcast → flood), and the reply is unicast back
+    // through the learned MAC. The reply is 2814 bytes: a full 2800-MTU frame.
+    let client_mac = [0x02, 0, 0, 0, 0, 0x01];
+    let ctrl_mac = [0x02, 0, 0, 0, 0, 0x02];
+    client.tun_out.send(ethernet([0xff; 6], client_mac, 60)).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), ctrl.tun_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(&got[6..12], &client_mac);
+    ctrl.tun_out.send(ethernet(client_mac, ctrl_mac, 2814)).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), client.tun_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(got.len(), 2814);
+    assert_eq!(&got[0..6], &client_mac);
+
+    // 4. A proven peer that is NOT the network's controller cannot push a config.
+    let rogue = spawn_node(kind, false, false).await;
+    rogue.ctx.transport.connect(client.addr).await.unwrap();
+    assert!(
+        rogue.ctx.sessions.await_accepted_us(client.addr, Duration::from_secs(5)).await,
+        "rogue completes the identity proof"
+    );
+    rogue
+        .ctx
+        .transport
+        .send_control(
+            client.addr,
+            &ControlMessage::NetworkConfigResponse {
+                nwid: nwid.clone(),
+                config: json!({"authorized": true, "ipAssignments": ["6.6.6.6"], "routes": [{"target": "0.0.0.0/0", "via": null}]}),
+            },
+        )
+        .await
+        .unwrap();
+    // Poll densely: the real controller re-sends its config every few
+    // seconds, so a single late check could miss a briefly applied rogue one.
+    for _ in 0..50 {
+        let now = client.ctx.networks.get(&nwid).await.unwrap();
+        assert_eq!(now.assigned_addresses, vec!["10.77.0.10".to_string()], "rogue config must be ignored");
+        assert!(now.routes.iter().all(|r| r.target != "0.0.0.0/0"), "rogue default route must be ignored");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // 5. An anonymous session (no identity proof) cannot inject frames.
+    let (anon, _anon_rx) = bind(kind).await;
+    anon.connect(ctrl.addr).await.unwrap();
+    anon.send_frame(ctrl.addr, ethernet([0xff; 6], [0x02, 0, 0, 0, 0, 0x66], 60)).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), ctrl.tun_rx.recv()).await.is_err(),
+        "a frame from an unproven session reached the TAP"
+    );
+
+    // 6. Disconnect wins over late responses: the sync loop stops asking and
+    // nothing flips the network back on.
+    client.ctx.networks.disconnect(&nwid).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let after = client.ctx.networks.get(&nwid).await.unwrap();
+    assert!(!after.connected);
+    assert_eq!(after.status, NetworkStatus::Disconnected);
+}

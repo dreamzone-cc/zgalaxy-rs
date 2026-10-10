@@ -21,6 +21,8 @@ use zgalaxy_rs::nat::NatTraversalEngine;
 use zgalaxy_rs::network::NetworkManager;
 use zgalaxy_rs::peer::PeerManager;
 use zgalaxy_rs::quic::{QuicMesh, QuicTransport};
+#[cfg(feature = "gtp")]
+use zgalaxy_rs::gtp_transport::{GtpMesh, GtpTransport};
 use zgalaxy_rs::resolver::DynamicDnsResolver;
 use zgalaxy_rs::transport::{BridgeMode, UdpTransport};
 
@@ -318,16 +320,40 @@ async fn main() -> Result<()> {
         requested
     } else {
         warn!(
-            "[ZGALAXY MESH] transportMode '{}' has no backend in this build yet (docs/GTP-INTEGRATION.md) — using quic",
+            "[ZGALAXY MESH] transportMode '{}' is not compiled into this build (GTP needs `--features gtp`) — using quic",
             requested
         );
         TransportKind::Quic
     };
 
+    // The accept loop starts right away; events queue in the channel until
+    // the engine below consumes them.
+    let (mesh_events_tx, mesh_events_rx) = mpsc::channel(1024);
+    let bind_v6 = std::net::SocketAddr::from(([0u8; 16], local_config.port));
+    let bind_v4 = std::net::SocketAddr::from(([0, 0, 0, 0], local_config.port));
+    #[cfg(feature = "gtp")]
+    let mut gtp_transport: Option<Arc<GtpTransport>> = None;
+    #[cfg(feature = "gtp")]
+    if transport_kind == TransportKind::Gtp {
+        let bound = match GtpTransport::bind(bind_v6).await {
+            Ok(t) => Ok(t),
+            Err(e_v6) => {
+                info!("[ZGALAXY GTP] IPv6 bind on {} unavailable ({:#}), falling back to {}", bind_v6, e_v6, bind_v4);
+                GtpTransport::bind(bind_v4).await
+            }
+        };
+        match bound {
+            Ok(gtp) => gtp_transport = Some(Arc::new(gtp)),
+            Err(e) => error!("[ZGALAXY GTP] Failed to bind GTP transport: {:#} — falling back to QUIC", e),
+        }
+    }
+    #[cfg(feature = "gtp")]
+    let quic_wanted = gtp_transport.is_none() && transport_kind != TransportKind::Udp;
+    #[cfg(not(feature = "gtp"))]
+    let quic_wanted = transport_kind == TransportKind::Quic;
+
     let mut quic_transport: Option<Arc<QuicTransport>> = None;
-    if transport_kind == TransportKind::Quic {
-        let bind_v6 = std::net::SocketAddr::from(([0u8; 16], local_config.port));
-        let bind_v4 = std::net::SocketAddr::from(([0, 0, 0, 0], local_config.port));
+    if quic_wanted {
         let bound = QuicTransport::bind(bind_v6).or_else(|e_v6| {
             info!(
                 "[ZGALAXY QUIC] IPv6 bind on [::]:{} unavailable ({:#}), falling back to 0.0.0.0:{}",
@@ -340,13 +366,34 @@ async fn main() -> Result<()> {
             Err(e) => error!("[ZGALAXY QUIC] Failed to bind QUIC transport: {:#} — falling back to UDP", e),
         }
     }
-    let mesh: Option<Arc<dyn MeshTransport>> = quic_transport
-        .as_ref()
-        .map(|q| Arc::new(QuicMesh(Arc::clone(q))) as Arc<dyn MeshTransport>);
+
+    let mut mesh: Option<Arc<dyn MeshTransport>> = None;
+    if let Some(quic) = &quic_transport {
+        let runner = Arc::clone(quic);
+        let events_tx = mesh_events_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = runner.run(events_tx).await {
+                error!("[ZGALAXY QUIC] Accept loop terminated: {:#}", e);
+            }
+        });
+        mesh = Some(Arc::new(QuicMesh(Arc::clone(quic))));
+    }
+    #[cfg(feature = "gtp")]
+    if let Some(gtp) = &gtp_transport {
+        let runner = Arc::clone(gtp);
+        let events_tx = mesh_events_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = runner.run(events_tx).await {
+                error!("[ZGALAXY GTP] Accept loop terminated: {:#}", e);
+            }
+        });
+        mesh = Some(Arc::new(GtpMesh(Arc::clone(gtp))));
+    }
+    drop(mesh_events_tx);
 
     // Canonical ZeroTier MTU (2800, ≥ 1280 for RFC 8200 IPv6), capped by what
-    // the transport can carry. QUIC sends frames above the datagram limit on
-    // a stream, so it carries the full 2800.
+    // the transport can carry. QUIC (uni stream) and GTP (ReliableUnordered)
+    // both carry frames above their datagram limit, so both carry the full 2800.
     let tun_mtu = mesh
         .as_ref()
         .map(|m| m.capabilities().interface_mtu())
@@ -390,16 +437,8 @@ async fn main() -> Result<()> {
     // Headless: the packet loop never started, so there is nothing to forward.
     let mut tun_outbound_rx = interface.is_some().then_some(tun_outbound_rx);
 
-    if let (Some(quic), Some(mesh)) = (&quic_transport, &mesh) {
+    if let Some(mesh) = &mesh {
         nat_engine.set_mesh_transport(Arc::clone(mesh)).await;
-
-        let (events_tx, events_rx) = mpsc::channel(1024);
-        let quic_runner = Arc::clone(quic);
-        tokio::spawn(async move {
-            if let Err(e) = quic_runner.run(events_tx).await {
-                error!("[ZGALAXY QUIC] Accept loop terminated: {:#}", e);
-            }
-        });
 
         let ctx = MeshContext {
             transport: Arc::clone(mesh),
@@ -420,7 +459,7 @@ async fn main() -> Result<()> {
             tun_mtu,
             if interface.is_some() { "live" } else { "headless" }
         );
-        spawn_watched("mesh-engine", ControlEngine::new(ctx.clone()).run(events_rx));
+        spawn_watched("mesh-engine", ControlEngine::new(ctx.clone()).run(mesh_events_rx));
         if let Some(rx) = tun_outbound_rx.take() {
             spawn_watched("mesh-outbound", control_engine::forward_outbound(ctx.clone(), rx));
         }
@@ -497,6 +536,12 @@ async fn main() -> Result<()> {
     // Keep running until signal
     tokio::signal::ctrl_c().await?;
     info!("Shutting down ZGALAXY Client Daemon cleanly...");
+    // GTP sessions are not torn down by dropping them: say goodbye so peers
+    // see the CLOSE now instead of after their 15 s idle timeout.
+    #[cfg(feature = "gtp")]
+    if let Some(gtp) = &gtp_transport {
+        gtp.close_all().await;
+    }
     Ok(())
 }
 

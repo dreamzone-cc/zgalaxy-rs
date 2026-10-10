@@ -65,7 +65,13 @@
 - [x] المرحلة 7: اعتماد GTP-rs v0.4.0 تحت feature `gtp` + `tests/gtp_api_smoke.rs`
   (فرع feat/gtp-phase7). كشف: المجموعة 0 غير مرتبة، الإسقاط لا يغلق الجلسة، سقف
   Unreliable 1133 — التفاصيل في GTP-INTEGRATION.md §4.5.
-- [ ] المرحلة 8: `GtpMesh` — الخطة في GTP-INTEGRATION.md §5.
+- [x] المرحلة 8: `GtpMesh` (`src/gtp_transport.rs`) + اختبارات النقل + الدورة الكاملة
+  عبر GTP + ربط `main.rs` (`transportMode: "gtp"` مع `--features gtp`). 99 اختباراً
+  بالـfeature، 91 بدونه. حيّ: إعادة تشغيل المتحكم → 0.9–1.5s (GTP-INTEGRATION.md §4.6).
+- [ ] QUIC: إرسال CLOSE عند الإيقاف (`endpoint.close` + `wait_idle`) كما يفعل GTP —
+  يخفض استرداد العملاء بعد إعادة تشغيل متحكم QUIC من ~13.5s إلى <2s.
+- [ ] GTP: PathManager/relay، تثبيت مفتاح المتحكم (`bind_with_static_identity`)،
+  وتشغيل QUIC+GTP معاً على العقدة نفسها (GTP-INTEGRATION.md §5).
 - [ ] تعافي العميل بعد إعادة تشغيل **المتحكم** ~13.5s (مقاس حياً): الجلسة الميتة تبقى
       حتى idle-timeout ‏15s (قرار ب4). اقتراح: keep-alive ‏2s + idle ‏6s، أو كشف
       حيوية تطبيقي (Pong مفقود).
