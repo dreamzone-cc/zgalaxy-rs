@@ -23,7 +23,7 @@ GTP **backend نقل** فقط. لا يملك المتحكم ولا NAT ولا ا
 ```text
 QuicTransport ──(QuicMesh: impl MeshTransport)──┐
                                                 ├─► TransportEvent ─► ControlEngine
-GtpTransport  ──(impl MeshTransport) [قادم]─────┘        │                │
+GtpTransport  ──(GtpMesh: impl MeshTransport)──┘        │                │
                                                        Frame          Control
                                                          │                │
                                                      L2Switch→TAP   PeerSessions + EmbeddedController
@@ -38,15 +38,21 @@ GtpTransport  ──(impl MeshTransport) [قادم]─────┘        │
 | 5 — PathManager (Direct/Relay) | ⏳ | `PathMode` معرَّف فقط |
 | 6 — فك NAT عن QUIC | ✅ جزئياً | `nat.rs` يتعامل مع `dyn MeshTransport` |
 | 7 — اعتماد GTP-rs + اختبار دخان للـAPI الفعلي | ✅ | feature `gtp`، `tests/gtp_api_smoke.rs` — انظر §4.5 |
-| 8+ — `GtpMesh` | ⏳ | انظر §5 |
+| 8 — `GtpMesh` + نفس اختبارات QUIC + ربط الـdaemon | ✅ | `src/gtp_transport.rs` — انظر §4.6 |
 
 `main.rs` لم يعد يحتوي أي منطق تحكم خاص بـQUIC: يربط النقل، ثم يشغّل
 `ControlEngine::run` و`forward_outbound` و`rtt_prober` و`config_sync_loop`.
 
 ### اختيار النقل
 `local.conf` → `settings.transportMode`: ‏`"quic"` (افتراضي) | `"gtp"` | `"udp"`.
-اختيار `gtp` اليوم يُسجَّل تحذيراً ويرجع إلى QUIC (`TransportKind::is_available`)
-حتى يُربط الـbackend — لا انهيار ولا تشغيل صامت بنقل خاطئ.
+`gtp` يعمل في بناء `cargo build --features gtp`. في بناء بدونه يُسجَّل تحذير ويرجع
+إلى QUIC (`TransportKind::is_available`) — لا انهيار ولا تشغيل صامت بنقل خاطئ.
+فشل ربط منفذ GTP يرجع إلى QUIC أيضاً.
+
+```json
+{ "settings": { "transportMode": "gtp" } }
+```
+كل العقد في الشبكة يجب أن تستخدم النقل نفسه: QUIC وGTP لا يتفاهمان على السلك (§5 بند 5).
 
 ### MTU من قدرات النقل لا من ثابت
 `TransportCapabilities { max_datagram_payload, max_frame, .. }`، و
@@ -154,13 +160,39 @@ gtp = { git = "https://github.com/dreamzone-cc/GTP-rs", tag = "v0.4.0", features
 `TransportKind::Gtp.is_available()` يبقى `false` حتى يوجد `GtpMesh` (المرحلة 8)،
 ثم يصبح `cfg!(feature = "gtp")` — تفعيله قبل ذلك يعني اختيار نقل غير موجود.
 
+### 4.6 GtpMesh (المرحلة 8) — كيف بُني وما تحقق
+- **مهمة واحدة لكل جلسة** (`drive_session`): `select!` بين `recv()` وقناة أوامر
+  (Frame / Control / Close). الإطار `try_send` (طابور ممتلئ = إسقاط كبطاقة شبكة،
+  لا انتظار)؛ التحكم ينتظر نتيجة الإرسال عبر oneshot.
+- **الإطار**: `send_unreliable`؛ عند `PayloadTooLarge { max }` يُحفظ الحد لتلك الجلسة
+  وما فوقه يذهب `send_reliable_unordered`. التحكم: `send_reliable_ordered` على `CONTROL_GROUP = 1`.
+- **الأجيال**: عداد ذري خاص بالنقل (GTP لا يملك `stable_id`)؛ جلسة جديدة لنفس
+  `remote` تستبدل القديمة وتغلقها بـCLOSE صريح.
+- **الإغلاق**: `close()` يرسل CLOSE وينتظر وضعه في الطابور؛ `close_all()` عند
+  الإيقاف + مهلة 200ms ليخرج الـCLOSE فعلاً قبل انتهاء العملية. قبل المهلة شوهد حياً
+  أن النظير لا يعلم إلا بعد 15s.
+- **CID**: عشوائي 64-bit لكل dial.
+
+التحقق:
+| | QUIC | GTP |
+|---|---|---|
+| اختبارات النقل (تحكم مرتب، إطار صغير، 2814B، رفض >64KiB، أجيال، إغلاق، dual-stack) | ✅ | ✅ `gtp_transport_test.rs` |
+| الدورة الكاملة (إثبات → join → رفض → تخويل → عنوان → إطارات 2814B) | ✅ | ✅ |
+| حالات سلبية مُتحقَّق منها بالـmutation (config من غير المتحكم، إطار من جلسة غير مُثبتة) | ✅ | ✅ |
+| حيّ: خدمتان على loopback — join → أول رد | 0.09s | 0.11s |
+| حيّ: authorize → OK | 0.43s | 0.45s |
+| حيّ: إعادة تشغيل المتحكم (SIGINT) → config جديد عند العميل | ~13.5s | **0.9–1.5s** (4/4) |
+
+الفرق الأخير لصالح GTP لأن `close_all` يرسل CLOSE عند الإيقاف، بينما QUIC يخرج
+بلا CLOSE فينتظر العميل مهلة الخمول. نفس المعالجة ممكنة لـQUIC
+(`endpoint.close` + `wait_idle`) — مسجّلة في PENDING_WORK.
+
 ## 5. الخطوات التالية بالترتيب
 
 1. ~~**المرحلة 7**~~ ✅: الاعتماد تحت feature `gtp` (مثبّت على commit الوسم v0.4.0) + `tests/gtp_api_smoke.rs`.
-2. **المرحلة 8**: `src/gtp_transport.rs` ‏(`GtpMesh: impl MeshTransport`) + نسخ
-   `tests/quic_transport_test.rs` و`tests/mesh_engine_e2e.rs` لتعمل على GTP
-   (نفس الالتزامات §3). الثاني يغطي الدورة كاملة: إثبات → join → تخويل → عنوان → إطارات.
-3. **المرحلة 9**: متحكم عبر GTP (يعمل تلقائياً — ControlEngine لا يعرف النقل).
+2. ~~**المرحلة 8**~~ ✅: `GtpMesh` + `tests/gtp_transport_test.rs` + الدورة الكاملة
+   (`tests/common/mod.rs` تشغّلها لـQUIC وGTP معاً) + ربط `main.rs`.
+3. ~~**المرحلة 9**~~ ✅ (ضمناً): المتحكم يعمل عبر GTP بلا أي تغيير — مُتحقَّق حياً (§4.6).
 4. **المرحلة 5/10+**: ‏PathManager + relay (مواصفة GTP-rs §10–§19، §44–§49).
 5. تشغيل مزدوج QUIC+GTP على نفس العقدة (منفذان) لترحيل تدريجي بلا كسر D1.
 

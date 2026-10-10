@@ -21,6 +21,8 @@ pub mod control_engine;
 pub mod controller;
 pub mod controller_api;
 pub mod crypto;
+#[cfg(feature = "gtp")]
+pub mod gtp_transport;
 pub mod identity;
 pub mod interface_sync;
 pub mod l2_switch;

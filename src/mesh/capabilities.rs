@@ -22,7 +22,7 @@ pub enum TransportKind {
     /// QUIC (quinn) — datagrams for frames, bi-streams for control.
     Quic,
     /// GTP/1.1 (GTP-rs) — Unreliable for frames, ReliableOrdered for control.
-    /// Reserved: the backend is not wired yet (see docs/GTP-INTEGRATION.md).
+    /// Available when built with the `gtp` feature (`crate::gtp_transport`).
     Gtp,
     /// Legacy plaintext UDP wire bridge (`src/transport.rs`).
     Udp,
@@ -39,7 +39,10 @@ impl TransportKind {
 
     /// Whether a mesh backend for this kind is compiled into this build.
     pub fn is_available(&self) -> bool {
-        matches!(self, TransportKind::Quic | TransportKind::Udp)
+        match self {
+            TransportKind::Quic | TransportKind::Udp => true,
+            TransportKind::Gtp => cfg!(feature = "gtp"),
+        }
     }
 }
 
@@ -109,7 +112,7 @@ mod tests {
         assert_eq!(" gtp ".parse::<TransportKind>().unwrap(), TransportKind::Gtp);
         assert_eq!("udp".parse::<TransportKind>().unwrap(), TransportKind::Udp);
         assert!("tcp".parse::<TransportKind>().is_err());
-        assert!(!TransportKind::Gtp.is_available(), "GTP backend is reserved, not wired");
+        assert_eq!(TransportKind::Gtp.is_available(), cfg!(feature = "gtp"));
     }
 
     #[test]
