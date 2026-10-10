@@ -37,7 +37,8 @@ GtpTransport  ──(impl MeshTransport) [قادم]─────┘        │
 | 4 — ControlEngine خارج main.rs | ✅ | `src/control_engine.rs` (+ `src/mesh/session.rs` لربط الهوية) |
 | 5 — PathManager (Direct/Relay) | ⏳ | `PathMode` معرَّف فقط |
 | 6 — فك NAT عن QUIC | ✅ جزئياً | `nat.rs` يتعامل مع `dyn MeshTransport` |
-| 7+ — GTP-rs نفسه | ⏳ | انظر §4 |
+| 7 — اعتماد GTP-rs + اختبار دخان للـAPI الفعلي | ✅ | feature `gtp`، `tests/gtp_api_smoke.rs` — انظر §4.5 |
+| 8+ — `GtpMesh` | ⏳ | انظر §5 |
 
 `main.rs` لم يعد يحتوي أي منطق تحكم خاص بـQUIC: يربط النقل، ثم يشغّل
 `ControlEngine::run` و`forward_outbound` و`rtt_prober` و`config_sync_loop`.
@@ -80,7 +81,7 @@ pub trait MeshTransport: Send + Sync {
 4. مفاتيح `remote` بصيغة قانونية (IPv4 لا `::ffff:a.b.c.d`) — راجع `quic::canonical_endpoint`.
 5. `send_frame` لا يطلب اتصالاً (data plane لا يتجمد على مهلة handshake).
 
-## 4. خريطة GTP-rs 0.4.0 → MeshTransport (تحقق من الـAPI قبل البناء)
+## 4. خريطة GTP-rs 0.4.0 → MeshTransport (مُتحقَّق منها في المرحلة 7)
 
 من `crates/gtp` (feature `tokio`) و`crates/gtp-runtime-tokio`:
 
@@ -89,17 +90,18 @@ pub trait MeshTransport: Send + Sync {
 | ربط endpoint | `GtpEndpoint::bind(addr)` / `bind_with_static_identity` |
 | قبول جلسة | `GtpEndpoint::accept() -> Option<AsyncGtpConnection>` |
 | طلب جلسة | `GtpEndpoint::connect(ConnectionId, peer_addr, secure=true)` |
-| إطار L2 (غير موثوق) | `AsyncGtpConnection::send_unreliable(payload, PriorityTier::P2WorldState, None)` |
-| رسالة تحكم (موثوق مرتب) | `send_reliable_ordered(.., OrderedGroupId(0), PriorityTier::P0Control)` |
+| إطار L2 (غير موثوق) | `AsyncGtpConnection::send_unreliable(payload, PriorityTier::P2WorldState)` (وسيطان فقط) |
+| رسالة تحكم (موثوق مرتب) | `send_reliable_ordered(OrderedGroupId(1), payload, PriorityTier::P0Control)` — **ليس 0**، انظر §4.5 |
 | Ping/Pong | `PriorityTier::P0Control` (أو `send_ping` الأصلي لقياس RTT النقل) |
-| الاستقبال | `recv() -> ReceivedMessage { class, payload }` — نفرّق بالـ`class` |
+| الاستقبال | `recv(&mut self) -> Option<ReceivedMessage { class, payload }>` — نفرّق بالـ`class`؛ `None` = انتهت الجلسة |
 | قياس | `feedback()` / `query_metrics()` → يمكن أن يغذي `/peer` latency |
 | ترحيل المسار | `trigger_path_challenge(new_addr, nonce)` → `path_migration: true` |
 | إغلاق | `graceful_close(code, reason)` |
 
 ### 4.1 التوجيه الداخلي للرسائل
 - `ReceivedMessage.class == Unreliable` → `TransportEvent::Frame`.
-- `ReliableOrdered` → فك `control::decode` → `TransportEvent::Control`.
+- `ReliableOrdered { group_id: 1, .. }` → فك `control::decode` → `TransportEvent::Control`.
+- `ReliableUnordered` → `TransportEvent::Frame` (الإطارات الكبيرة، §4.3).
 - `ConnectionId`: مشتق من (عنوان العقدتين + عداد) أو عشوائي 64-bit؛ الهوية
   الحقيقية تبقى من أ3 لا من CID.
 
@@ -111,13 +113,30 @@ pub trait MeshTransport: Send + Sync {
 
 ### 4.3 الحجم (نقطة حرجة)
 `GtpConnection::max_message_payload()` = ‏`min_mtu − header − AEAD tag − 27`
-(≈ 1150 بايت عند min_mtu=1200) و`send_unreliable` يرفض ما فوقه بـ
+(**1133 بايت مقيسة** على loopback مع `competitive_fps`) و`send_unreliable` يرفض ما فوقه بـ
 `PayloadTooLarge`. إطار 2814 بايت (MTU 2800) لا يمر Unreliable. الخيارات:
 1. **(مقترح)** نفس نمط QUIC: ما يتجاوز الحد يُرسل `send_reliable_unordered`
    (GTP-rs يجزّئ الرسائل الموثوقة عبر `fragment_budget`) — بلا HOL بين الإطارات.
 2. خفض MTU الواجهة عند GTP إلى `max_message_payload − 14` — يكسر IPv6 (<1280).
 
-القيمة الفعلية تُقرأ من الاتصال، لا تُفترض.
+القيمة الفعلية تُقرأ من الاتصال، لا تُفترض. الخيار 1 مُتحقَّق منه: إطار 2814 بايت
+يصل سليماً عبر `ReliableUnordered` في ~1ms على loopback، ورسالة 64KiB (حد الإطار) تصل كذلك.
+
+### 4.5 ما كشفه اختبار الدخان (المرحلة 7)
+`cargo test --features gtp --test gtp_api_smoke -- --nocapture`
+
+| الحقيقة | الأثر على `GtpMesh` |
+|---|---|
+| `OrderedGroupId(0)` محجوز للتسليم **غير المرتب** (يصل `ReliableUnordered`) | التحكم على المجموعة 1؛ لو استُخدمت 0 لضاع الترتيب بصمت |
+| `recv` يحتاج `&mut self` والإرسال `&self`، والحقول الداخلية `pub(crate)` | مهمة واحدة تملك كل اتصال: `select!` بين `recv()` وقناة أوامر الإرسال |
+| سقف Unreliable = 1133 بايت | ما فوقه → `ReliableUnordered` (حتى 64KiB) |
+| `graceful_close` من طرف → `recv()` يرجع `None` عند الآخر فوراً (<1ms) | `None` → `TransportEvent::Disconnected` |
+| **إسقاط** `AsyncGtpConnection` و`GtpEndpoint` لا يغلق الجلسة: مهام GTP-rs تبقى وتجيب الـkeepalive | `close()` يجب أن يستدعي `graceful_close` صراحة، ويُغلق كل الجلسات عند الإيقاف |
+| نظير معطّل (بلا CLOSE) يُكتشف بعد 15.0s (`competitive_fps`: idle 15s، keepalive 1s) | مطابق لمهلة QUIC (ب4)، لا تغيير في سلوك الاسترداد |
+| `connect` يستخدم `competitive_fps()` ثابتاً — لا يقبل `GtpConfig` | لا يمكن ضبط المهلة/الـMTU من zgalaxy حالياً |
+| نفس الـendpoint يقبل ويطلب جلسات معاً، والجلسات مستقلة | منفذ واحد لكل عقدة كما في QUIC |
+| الـCID يختاره الطالب ويراه القابل كما هو | CID عشوائي 64-bit لكل dial؛ تصادمه لا يمس الهوية (أ3) |
+| `peer_addr()` عند القابل = عنوان socket الطالب | مفتاح `remote` بعد `canonical_endpoint` (الالتزام 4) |
 
 ### 4.4 الاعتماد
 GTP-rs workspace بـ13 crate، ‏`rust-version = 1.85`، ‏tokio 1.40 (متوافق مع 1.38+ هنا).
@@ -130,12 +149,14 @@ gtp = ["dep:gtp"]
 [dependencies]
 gtp = { git = "https://github.com/dreamzone-cc/GTP-rs", tag = "v0.4.0", features = ["tokio"], optional = true }
 ```
-وعندها `TransportKind::Gtp.is_available()` يصبح `cfg!(feature = "gtp")`.
+المُنفَّذ فعلاً يثبّت `rev = "547c46d…"` (commit الوسم v0.4.0، فالوسم annotated وقد يُنقل)
+بدلاً من `tag`. البناء الافتراضي لا يسحب أي crate من GTP.
+`TransportKind::Gtp.is_available()` يبقى `false` حتى يوجد `GtpMesh` (المرحلة 8)،
+ثم يصبح `cfg!(feature = "gtp")` — تفعيله قبل ذلك يعني اختيار نقل غير موجود.
 
 ## 5. الخطوات التالية بالترتيب
 
-1. **المرحلة 7**: إضافة الاعتماد تحت feature + اختبار دخان لـAPI الفعلي
-   (bind/connect/accept/unreliable/reliable_ordered) — لا نعتمد على API مفترض.
+1. ~~**المرحلة 7**~~ ✅: الاعتماد تحت feature `gtp` (مثبّت على commit الوسم v0.4.0) + `tests/gtp_api_smoke.rs`.
 2. **المرحلة 8**: `src/gtp_transport.rs` ‏(`GtpMesh: impl MeshTransport`) + نسخ
    `tests/quic_transport_test.rs` و`tests/mesh_engine_e2e.rs` لتعمل على GTP
    (نفس الالتزامات §3). الثاني يغطي الدورة كاملة: إثبات → join → تخويل → عنوان → إطارات.

@@ -43,6 +43,12 @@ jobs:
       - name: Cargo Test
         run: cargo test --verbose
 
+      - name: Clippy (gtp feature)
+        run: cargo clippy --all-targets --features gtp -- -D warnings
+
+      - name: GTP API smoke test
+        run: cargo test --features gtp --test gtp_api_smoke
+
   build-multi-arch:
     name: Build Release (${{ matrix.target }})
     needs: check-and-test

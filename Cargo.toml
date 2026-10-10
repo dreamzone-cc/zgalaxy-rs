@@ -42,6 +42,10 @@ quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
 
+# GTP transport (optional; see docs/GTP-INTEGRATION.md). Pinned to the v0.4.0
+# tag's commit so the build is immutable even if the tag moves.
+gtp = { git = "https://github.com/dreamzone-cc/GTP-rs", rev = "547c46df64469a8f7e5cc47378e2119e914e907c", features = ["tokio"], optional = true }
+
 # Local REST/IPC Server & Web Engine
 axum = { version = "0.7", features = ["json", "tokio"] }
 tower = { version = "0.4", features = ["util"] }
@@ -64,6 +68,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"]
 anyhow = "1.0"
 thiserror = "1.0"
 ctrlc = "3.4"
+
+[features]
+default = []
+gtp = ["dep:gtp"]
 
 [dev-dependencies]
 tempfile = "3.10"
