@@ -150,3 +150,21 @@ async fn dual_stack_dials_reuse_the_session() {
         _ => unreachable!(),
     }
 }
+
+/// Shutdown: `close_all` must reach the peer at once, not after its 15 s
+/// idle timeout (that is what made clients recover slowly from a
+/// controller restart).
+#[tokio::test]
+async fn close_all_reaches_the_peer_immediately() {
+    let (a, mut rx_a) = node().await;
+    let (b, _rx_b) = node().await;
+    let a_addr = a.local_addr().unwrap();
+    b.connect(a_addr).await.unwrap();
+    recv_until(&mut rx_a, |e| matches!(e, QuicEvent::Connected { .. })).await;
+
+    let t = std::time::Instant::now();
+    b.close_all().await;
+    assert!(QuicMesh(Arc::clone(&b)).connected_peers().await.is_empty());
+    recv_until(&mut rx_a, |e| matches!(e, QuicEvent::Disconnected { .. })).await;
+    assert!(t.elapsed() < Duration::from_secs(2), "peer saw the shutdown after {:?}", t.elapsed());
+}
