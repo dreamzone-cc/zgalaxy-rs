@@ -6,8 +6,10 @@
 //! using the same envelope: a 4-byte big-endian length prefix followed by a
 //! JSON body.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::identity::Identity;
 
 /// Upper bound for one encoded control message body. Network configs are
 /// small JSON documents; anything beyond this is malformed or hostile.
@@ -36,7 +38,14 @@ pub enum ControlMessage {
     /// replacement) when the client holds one from a previous response.
     NetworkConfigRequest { nwid: String, token: Option<String> },
     /// Controller-side response with the effective network configuration.
-    NetworkConfigResponse { nwid: String, config: serde_json::Value },
+    /// Current clients apply `signed` only; `config` is the same document,
+    /// unsigned, kept for clients that predate signing.
+    NetworkConfigResponse {
+        nwid: String,
+        config: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed: Option<SignedConfig>,
+    },
     /// Ping over the control channel (diagnostics / RTT measurement).
     Ping { nonce: u64, sent_ms: u64 },
     Pong { nonce: u64, sent_ms: u64, received_ms: u64 },
@@ -100,6 +109,80 @@ pub fn challenge_material(nonce: u64, address: &str) -> Vec<u8> {
     m
 }
 
+/// A network config signed by the network's controller (ed25519).
+///
+/// The identity proof (أ3) is not bound to the transport channel, so an
+/// on-path relay can forward a real controller's proof and then edit what
+/// follows on that session. A signature over the config itself cannot be
+/// forged that way, on any transport. `body` is the exact JSON text that was
+/// signed, so verification never depends on re-serialising JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedConfig {
+    /// The config document as JSON text, exactly as signed.
+    pub body: String,
+    /// The member (node address) the config was issued to.
+    pub member: String,
+    /// Controller wall clock at signing. Clients refuse anything not newer
+    /// than the last config they applied for the network (replay guard).
+    pub issued_ms: u64,
+    /// Hex ed25519 signature over [`config_signature_material`].
+    pub signature: String,
+}
+
+/// Domain-separated, length-prefixed signing material for a config.
+pub fn config_signature_material(nwid: &str, member: &str, issued_ms: u64, body: &str) -> Vec<u8> {
+    let mut m = Vec::with_capacity(16 + nwid.len() + member.len() + body.len());
+    m.extend_from_slice(b"ZGCFG1");
+    for field in [nwid.as_bytes(), member.as_bytes()] {
+        m.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        m.extend_from_slice(field);
+    }
+    m.extend_from_slice(&issued_ms.to_be_bytes());
+    m.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    m.extend_from_slice(body.as_bytes());
+    m
+}
+
+impl SignedConfig {
+    /// Sign `config` for `member` of `nwid` with the controller identity.
+    pub fn sign(controller: &Identity, nwid: &str, member: &str, config: &serde_json::Value) -> Result<Self> {
+        Self::sign_at(controller, nwid, member, config, unix_millis())
+    }
+
+    /// [`Self::sign`] with an explicit `issued_ms` (tests, clock control).
+    pub fn sign_at(
+        controller: &Identity,
+        nwid: &str,
+        member: &str,
+        config: &serde_json::Value,
+        issued_ms: u64,
+    ) -> Result<Self> {
+        let body = serde_json::to_string(config)?;
+        let sig = controller.sign(&config_signature_material(nwid, member, issued_ms, &body))?;
+        Ok(Self { body, member: member.to_string(), issued_ms, signature: hex::encode(sig) })
+    }
+
+    /// Verify the signature with the controller's key, check the config is
+    /// addressed to `member` of `nwid`, and return the parsed document.
+    pub fn verify(&self, controller: &Identity, nwid: &str, member: &str) -> Result<serde_json::Value> {
+        if self.member != member {
+            bail!("config was issued to {}, not to {}", self.member, member);
+        }
+        let sig = hex::decode(&self.signature)
+            .ok()
+            .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
+            .context("malformed config signature")?;
+        if !controller.verify(&config_signature_material(nwid, member, self.issued_ms, &self.body), &sig) {
+            bail!("config signature does not verify against controller {}", controller.address);
+        }
+        let config: serde_json::Value = serde_json::from_str(&self.body).context("signed config body is not JSON")?;
+        if config.get("nwid").and_then(|v| v.as_str()).is_some_and(|n| n != nwid) {
+            bail!("signed config body names another network");
+        }
+        Ok(config)
+    }
+}
+
 /// Milliseconds since the Unix epoch (wall clock) for Ping/Pong stamps.
 pub fn unix_millis() -> u64 {
     std::time::SystemTime::now()
@@ -111,6 +194,42 @@ pub fn unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_config_verifies_and_rejects_tampering() {
+        let ctrl = Identity::generate();
+        let nwid = format!("{}000001", ctrl.address);
+        let member = Identity::generate().address.to_string();
+        let config = serde_json::json!({"nwid": nwid, "authorized": true, "ipAssignments": ["10.0.0.5"]});
+        let signed = SignedConfig::sign(&ctrl, &nwid, &member, &config).unwrap();
+        assert_eq!(signed.verify(&ctrl, &nwid, &member).unwrap(), config);
+
+        // Survives the wire (field order or whitespace changes elsewhere in
+        // the message cannot touch the signed text).
+        let msg = ControlMessage::NetworkConfigResponse { nwid: nwid.clone(), config: config.clone(), signed: Some(signed.clone()) };
+        match decode(&encode(&msg).unwrap()).unwrap() {
+            ControlMessage::NetworkConfigResponse { signed: Some(s), .. } => assert_eq!(s, signed),
+            other => panic!("{:?}", other),
+        }
+
+        let tampered = SignedConfig { body: signed.body.replace("10.0.0.5", "6.6.6.6"), ..signed.clone() };
+        assert!(tampered.verify(&ctrl, &nwid, &member).is_err(), "edited body");
+        let replayed_late = SignedConfig { issued_ms: signed.issued_ms + 1, ..signed.clone() };
+        assert!(replayed_late.verify(&ctrl, &nwid, &member).is_err(), "edited timestamp");
+        assert!(signed.verify(&ctrl, &nwid, "0123456789").is_err(), "another member");
+        assert!(signed.verify(&ctrl, &format!("{}000002", ctrl.address), &member).is_err(), "another network");
+        assert!(signed.verify(&Identity::generate(), &nwid, &member).is_err(), "another controller key");
+    }
+
+    #[test]
+    fn unsigned_responses_still_decode() {
+        // What a controller from before signing sends.
+        let body = br#"{"type":"NetworkConfigResponse","data":{"nwid":"0123456789abcdef","config":{}}}"#;
+        match decode_body(body).unwrap() {
+            ControlMessage::NetworkConfigResponse { signed, .. } => assert!(signed.is_none()),
+            other => panic!("{:?}", other),
+        }
+    }
 
     #[test]
     fn roundtrip_keeps_wire_format() {

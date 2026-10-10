@@ -20,7 +20,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
-use crate::control::{challenge_material, unix_millis, ControlMessage};
+use crate::control::{challenge_material, unix_millis, ControlMessage, SignedConfig};
 use crate::controller::EmbeddedController;
 use crate::identity::{Address, Identity};
 use crate::interface_sync;
@@ -100,11 +100,15 @@ impl MeshContext {
 pub struct ControlEngine {
     ctx: MeshContext,
     last_presence: HashMap<SocketAddr, Instant>,
+    /// Per network: `issued_ms` of the last signed config applied. Older or
+    /// equal ones are replays (in memory: a restart forgets it, and the next
+    /// fresh config from the controller supersedes any replayed one).
+    config_issued: HashMap<String, u64>,
 }
 
 impl ControlEngine {
     pub fn new(ctx: MeshContext) -> Self {
-        Self { ctx, last_presence: HashMap::new() }
+        Self { ctx, last_presence: HashMap::new(), config_issued: HashMap::new() }
     }
 
     pub async fn run(mut self, mut events: mpsc::Receiver<TransportEvent>) {
@@ -225,8 +229,9 @@ impl ControlEngine {
             ControlMessage::NetworkConfigRequest { nwid, token } => {
                 self.on_config_request(remote, nwid, token).await;
             }
-            ControlMessage::NetworkConfigResponse { nwid, config } => {
-                self.on_config_response(remote, nwid, config).await;
+            ControlMessage::NetworkConfigResponse { nwid, signed, .. } => {
+                // `config` (unsigned copy for old clients) is never applied.
+                self.on_config_response(remote, nwid, signed).await;
             }
             ControlMessage::Ping { nonce, sent_ms } => {
                 self.ctx.reply(remote, ControlMessage::Pong { nonce, sent_ms, received_ms: unix_millis() });
@@ -290,11 +295,18 @@ impl ControlEngine {
             "mtu": net.mtu,
             "membershipToken": issued,
         });
-        self.ctx.reply(remote, ControlMessage::NetworkConfigResponse { nwid, config: response });
+        let signed = match SignedConfig::sign(&self.ctx.identity, &nwid, &member, &response) {
+            Ok(signed) => signed,
+            Err(e) => {
+                warn!("[ZGALAXY MESH] cannot sign config for {} / {}: {:#}", nwid, member, e);
+                return;
+            }
+        };
+        self.ctx.reply(remote, ControlMessage::NetworkConfigResponse { nwid, config: response, signed: Some(signed) });
     }
 
     /// Client side: apply a controller's config to the joined network.
-    async fn on_config_response(&mut self, remote: SocketAddr, nwid: String, config: serde_json::Value) {
+    async fn on_config_response(&mut self, remote: SocketAddr, nwid: String, signed: Option<SignedConfig>) {
         // Only the network's controller may configure it: a network id is the
         // controller's 10-hex address followed by 6 hex digits. Without this
         // any proven peer could push addresses and routes for any network.
@@ -307,6 +319,36 @@ impl ControlEngine {
             );
             return;
         }
+        // The session proved the controller's identity, but أ3 is not bound
+        // to the channel: an on-path relay could forward a real proof and
+        // then rewrite this message. Only the controller's signature counts.
+        let Some(signed) = signed else {
+            warn!("[ZGALAXY MESH] unsigned config for {} from {} rejected (controller predates config signing?)", nwid, remote);
+            return;
+        };
+        let Some(controller) = self.ctx.sessions.proven_identity(remote).await else { return };
+        let me = self.ctx.identity.address.to_string();
+        let config = match signed.verify(&controller, &nwid, &me) {
+            Ok(config) => config,
+            Err(e) => {
+                warn!("[ZGALAXY MESH] config for {} from {} rejected: {:#}", nwid, remote, e);
+                return;
+            }
+        };
+        let last = self.config_issued.get(&nwid).copied().unwrap_or(0);
+        if signed.issued_ms == last {
+            // Two answers signed in the same millisecond: nothing new.
+            return;
+        }
+        if signed.issued_ms < last {
+            warn!(
+                "[ZGALAXY MESH] config for {} from {} rejected: issued {} is older than {} (replay?)",
+                nwid, remote, signed.issued_ms, last
+            );
+            return;
+        }
+        self.config_issued.insert(nwid.clone(), signed.issued_ms);
+
         let Some(applied) = self.ctx.networks.apply_controller_config(&nwid, &config).await else {
             return;
         };

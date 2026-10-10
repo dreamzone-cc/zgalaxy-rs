@@ -25,8 +25,8 @@ use crate::identity::Identity;
 struct Inner {
     /// Outstanding challenges: remote -> (nonce, announced address).
     pending: HashMap<SocketAddr, (u64, String)>,
-    /// Proven node address per remote.
-    proven: HashMap<SocketAddr, String>,
+    /// Proven identity (public) per remote.
+    proven: HashMap<SocketAddr, Identity>,
     /// Remotes that verified OUR announcement.
     accepted_us: HashMap<SocketAddr, String>,
 }
@@ -122,7 +122,7 @@ impl PeerSessions {
         }
 
         let mut inner = self.inner.write().await;
-        if let Some(existing) = inner.proven.get(&remote) {
+        if let Some(existing) = inner.proven.get(&remote).map(|id| id.address.to_string()) {
             if existing != address {
                 warn!(
                     "[ZGALAXY MESH] remote {} re-announced a different address ({} != {}) — rejected",
@@ -132,7 +132,7 @@ impl PeerSessions {
             }
         }
         inner.pending.remove(&remote);
-        inner.proven.insert(remote, address.to_string());
+        inner.proven.insert(remote, identity);
         drop(inner);
         self.changed.notify_waiters();
         true
@@ -140,6 +140,11 @@ impl PeerSessions {
 
     /// The node address `remote` proved, if any.
     pub async fn proven_address(&self, remote: SocketAddr) -> Option<String> {
+        self.inner.read().await.proven.get(&remote).map(|id| id.address.to_string())
+    }
+
+    /// The public identity `remote` proved (its key verifies what it signs).
+    pub async fn proven_identity(&self, remote: SocketAddr) -> Option<Identity> {
         self.inner.read().await.proven.get(&remote).cloned()
     }
 
