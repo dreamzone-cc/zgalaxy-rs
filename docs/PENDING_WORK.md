@@ -54,6 +54,16 @@
 - [x] `-d` كان يكسر بناء Windows (`CommandExt` بلا cfg) + تحذير watchdog مضلل في
       الوضع headless + clippy في CI.
 
+### أمن: انتحال الهوية في أ3 — مُصلح (2026-10-10)
+- [x] `Identity::parse` يثق بالعنوان المكتوب بجانب مفتاح 64 بايت (لملفات ZeroTier
+  المحلية). `verify_proof` كان يستخدمه لهويات الشبكة، فكان أي مهاجم يُثبت **أي** عنوان
+  — منه عنوان المتحكم — بمفتاحه هو ويدفع config للعملاء (مُثبت باختبار e2e على QUIC وGTP).
+  الإصلاح: `Identity::parse_announced` للشبكة — العنوان يجب أن يُشتق من المفتاح، ومفتاح
+  32 بايت يجب أن يحقق قاعدة hashcash. الملفات المحلية بلا تغيير.
+  أثر: عقدة تستخدم هوية ZeroTier مستوردة (64 بايت لا يُشتق عنوانها) لن تجتاز أ3 بعد الآن.
+- [ ] متبقٍّ معروف: العنوان 40 بت فقط، والـhashcash ضعيف (~×15)؛ إيجاد مفتاح لعنوان معيّن
+  ≈ 2^40 محاولة. ZeroTier يرفع الكلفة بدالة memory-hard — تغييرها يغيّر كل العناوين.
+
 ### تهيئة GTP (المراحل 1–4 من مواصفة GTP-rs §55) — منفذة
 - [x] `src/control.rs` · `src/mesh/` (MeshTransport, TransportEvent, TransportCapabilities,
       PeerSessions) · `QuicMesh` · `src/control_engine.rs` · `src/interface_sync.rs`.

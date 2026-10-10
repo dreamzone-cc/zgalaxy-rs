@@ -73,7 +73,8 @@ impl PeerSessions {
 
     /// Verify an AnnounceProof against the outstanding challenge: (1) a
     /// challenge exists for `remote`, (2) nonce and announced address match,
-    /// (3) public_identity parses and its pubkey derives exactly `address`,
+    /// (3) public_identity parses and its pubkey derives exactly `address`
+    /// (`Identity::parse_announced` — derived, never merely stated),
     /// (4) the ed25519 signature over the challenge material validates, and
     /// (5) the remote has not already proven a DIFFERENT address on this
     /// session. On success the address becomes the remote's proven identity.
@@ -94,9 +95,12 @@ impl PeerSessions {
             warn!("[ZGALAXY MESH] stale/mismatched proof from {}", remote);
             return false;
         }
-        let Ok(identity) = Identity::parse(public_identity) else {
-            warn!("[ZGALAXY MESH] unparseable public identity from {}", remote);
-            return false;
+        let identity = match Identity::parse_announced(public_identity) {
+            Ok(identity) => identity,
+            Err(e) => {
+                warn!("[ZGALAXY MESH] identity from {} rejected: {:#}", remote, e);
+                return false;
+            }
         };
         if identity.address.to_string() != address {
             warn!(
@@ -243,6 +247,28 @@ mod tests {
 
         // Negative: malformed announced address never gets a challenge.
         assert!(sessions.challenge(remote5, "not-an-address").await.is_none());
+    }
+
+    /// Security regression: a 64-byte public key used to be accepted with
+    /// whatever address the string claimed. An attacker could prove ANY
+    /// address (e.g. the controller's) with its own key.
+    #[tokio::test]
+    async fn spoofed_address_with_a_foreign_key_is_rejected() {
+        let sessions = PeerSessions::new();
+        let victim = Identity::generate().address.to_string();
+        let attacker = Identity::generate();
+        let mut blob = vec![0u8; 32];
+        blob.extend_from_slice(attacker.verifying_key.as_bytes());
+        let spoofed = format!("{}:0:{}", victim, hex::encode(&blob));
+
+        let remote: SocketAddr = "198.51.100.66:9993".parse().unwrap();
+        let nonce = sessions.challenge(remote, &victim).await.unwrap();
+        let sig = attacker.sign(&challenge_material(nonce, &victim)).unwrap();
+        assert!(
+            !sessions.verify_proof(remote, nonce, &victim, &hex::encode(sig), &spoofed).await,
+            "attacker proved someone else's address"
+        );
+        assert!(sessions.proven_address(remote).await.is_none());
     }
 
     #[tokio::test]

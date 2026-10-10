@@ -100,6 +100,9 @@ impl FromStr for Address {
 }
 
 /// Cryptographic Identity representing a ZGALAXY / ZeroTier node.
+/// `generate()` keeps a key only when SHA-512(pubkey)[0] is below this.
+const HASHCASH_LIMIT: u8 = 17;
+
 #[derive(Clone)]
 pub struct Identity {
     pub address: Address,
@@ -121,7 +124,7 @@ impl Identity {
             let digest = hasher.finalize();
 
             // Hashcash difficulty condition: digest[0] < 17 and address is not reserved
-            if digest[0] < 17 {
+            if digest[0] < HASHCASH_LIMIT {
                 let mut addr_bytes = [0u8; 5];
                 addr_bytes.copy_from_slice(&digest[59..64]);
                 let address = Address(addr_bytes);
@@ -291,11 +294,71 @@ impl Identity {
             raw_public_key: pub_bytes,
         })
     }
+
+    /// Parse an identity received from the NETWORK (أ3 announcements).
+    ///
+    /// `parse` also loads local files and trusts the address stated next to
+    /// a 64-byte key. For a remote peer that is an authentication bypass:
+    /// anyone could pair the controller's address with their own key and
+    /// prove it. Here the address MUST derive from the public key, and a
+    /// native 32-byte key must also meet the hashcash rule every
+    /// `generate()`d identity satisfies.
+    pub fn parse_announced(s: &str) -> Result<Self> {
+        let id = Self::parse(s)?;
+        if id.signing_key.is_some() {
+            bail!("an announced identity must not carry a secret key");
+        }
+        let digest = Sha512::digest(&id.raw_public_key);
+        if id.raw_public_key.len() == 32 && digest[0] >= HASHCASH_LIMIT {
+            bail!("identity {} fails the hashcash rule", id.address);
+        }
+        let mut derived = [0u8; 5];
+        derived.copy_from_slice(&digest[59..64]);
+        let derived = Address(derived);
+        if derived != id.address {
+            bail!("identity claims address {} but its key derives {}", id.address, derived);
+        }
+        if derived.is_reserved() {
+            bail!("identity {} uses a reserved address", derived);
+        }
+        Ok(id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn announced_identities_must_derive_their_address() {
+        let id = Identity::generate();
+        // A real (generated) identity passes, public string only.
+        let ok = Identity::parse_announced(&id.to_public_string()).unwrap();
+        assert_eq!(ok.address, id.address);
+        // Its secret form is refused on the wire.
+        assert!(Identity::parse_announced(&id.to_secret_string().unwrap()).is_err());
+
+        // 64-byte blob with someone else's address: `parse` trusts it (local
+        // files), `parse_announced` must not.
+        let victim = Identity::generate().address;
+        let mut blob = vec![0u8; 32];
+        blob.extend_from_slice(id.verifying_key.as_bytes());
+        let spoofed = format!("{}:0:{}", victim, hex::encode(&blob));
+        assert_eq!(Identity::parse(&spoofed).unwrap().address, victim);
+        assert!(Identity::parse_announced(&spoofed).is_err());
+
+        // A 32-byte key with a correct address but failing the hashcash rule.
+        let weak = loop {
+            let sk = SigningKey::generate(&mut OsRng);
+            if Sha512::digest(sk.verifying_key().to_bytes())[0] >= HASHCASH_LIMIT {
+                break sk;
+            }
+        };
+        let vk = weak.verifying_key().to_bytes();
+        let s = format!("{}:0:{}", Address::from_public_key(&vk), hex::encode(vk));
+        assert!(Identity::parse(&s).is_ok());
+        assert!(Identity::parse_announced(&s).is_err());
+    }
 
     #[test]
     fn test_identity_generation_and_derivation() {

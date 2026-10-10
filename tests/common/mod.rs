@@ -66,8 +66,11 @@ pub async fn bind(kind: TransportKind) -> (Arc<dyn MeshTransport>, mpsc::Receive
 }
 
 async fn spawn_node(kind: TransportKind, is_controller: bool, sync: bool) -> Node {
+    spawn_node_as(kind, Identity::generate(), is_controller, sync).await
+}
+
+async fn spawn_node_as(kind: TransportKind, identity: Identity, is_controller: bool, sync: bool) -> Node {
     let dir = tempfile::tempdir().unwrap();
-    let identity = Identity::generate();
     let (transport, events_rx) = bind(kind).await;
     let addr = transport.local_addr().unwrap();
 
@@ -228,6 +231,42 @@ pub async fn full_cycle(kind: TransportKind) {
         let now = client.ctx.networks.get(&nwid).await.unwrap();
         assert_eq!(now.assigned_addresses, vec!["10.77.0.10".to_string()], "rogue config must be ignored");
         assert!(now.routes.iter().all(|r| r.target != "0.0.0.0/0"), "rogue default route must be ignored");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // 4b. An impostor claiming the CONTROLLER's address with its own key
+    // (64-byte public key blob: the stated address used to be trusted
+    // as-is) must not pass the identity proof, so it cannot push a config.
+    let attacker = Identity::generate();
+    let mut blob = vec![0u8; 32];
+    blob.extend_from_slice(attacker.verifying_key.as_bytes());
+    let impostor_id = Identity {
+        address: ctrl.ctx.identity.address,
+        verifying_key: attacker.verifying_key,
+        signing_key: attacker.signing_key.clone(),
+        raw_public_key: blob,
+    };
+    let impostor = spawn_node_as(kind, impostor_id, false, false).await;
+    impostor.ctx.transport.connect(client.addr).await.unwrap();
+    assert!(
+        !impostor.ctx.sessions.await_accepted_us(client.addr, Duration::from_secs(2)).await,
+        "impostor passed the identity proof as the controller"
+    );
+    impostor
+        .ctx
+        .transport
+        .send_control(
+            client.addr,
+            &ControlMessage::NetworkConfigResponse {
+                nwid: nwid.clone(),
+                config: json!({"authorized": true, "ipAssignments": ["6.6.6.7"], "routes": []}),
+            },
+        )
+        .await
+        .unwrap();
+    for _ in 0..50 {
+        let now = client.ctx.networks.get(&nwid).await.unwrap();
+        assert_eq!(now.assigned_addresses, vec!["10.77.0.10".to_string()], "impostor config must be ignored");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
