@@ -62,7 +62,10 @@
       سلبية (متحكم مزيف، جلسة مجهولة، رد بعد الفصل) — مُتحقق منها بـmutation testing.
 
 ### متبقٍ من هذا الفحص
-- [ ] المرحلة 7+: اعتماد GTP-rs (feature `gtp`) و`GtpMesh` — الخطة في GTP-INTEGRATION.md §5.
+- [x] المرحلة 7: اعتماد GTP-rs v0.4.0 تحت feature `gtp` + `tests/gtp_api_smoke.rs`
+  (فرع feat/gtp-phase7). كشف: المجموعة 0 غير مرتبة، الإسقاط لا يغلق الجلسة، سقف
+  Unreliable 1133 — التفاصيل في GTP-INTEGRATION.md §4.5.
+- [ ] المرحلة 8: `GtpMesh` — الخطة في GTP-INTEGRATION.md §5.
 - [ ] تعافي العميل بعد إعادة تشغيل **المتحكم** ~13.5s (مقاس حياً): الجلسة الميتة تبقى
       حتى idle-timeout ‏15s (قرار ب4). اقتراح: keep-alive ‏2s + idle ‏6s، أو كشف
       حيوية تطبيقي (Pong مفقود).
